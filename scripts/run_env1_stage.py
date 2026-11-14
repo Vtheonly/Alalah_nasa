@@ -42,6 +42,10 @@ def main(argv=None) -> int:
                     help="keep every original downloaded UMD file here "
                          "(otherwise deleted after parsing; size + SHA-256 "
                          "are always logged in data_provenance_manifest.json)")
+    ap.add_argument("--keep-originals", choices=("all", "ancillary"),
+                    default="all",
+                    help="with --originals-dir: keep every original ('all') "
+                         "or only the CMG cloud / MCD64CMQ grids ('ancillary')")
     ap.add_argument("--probe-only", action="store_true",
                     help="only run the source connectivity probe and exit")
     ap.add_argument("--skip-wheels", action="store_true")
@@ -67,7 +71,8 @@ def main(argv=None) -> int:
     import os
     map_key = args.firms_map_key or os.environ.get("FIRMS_MAP_KEY")
     download_data.download_all(paths, years=years, firms_map_key=map_key,
-                               originals_dir=args.originals_dir)
+                               originals_dir=args.originals_dir,
+                               keep_originals=args.keep_originals)
     report = normalize_dedup.run_normalization(paths)
     logger.info("Ingestion audit: %s", report["audit"])
 

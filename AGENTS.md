@@ -255,3 +255,68 @@ log corr 0.97, drift ratio 1.05.
   `python3 -m pytest tests/test_06_gpu_solver_math.py -k cuda`,
   `python3 scripts/run_env2_gpu_solve.py --timing-gate-only` (Gate 4), then
   the full `make cpu-prep gpu-solve validate`.
+
+---
+
+## Handoff update — Colab acquisition + Kaggle execution notebooks
+
+### Deliverables
+* `notebooks/01_colab_data_acquisition.ipynb` (Env 1 launcher on Colab):
+  clone exact commit -> inspect entry points (Makefile, scripts/, pyproject
+  groups, `DataPaths`) -> install the `ingest` group (pyhdf has manylinux
+  wheels cp310-cp314) -> `run_env1_stage.py --probe-only` ->
+  `run_env1_stage.py` (acquisition) -> `build_wheels.sh <dir> 3.13` ->
+  verification -> package -> Kaggle auth -> create OR new version.
+* `notebooks/02_kaggle_harmonization.ipynb` (Env 2 launcher on Kaggle,
+  offline): find `package_manifest.json` anywhere under /kaggle/input ->
+  extract `.zip` components if Kaggle left them archived -> SHA-256 verify
+  -> copy codebase to /kaggle/tmp -> pip --no-index only for missing deps ->
+  set `FIRE_HARMONIZER_{STAGED,WHEELS,OUTPUT}_DIR` -> codebase tests_06 ->
+  `run_env2_cpu_prep.py` -> `run_env2_gpu_solve.py --timing-gate-only` ->
+  `run_env2_gpu_solve.py` -> `run_env2_validate.py` -> output inventory +
+  run_manifest.json + resources.csv/png. Stage markers (package_id + commit
+  + args + upstream markers) make re-runs skip finished stages.
+* Neither notebook contains processing/scientific logic; both only call
+  codebase entry points. Builders were kept out of the repo; edit the
+  `.ipynb` directly (cells are plain Python).
+
+### Package contract (keep both notebooks in sync)
+`package_manifest.json` (schema_version 1) at the dataset root with
+`layout = {codebase: codebase, staged_data: staged-data, wheels:
+offline-wheels[, originals: originals]}`, `files{relpath: {bytes, sha256}}`,
+codebase {repo_url, ref, commit}, target_env2_python. Upload uses
+`kaggle datasets create|version -r zip -t` (`-t` keeps Parquet unconverted).
+
+### Codebase changes made for this (acquisition side, src/ingest)
+* `probe_sources()` + `run_env1_stage.py --probe-only`.
+* Portolan PyArrow streaming failover (DuckDB httpfs/spatial must otherwise
+  be downloaded at run time); resume skips staged years.
+* Originals: SHA-256/size of every UMD original in the provenance manifest;
+  `--originals-dir` + `--keep-originals {all,ancillary}`.
+* `run_normalization` streams per file / per acquisition month (bounded
+  RAM); verified identical output (322,243 rows, same audit) on the twin.
+
+### Verified facts (2026-11-14, from this sandbox with an allow-listed env)
+* NASA CMR has NO collections for MCD14ML, MOD14C8Q, MYD14C8Q, MOD14CMQ,
+  MYD14CMQ, MCD64CMQ, VNP14IMGML, VJ114IMGML (CMR has MCD64A1, MOD14A2,
+  VNP14IMG, ...). The cloud CMG grids exist ONLY on the UMD archive
+  (fuoco.geog.umd.edu SFTP 22 / FTP 21): if UMD is unreachable, Env 1
+  correctly aborts (no zero-cloud fabrication). The readme's CMR failover
+  for CMG grids cannot succeed.
+* Portolan catalog + year partitions: HTTP 200 (2000: 4 MB ... 2026: 917 MB,
+  updated hourly); live PyArrow fetch of 2000 -> 62,694 Terra detections.
+* FIRMS API live (401 without MAP_KEY); Natural Earth + GeoBoundaries 200.
+* UMD unreachable from this sandbox (raw TCP not proxied) -> real
+  acquisition NOT executed here.
+
+### Verification performed
+* Notebook 1 executed headless (repackage mode, RUN_ACQUISITION=0, staged
+  twin) incl. real GitHub clone + wheel build; publish path executed twice
+  against a stub `kaggle` CLI: create (v1) then new version (v2); kaggle.json
+  mode 600; key absent from package/outputs/logs.
+* Notebook 2 executed headless against simulated /kaggle/input in both forms
+  (zipped components under datasets/<owner>/<slug>/, and extracted read-only
+  dirs): integrity OK, all codebase stages succeeded on CPU, outputs
+  verified, web API 200; second run skipped every completed stage.
+* Not executed: real Colab (Drive/Secrets/upload widgets), real Kaggle API,
+  real GPUs, real UMD acquisition.

@@ -315,7 +315,8 @@ def _in_boxes(lat, lon, bboxes) -> np.ndarray:
 def fetch_umd_history(paths: DataPaths, years: list[int],
                       manifest: ProvenanceManifest | None = None,
                       bboxes: list[tuple] | None = None,
-                      session=None, originals_dir: Path | None = None) -> dict:
+                      session=None, originals_dir: Path | None = None,
+                      keep_originals: str = "all") -> dict:
     """Stream UMD files ONE AT A TIME through a temp file (deleted
     immediately) and stage compact outputs:
 
@@ -327,8 +328,13 @@ def fetch_umd_history(paths: DataPaths, years: list[int],
     Every original file's size + SHA-256 is logged in the provenance
     manifest.  With ``originals_dir`` the untouched original is MOVED there
     instead of being deleted (and an existing original is reused instead of
-    re-downloaded -- resumable acquisition).
+    re-downloaded -- resumable acquisition).  ``keep_originals``:
+    ``"all"`` or ``"ancillary"`` (only the small CMG cloud / MCD64CMQ HDF4
+    grids; the ~100 GB of global active-fire originals are then deleted
+    after parsing, their SHA-256 still logged).
     """
+    if keep_originals not in ("all", "ancillary"):
+        raise ValueError("keep_originals must be 'all' or 'ancillary'")
     import tempfile
 
     from .normalize_dedup import (parse_mcd14ml_rows, parse_vxx14imgml_rows,
@@ -368,7 +374,10 @@ def fetch_umd_history(paths: DataPaths, years: list[int],
                             result["fires"].append(dest)
                             continue
                     tmp_path = Path(tmp) / name
-                    kept = (Path(originals_dir) / key / name) if originals_dir \
+                    keep_this = originals_dir is not None and (
+                        keep_originals == "all"
+                        or key in ("MOD14C8Q", "MYD14C8Q", "MCD64CMQ"))
+                    kept = (Path(originals_dir) / key / name) if keep_this \
                         else None
                     try:
                         if kept is not None and kept.exists() and \
@@ -986,7 +995,8 @@ def download_all(paths: DataPaths, years: list[int] | None = None,
                  firms_map_key: str | None = None,
                  bboxes: list[tuple] | None = None,
                  earthdata_token: str | None = None,
-                 originals_dir: str | Path | None = None) -> dict:
+                 originals_dir: str | Path | None = None,
+                 keep_originals: str = "all") -> dict:
     """Run the full Env 1 acquisition with autonomous failover.
 
     Returns a summary dict; every resolved source is written to
@@ -1010,7 +1020,8 @@ def download_all(paths: DataPaths, years: list[int] | None = None,
 
     # 2) Historical active fires + CMG grids: UMD primary (SFTP -> FTP).
     umd = fetch_umd_history(paths, years, manifest, bboxes,
-                            originals_dir=originals_dir)
+                            originals_dir=originals_dir,
+                            keep_originals=keep_originals)
     summary["umd_method"] = umd["method"]
     summary["umd_fire_files"] = len(umd["fires"])
     if not umd["fires"]:
