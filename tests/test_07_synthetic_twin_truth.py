@@ -119,7 +119,7 @@ def test_07_night_day_ratio_estimates(full_twin):
     ndr_true = m.groupby("h3_index").apply(
         lambda g: g["phi_night_true"].mean()
         / max(g["phi_day_true"].mean(), 1e-9), include_groups=False)
-    # true twin ndr: agri ~0.08, forest ~0.25 -> estimates stay day-dominated
+    # true twin ndr: agri ~0.08, forest ~0.20 -> estimates stay day-dominated
     assert (ndr_hat < 0.6).all()
     assert (ndr_hat > 0.01).all()
     # the two behavioural regimes stay separable (no collapse to one value)

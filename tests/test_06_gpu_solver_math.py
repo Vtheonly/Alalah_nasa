@@ -331,18 +331,53 @@ def test_06_fixed_lag_update_matches_full_batch():
     batch (< 1e-3) across an active fire transition."""
     from src.engine.solver import GMRFSolver
     data = _tiny_solver_data()
+    # active fire transition inside the trailing 14-day window
+    T = data.t_days
+    data.y[:, T - 9:, 2, 0] = 40.0
+    data.y[:, T - 9:, 2, 1] = 12.0
     solver = GMRFSolver(data)
     z_full = solver.solve(sweeps=S.SOLVER_SWEEPS).clone()
-    # fresh solver at the pre-transition state, then fixed-lag over 14 days
     solver2 = GMRFSolver(data)
     solver2.z = z_full.clone()          # saved state from the full batch
     z2 = solver2.solve_fixed_lag(window_days=14)
-    w = min(14, data.t_days)
+    w = min(14, T)
     diff = (z2[:, -w:, :] - z_full[:, -w:, :]).abs().max()
-    assert float(diff) < 0.75   # same active-transition structure
-    # the anchor row (t_start - 1) is untouched by the windowed re-solve
-    t_start = data.t_days - w
-    assert torch.equal(z2[:, t_start - 1, :], z_full[:, t_start - 1, :])
+    assert float(diff) < 1e-3
+    # the transition is real (states jump inside the window) ...
+    assert float((z_full[:, -3:, 0].mean() - z_full[:, T - 14:T - 10, 0]
+                  .mean()).abs()) > 1.0
+    # ... and the anchor row (t_start - 1) and everything before it is
+    # untouched by the windowed re-solve
+    t_start = T - w
+    assert torch.equal(z2[:, :t_start, :], z_full[:, :t_start, :])
+
+
+def test_06_fixed_lag_assimilates_new_window_data():
+    """Starting from a state solved WITHOUT the trailing detections, the
+    windowed update assimilates them and lands on the exact conditional
+    MAP of the window (verified by its vanishing windowed gradient)."""
+    from src.engine.solver import GMRFSolver
+    data = _tiny_solver_data()
+    T = data.t_days
+    y_new = data.y.clone()
+    y_new[:, T - 9:, 2, 0] = 40.0
+    old = GMRFSolver(data)
+    z_old = old.solve(sweeps=S.SOLVER_SWEEPS).clone()
+    data.y = y_new
+    upd = GMRFSolver(data)
+    upd.z = z_old.clone()
+    z_upd = upd.solve_fixed_lag(window_days=14).clone()
+    t_start = T - 14
+    assert torch.equal(z_upd[:, :t_start], z_old[:, :t_start])
+    assert float(z_upd[:, -3:, 0].mean()) > float(z_old[:, -3:, 0].mean()) + 1.0
+    # windowed stationarity: block gradients vanish on [t_start, T-1]
+    for color in (0, 1, 2):
+        for s in (0, 1):
+            built = upd._block_system(color, s, t_start)
+            if built is None:
+                continue
+            _idx, _a, _b, g = built
+            assert float(g.abs().max()) < 1e-3
 
 
 def test_06_solver_z_bounds_respected():

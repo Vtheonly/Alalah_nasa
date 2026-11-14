@@ -49,6 +49,20 @@ def season_of(month: int) -> str:
     return SEASONS[(int(month) % 12) // 3]
 
 
+def in_calib_window(df: pd.DataFrame, date_col: str = "solar_date",
+                    start: str = S.CALIB_START,
+                    end: str = S.CALIB_END) -> pd.Series:
+    """INV-03 pre-drift calibration freeze: 2012-01-20 .. 2021-12-31."""
+    d = pd.to_datetime(df[date_col])
+    return (d >= pd.Timestamp(start)) & (d <= pd.Timestamp(end))
+
+
+def calib_window(df: pd.DataFrame, date_col: str = "solar_date") -> pd.DataFrame:
+    if df is None or not len(df):
+        return df
+    return df[in_calib_window(df, date_col).to_numpy()]
+
+
 # ---------------------------------------------------------------------------
 # 1) Isotonic confidence reliability
 # ---------------------------------------------------------------------------
@@ -99,17 +113,19 @@ def fit_isotonic_reliability(prov_bio: pd.DataFrame,
 
 
 def reliability_weights(prov_bio: pd.DataFrame, models: dict) -> np.ndarray:
-    """Per-detection calibrated reliability w_i (1.0 where w >= 0.90)."""
+    """Per-detection calibrated reliability w_i (1.0 where w >= 0.90),
+    vectorized per (sensor_family, dn_flag) model."""
     w = np.ones(len(prov_bio), dtype=np.float64)
+    if not len(prov_bio) or not models:
+        return w
     fam = prov_bio["sensor_family"].to_numpy()
     dn = prov_bio["dn_flag"].to_numpy()
     conf = prov_bio["conf_num"].fillna(65.0).to_numpy(dtype=float)
-    for i in range(len(prov_bio)):
-        m = models.get((fam[i], dn[i]))
-        if m is None:
-            continue
-        wi = float(m.predict([conf[i]])[0])
-        w[i] = 1.0 if wi >= 0.90 else wi
+    for (f, d), m in models.items():
+        sel = (fam == f) & (dn == d)
+        if sel.any():
+            wi = np.asarray(m.predict(conf[sel]), dtype=float)
+            w[sel] = np.where(wi >= 0.90, 1.0, wi)
     return w
 
 
@@ -163,30 +179,79 @@ def fit_lognormal_truncated(frp: np.ndarray, f_ref: float = S.F_REF_MW
     return (mu, sigma)
 
 
-def fit_lognorm_params(clusters: pd.DataFrame, f_ref: float = S.F_REF_MW) -> dict:
+def fit_lognorm_params(clusters: pd.DataFrame, f_ref: float = S.F_REF_MW,
+                       min_clusters: int = 30) -> dict:
     """Per-pyrome truncated Log-Normal (mu_F, sigma_F) on clear-sky near-nadir
-    (VZA < 20 deg, cloud_frac < 0.30) VIIRS clusters above F_ref."""
-    out: dict[int, tuple[float, float]] = {}
-    if "pyrome_id" not in clusters.columns:
-        clusters = clusters.assign(pyrome_id=0)
-    for b, g in clusters.groupby("pyrome_id"):
-        sel = g[(g["vza_deg"] < 20.0)
-                & (g.get("cloud_frac", pd.Series(0.0, index=g.index)) < 0.30)
-                & (g["cluster_frp_mw"] > f_ref)]
-        vals = sel["cluster_frp_mw"].to_numpy() if len(sel) else \
-            g[g["cluster_frp_mw"] > f_ref]["cluster_frp_mw"].to_numpy()
-        if len(vals) < 5:
+    (VZA < 20 deg, cloud_frac < 0.30) VIIRS clusters above F_ref, restricted
+    to the 2012-01-20 .. 2021-12-31 window (INV-03).
+
+    Fallback chain per pyrome when fewer than ``min_clusters`` qualify:
+    window VIIRS clusters above F_ref -> all clusters above F_ref -> all
+    clusters (logged in the returned dict under ``"_selection"``).
+    """
+    out: dict = {}
+    sel_log: dict = {}
+    c = clusters
+    if "pyrome_id" not in c.columns:
+        c = c.assign(pyrome_id=0)
+    if "solar_date" in c.columns:
+        c = c[in_calib_window(c).to_numpy()] if in_calib_window(c).any() else c
+    for b, g in c.groupby("pyrome_id"):
+        above = g["cluster_frp_mw"] > f_ref
+        viirs = (g["sensor_family"] == "VIIRS") if "sensor_family" in g \
+            else pd.Series(True, index=g.index)
+        vza = g["vza_deg"] if "vza_deg" in g else pd.Series(0.0, index=g.index)
+        cloud = g["cloud_frac"] if "cloud_frac" in g \
+            else pd.Series(0.0, index=g.index)
+        tiers = (("clear_nadir_viirs", above & viirs & (vza < 20.0)
+                  & (cloud < 0.30)),
+                 ("viirs", above & viirs), ("all_above_fref", above))
+        vals, tag = None, "all"
+        for name, m in tiers:
+            if int(m.sum()) >= min_clusters:
+                vals, tag = g.loc[m, "cluster_frp_mw"].to_numpy(), name
+                break
+        if vals is None:
             vals = g["cluster_frp_mw"].to_numpy()
         out[int(b)] = fit_lognormal_truncated(vals, f_ref)
+        sel_log[int(b)] = tag
     if not out:
         out[0] = (0.0, 1.0)
-    return out
+    out_sel = dict(out)
+    out_sel["_selection"] = sel_log
+    return out_sel
+
+
+def lognorm_cluster_table(prov_bio: pd.DataFrame, hex_pyromes: pd.DataFrame,
+                          cloud_df: pd.DataFrame | None,
+                          clim_df: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Calibration-window cluster table with pyrome, sensor, cluster VZA and
+    the 0.25 deg cloud fraction at the cluster centroid / date."""
+    clusters = extract_cluster_table(calib_window(prov_bio))
+    if not len(clusters):
+        clusters = extract_cluster_table(prov_bio)
+    pyr = hex_pyromes[["h3_index", "pyrome_id"]].drop_duplicates("h3_index")
+    clusters = clusters.merge(pyr, on="h3_index", how="left")
+    clusters["pyrome_id"] = clusters["pyrome_id"].fillna(0).astype(int)
+    if "vza_deg" not in clusters.columns:
+        clusters["vza_deg"] = np.nan
+    if {"latitude", "longitude"} <= set(clusters.columns) and \
+            cloud_df is not None and len(cloud_df):
+        from ..engine.priors import cloud_at_points
+        clusters["cloud_frac"] = cloud_at_points(
+            clusters["latitude"].to_numpy(), clusters["longitude"].to_numpy(),
+            clusters["solar_date"], cloud_df, clim_df)
+    else:
+        clusters["cloud_frac"] = 0.0
+    return clusters
 
 
 def _mu_sigma(lognorm_params: dict, pyrome):
     """Elementwise (mu_F, sigma_F) lookup supporting scalars and arrays."""
     arr = np.asarray(pyrome)
     flat = arr.ravel().tolist()
+    lognorm_params = {k: v for k, v in lognorm_params.items()
+                      if not (isinstance(k, str) and k.startswith("_"))}
     mus = np.empty(len(flat))
     sgs = np.empty(len(flat))
     for i, b in enumerate(flat):
@@ -242,7 +307,8 @@ def psi_frp_eff(family: str, pyrome: int, area_km2, dn: str, e_raw,
 def build_gamma_pairs(pass_obs: pd.DataFrame) -> pd.DataFrame:
     """Synchronous Aqua / near-nadir SNPP pairs (VZA_SNPP < 25 deg, dt <= 45
     min, same h3_index, same dn_flag, both > 0)."""
-    p = pass_obs[(pass_obs["y_frp_mw"] > 0)].copy()
+    p = pass_obs[(pass_obs["y_frp_mw"] > 0)]
+    p = calib_window(p).copy()                          # INV-03 freeze
     aqua = p[p["platform"] == "Aqua"]
     snpp = p[(p["platform"] == "SNPP") & (p["mean_vza_deg"] < 25.0)]
     if not len(aqua) or not len(snpp):
@@ -338,8 +404,8 @@ def fit_gamma_calibration(pass_obs: pd.DataFrame, lognorm_params: dict):
     # population per (pyrome, dn) -> the EQM contributes quantile SHAPE
     # only (zero net level transfer).
     eqm_anchors: dict[tuple, float] = {}
-    mod = pass_obs[(pass_obs["sensor_family"] == "MODIS")
-                   & (pass_obs["y_frp_mw"] > 0)]
+    mod = calib_window(pass_obs[(pass_obs["sensor_family"] == "MODIS")
+                                & (pass_obs["y_frp_mw"] > 0)])
     if len(mod):
         ln_y_all = np.log(mod["y_frp_mw"].to_numpy(dtype=float))
         r_all = _predict_r(lgbm, mod, ln_y_all, float(np.median(r_k)))
@@ -464,46 +530,52 @@ def build_diurnal_pairs(pass_obs: pd.DataFrame, lgbm, eqm_knots,
             p.loc[m_modis, "mean_area_km2"], p.loc[m_modis, "raw_event_count"],
             lgbm, eqm_knots, lognorm_params, None, eqm_anchors)
     p["ln_y_adj"] = p["ln_y"] - ln_gamma - ln_psi
-    p["v_cloud"] = p["v_cloud"] if "v_cloud" in p.columns else 0.0
+    if "v_cloud" not in p.columns:
+        p["v_cloud"] = 1.0
+    if "w_mean" not in p.columns:
+        p["w_mean"] = 1.0
 
     keys = ["h3_index", "solar_date", "dn_flag"]
-    pairs = []
-    d = p[p["platform"].isin(["Terra", "Aqua", "SNPP", "NOAA-20"])]
-    for (_h, dt, dn), g in d.groupby(keys):
-        b = int(g["pyrome_id"].iloc[0])
-        terras = g[g["platform"] == "Terra"]
-        ref = g[g["platform"].isin(["Aqua", "SNPP"])]
-        for _, t in terras.iterrows():
-            for _, r in ref.iterrows():
-                pairs.append((b, dt, dn, t["mean_solar_hour"], r["mean_solar_hour"],
-                              t["ln_y_adj"], r["ln_y_adj"],
-                              float((t["sensor_family"] == "MODIS")
-                                    & (r["sensor_family"] == "MODIS")),
-                              (t["mean_vza_deg"] + r["mean_vza_deg"]) / 2.0,
-                              (t["w_mean"] + r["w_mean"]) / 2.0,
-                              float((t["v_cloud"] + r["v_cloud"]) / 2.0),
-                              max(t["has_i4_m13_fallback"],
-                                  r["has_i4_m13_fallback"])))
-        if pd.Timestamp(dt) >= pd.Timestamp(S.DRIFT_START):
-            aquas = g[g["platform"] == "Aqua"]
-            n20 = g[g["platform"] == "NOAA-20"]
-            for _, a in aquas.iterrows():
-                for _, n in n20.iterrows():
-                    pairs.append((b, dt, dn, a["mean_solar_hour"],
-                                  n["mean_solar_hour"], a["ln_y_adj"],
-                                  n["ln_y_adj"],
-                                  float((a["sensor_family"] == "MODIS")
-                                        & (n["sensor_family"] == "MODIS")),
-                                  (a["mean_vza_deg"] + n["mean_vza_deg"]) / 2.0,
-                                  (a["w_mean"] + n["w_mean"]) / 2.0,
-                                  float((a["v_cloud"] + n["v_cloud"]) / 2.0),
-                                  max(a["has_i4_m13_fallback"],
-                                      n["has_i4_m13_fallback"])))
+    cols_keep = keys + ["platform", "pyrome_id", "sensor_family",
+                        "mean_solar_hour", "ln_y_adj", "mean_vza_deg",
+                        "w_mean", "v_cloud", "has_i4_m13_fallback"]
+    p = p[cols_keep]
+    sd = pd.to_datetime(p["solar_date"])
+    # Terra vs Aqua/SNPP over 2003-2021 (readme 5.2.5)
+    base = p[(sd >= pd.Timestamp("2003-01-01"))
+             & (sd <= pd.Timestamp(S.CALIB_END))]
+    terra = base[base["platform"] == "Terra"]
+    ref = base[base["platform"].isin(["Aqua", "SNPP"])]
+    m1 = terra.merge(ref, on=keys, suffixes=("_1", "_2"))
+    # Aqua 2022-2025 drifting hours vs stationary NOAA-20 (diurnal only)
+    drift = p[(sd >= pd.Timestamp(S.DRIFT_START))
+              & (sd <= pd.Timestamp("2025-12-31"))]
+    m2 = drift[drift["platform"] == "Aqua"].merge(
+        drift[drift["platform"] == "NOAA-20"], on=keys, suffixes=("_1", "_2"))
+    m = pd.concat([m1, m2], ignore_index=True)
     cols = ["pyrome_id", "solar_date", "dn_flag", "tau1", "tau2", "ln1",
             "ln2", "is_modis", "vza_mean", "w_mean", "v_cloud", "m13"]
-    if not pairs:
+    if not len(m):
         return pd.DataFrame(columns=cols)
-    return pd.DataFrame(pairs, columns=cols)
+    return pd.DataFrame({
+        "pyrome_id": m["pyrome_id_1"].astype(int).to_numpy(),
+        "solar_date": m["solar_date"].to_numpy(),
+        "dn_flag": m["dn_flag"].to_numpy(),
+        "tau1": m["mean_solar_hour_1"].to_numpy(dtype=float),
+        "tau2": m["mean_solar_hour_2"].to_numpy(dtype=float),
+        "ln1": m["ln_y_adj_1"].to_numpy(dtype=float),
+        "ln2": m["ln_y_adj_2"].to_numpy(dtype=float),
+        "is_modis": ((m["sensor_family_1"] == "MODIS")
+                     & (m["sensor_family_2"] == "MODIS")).astype(float)
+        .to_numpy(),
+        "vza_mean": ((m["mean_vza_deg_1"] + m["mean_vza_deg_2"]) / 2.0)
+        .to_numpy(dtype=float),
+        "w_mean": ((m["w_mean_1"] + m["w_mean_2"]) / 2.0).to_numpy(dtype=float),
+        "v_cloud": ((m["v_cloud_1"] + m["v_cloud_2"]) / 2.0)
+        .to_numpy(dtype=float),
+        "m13": np.maximum(m["has_i4_m13_fallback_1"].to_numpy(dtype=float),
+                          m["has_i4_m13_fallback_2"].to_numpy(dtype=float)),
+    })
 
 
 def fit_diurnal_curves(pairs: pd.DataFrame) -> dict:
@@ -574,7 +646,7 @@ def fit_sigma_ols(pairs: pd.DataFrame, coeffs: dict) -> LinearRegression:
     1-w_mean, 1-v_cloud, i4_m13_fallback], clipped to [0.025, 2.50]."""
     xs, ys = [], []
     if not pairs.empty:
-        df = pairs.copy()
+        df = calib_window(pairs).copy()                 # INV-03 freeze
         df["solar_date"] = pd.to_datetime(df["solar_date"])
         df["season"] = df["solar_date"].dt.month.map(season_of)
         for (b, s, dn), g in df.groupby(["pyrome_id", "season", "dn_flag"]):
@@ -633,9 +705,9 @@ def fit_area_model(pass_obs: pd.DataFrame, coeffs: dict,
                    lognorm_params: dict | None = None) -> Ridge:
     """Ridge on clear-sky near-nadir VIIRS detections predicting
     ln(A_det + 1e-3) from [ln(Phi + 0.01), ln(ndr + 0.05), pyrome one-hot]."""
-    p = pass_obs[(pass_obs["sensor_family"] == "VIIRS")
-                 & (pass_obs["y_frp_mw"] > 0)
-                 & (pass_obs["mean_vza_deg"] < 25.0)].copy()
+    p = calib_window(pass_obs[(pass_obs["sensor_family"] == "VIIRS")
+                              & (pass_obs["y_frp_mw"] > 0)
+                              & (pass_obs["mean_vza_deg"] < 25.0)]).copy()
     p["month"] = pd.to_datetime(p["solar_date"]).dt.month
     if lognorm_params is None:
         c = extract_cluster_table_from_pass(p)
@@ -730,13 +802,19 @@ def calibrate(prov_bio: pd.DataFrame, pass_obs: pd.DataFrame,
         hex_pyromes[["h3_index", "pyrome_id"]], on="h3_index", how="left")
     pass_obs["pyrome_id"] = pass_obs["pyrome_id"].fillna(0).astype(int)
 
+    # ---- cloud climatology (trailing-2026 fallback) + per-pass v_cloud ---
+    if cloud_df is not None and len(cloud_df):
+        clim = build_cloud_climatology(cloud_df)
+    else:
+        clim = pd.DataFrame(columns=["lat_025", "lon_025", "month",
+                                     "cloud_frac_clim"])
+    artifacts["cloud_climatology"] = clim
+    pass_obs["v_cloud"] = pass_visibility(pass_obs, cloud_df, clim)
+
     # ---- log-normal cluster intensity + survival integrals ----------------
-    clusters = extract_cluster_table(prov_bio)
-    clusters = clusters.merge(
-        hex_pyromes[["h3_index", "pyrome_id"]], on="h3_index", how="left")
-    clusters["pyrome_id"] = clusters["pyrome_id"].fillna(0).astype(int)
-    clusters["vza_deg"] = 20.0        # cluster-level VZA unknown here
-    clusters["cloud_frac"] = 0.0
+    # clear-sky (cloud_frac < 0.30) near-nadir (cluster VZA < 20 deg) VIIRS
+    # clusters of the 2012-2021 window (INV-03), real per-cluster geometry
+    clusters = lognorm_cluster_table(prov_bio, hex_pyromes, cloud_df, clim)
     lognorm_params = fit_lognorm_params(clusters)
     artifacts["fmin_params"] = {k: v for k, v in S.FMIN_PARAMS.items()}
     artifacts["lognorm_params"] = lognorm_params
@@ -765,13 +843,6 @@ def calibrate(prov_bio: pd.DataFrame, pass_obs: pd.DataFrame,
     # ---- area model -----------------------------------------------------------
     area_model = fit_area_model(pass_obs, diurnal_coeffs, lognorm_params)
     artifacts["area_model"] = area_model
-
-    # ---- cloud climatology (trailing-2026 fallback) -----------------------------
-    if cloud_df is not None and len(cloud_df):
-        artifacts["cloud_climatology"] = build_cloud_climatology(cloud_df)
-    else:
-        artifacts["cloud_climatology"] = pd.DataFrame(
-            columns=["lat_025", "lon_025", "month", "cloud_frac_clim"])
 
     # ---- assemble calibrated pass observations --------------------------------
     out = pass_obs.copy()
@@ -802,22 +873,75 @@ def calibrate(prov_bio: pd.DataFrame, pass_obs: pd.DataFrame,
     out["mu_gain_det"] = out["ln_diurnal"] + out["ln_gamma"] + out["ln_psi_eff"]
     out["sigma2"] = sigma2_of(
         sigma_ols, fam == "MODIS", out["mean_vza_deg"], out["w_mean"],
-        np.zeros(len(out)), out["has_i4_m13_fallback"])
+        out["v_cloud"].to_numpy(dtype=float), out["has_i4_m13_fallback"])
     out.loc[out["has_i4_m13_fallback"] > 0, "sigma2"] = np.clip(
         out.loc[out["has_i4_m13_fallback"] > 0, "sigma2"]
         * S.VIIRS_M13_SIGMA_INFLATION ** 2, *S.SIGMA2_CLIP)
     return artifacts, out
 
 
+def pass_visibility(pass_obs: pd.DataFrame, cloud_df, clim_df) -> np.ndarray:
+    """Per-pass clear-sky visibility v = p_swath(platform, |lat|, t) *
+    clip(1 - cloud_frac, 0.10, 0.98) at the pass cell / solar date (joined
+    from the 0.25 deg cloud grid; 1.0 when no cloud data is staged)."""
+    if not len(pass_obs):
+        return np.zeros(0)
+    if cloud_df is None or not len(cloud_df):
+        return np.ones(len(pass_obs))
+    from ..engine.priors import cloud_at_cells
+    from ..geometry.solar_geometry import p_swath
+    cloud = cloud_at_cells(pass_obs["h3_index"].to_numpy(dtype=np.int64),
+                           pass_obs["solar_date"], cloud_df, clim_df)
+    from ..geometry.h3_utils import h3_cell_center
+    uc, inv = np.unique(pass_obs["h3_index"].to_numpy(dtype=np.int64),
+                        return_inverse=True)
+    lat = np.array([h3_cell_center(int(c))[0] for c in uc])[inv]
+    post = (pd.to_datetime(pass_obs["solar_date"])
+            >= pd.Timestamp(S.DRIFT_START)).to_numpy()
+    plat = pass_obs["platform"].to_numpy()
+    ps = np.empty(len(pass_obs))
+    for p in np.unique(plat):
+        m = plat == p
+        ps[m] = np.where(post[m], p_swath(p, np.abs(lat[m]), True),
+                         p_swath(p, np.abs(lat[m]), False))
+    return ps * np.clip(1.0 - cloud, *S.VIS_CLIP)
+
+
 def build_cloud_climatology(cloud_df: pd.DataFrame) -> pd.DataFrame:
     """2012-2025 multi-year mean cloud fraction per (0.25 deg cell, month)."""
     df = cloud_df.copy()
-    df["month"] = np.where(df["period_kind"] == "month", df["period"],
-                           ((df["period"] - 1) * 8 // 30) + 1)
+    kind = (df["period_kind"].astype(str) if "period_kind" in df.columns
+            else pd.Series("8d", index=df.index))
+    mid_doy = np.clip((df["period"].to_numpy(dtype=int) - 1) * 8 + 4, 1, 365)
+    m8 = (pd.Timestamp("2001-01-01")
+          + pd.to_timedelta(mid_doy - 1, unit="D")).month.to_numpy()
+    df["month"] = np.where(kind.to_numpy() == "month",
+                           df["period"].to_numpy(dtype=int), m8)
     clim = (df[df["year"].between(2012, 2025)]
             .groupby(["lat_025", "lon_025", "month"], as_index=False)["cloud_frac"]
             .mean().rename(columns={"cloud_frac": "cloud_frac_clim"}))
     return clim
+
+
+def psi_cnt_row_fn(artifacts):
+    """Per-row psi_CNT (platform-aware: MODIS at A_avg 2.35, VIIRS 0.23)."""
+    def psi_cnt_fn(b, g):
+        n = len(g)
+        plats = (g["platform"].to_numpy() if "platform" in g.columns
+                 else np.full(n, "SNPP", dtype=object))
+        fams = np.array([S.SENSOR_FAMILY.get(str(p), "VIIRS") for p in plats])
+        dns = g["dn_flag"].to_numpy()
+        out = np.empty(n)
+        for fam in ("MODIS", "VIIRS"):
+            m = fams == fam
+            if m.any():
+                out[m] = psi_cnt(fam, np.full(int(m.sum()), b),
+                                     np.full(int(m.sum()),
+                                             S.PASS_GEOMETRY_AVG[fam][0]),
+                                     dns[m], artifacts["lognorm_params"])
+        return out
+    return psi_cnt_fn
+
 
 
 def save_artifacts(artifacts: dict, path) -> None:
