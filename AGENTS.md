@@ -219,3 +219,39 @@ log corr 0.97, drift ratio 1.05.
   than separate SNPP-vs-NOAA-20 VIIRS pairs; window-frozen per INV-03.
 * Harmonized Chow test on the twin is asserted as a >60% F-drop vs raw (the
   twin carries genuine climate trends, so p > 0.05 is not guaranteed).
+
+### Additional findings during verification (same session)
+* **DuckDB 1.3.2 (the Kaggle image's version) cannot build an ART index on
+  a heavily duplicated key** (`NotImplementedException: unrecognized enum
+  value "0" for enum "NType"` above ~1e5 rows). The exporter now indexes
+  only the UNIQUE `(h3_index, year, month)` keys and clusters the
+  provenance / daily tables with `ORDER BY h3_index` (zone-map pruning).
+  Regression test: `test_09_export_survives_duckdb_duplicate_key_scale`.
+* **6 Gauss-Seidel sweeps do not converge the MAP** (linear rate ~0.8 per
+  sweep through the Day/Night + spatial couplings; max |dz| ~0.05 after 6).
+  `solve()` keeps the spec's 6 sweeps as a minimum and continues until the
+  per-sweep change < 1e-4 (cap `MAX_SOLVER_SWEEPS = 40`, CLI
+  `--max-sweeps`; `--max-sweeps 6` restores the fixed schedule if GPU
+  budget is tight). A future speed-up: solve Day+Night jointly as a 2x2
+  block-tridiagonal system inside each color block.
+
+### Verification status (end of this session)
+* Environment: Linux CPU sandbox (4 vCPU, no GPU), Python 3.13.18 with the
+  Kaggle image's library versions pinned (numpy 2.1.3, pandas 2.3.3,
+  scipy 1.16.3, scikit-learn 1.6.1, lightgbm 4.6.0, duckdb 1.3.2,
+  polars 1.35.2, pyarrow 23.0.1) + torch 2.15 (CPU use), h3 4.5.0.
+* `python3 -m pytest tests -q`: **194 collected, 190 passed, 4 skipped,
+  0 failed** (~15 min). Per file: 26/22/14/20/28/23/18/15/14/14.
+  Skips: 3 CUDA-hardware tests + `test_06_cuda_extension_compiles_with_nvcc`
+  (toolchain-gated) which PASSES when `CUDA_HOME` points at a toolkit
+  (verified with pip `nvidia-cuda-nvcc==13.2` + `nvidia-nvvm==13.2`).
+* End-to-end Makefile path verified on the twin staged as Env 1 output
+  (`active_fires/` + cloud + polygons): `run_env2_cpu_prep.py` ->
+  `run_env2_gpu_solve.py` -> `run_env2_validate.py` all exit 0; harmonized
+  2012 Chow p = 0.20 (raw 8e-7); VIIRS-masked ablation 90% coverage 0.914,
+  log-RMSE 0.18 vs raw MODIS 0.81; uvicorn endpoints 200, SQL-injection
+  metric -> 422.
+* Next on Kaggle (4x L4): `pip install --no-index --find-links=<wheels> h3`,
+  `python3 -m pytest tests/test_06_gpu_solver_math.py -k cuda`,
+  `python3 scripts/run_env2_gpu_solve.py --timing-gate-only` (Gate 4), then
+  the full `make cpu-prep gpu-solve validate`.

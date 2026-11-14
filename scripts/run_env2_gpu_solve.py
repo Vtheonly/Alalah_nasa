@@ -89,6 +89,9 @@ def main(argv=None) -> int:
     ap.add_argument("--batch-size", type=int, default=S.BATCH_SIZE)
     ap.add_argument("--workers-per-gpu", type=int, default=1,
                     help="concurrent chunk workers per GPU (each < 6 GB)")
+    ap.add_argument("--max-sweeps", type=int, default=S.MAX_SOLVER_SWEEPS,
+                    help="cap on Gauss-Seidel sweeps (>= 6; the solve stops "
+                         "earlier once the per-sweep change < 1e-4)")
     ap.add_argument("--timing-gate-only", action="store_true",
                     help="benchmark one chunk and exit (readme Gate 4)")
     args = ap.parse_args(argv)
@@ -112,7 +115,7 @@ def main(argv=None) -> int:
         inp["priors"], inp["artifacts"], inp["cloud_df"],
         inp["platform_active"], t_days=S.T_DAYS, batch_size=args.batch_size,
         paths=paths, keep_states=False,
-        workers_per_gpu=args.workers_per_gpu)
+        workers_per_gpu=args.workers_per_gpu, max_sweeps=args.max_sweeps)
     logger.info("solve + folds done (%.0fs); c_modis=%s c_multi=%s",
                 time.time() - t0, h["c_modis"], h["c_multi"])
     products = ex.build_products(h["monthly"], h["daily"], inp["pass_obs"],

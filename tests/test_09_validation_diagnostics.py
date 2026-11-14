@@ -61,6 +61,8 @@ def test_09_chow_raw_2012_break_and_harmonized_pass(twin_diagnostics):
     # trends, so we compare break STRENGTH raw-vs-harmonized)
     assert sb["chow_harm_2012"]["F"] < 0.4 * sb["chow_raw_2012"]["F"]
     assert sb["chow_harm_2012"]["p"] > sb["chow_raw_2012"]["p"]
+    # readme 7.9: the harmonized record passes the 2012 Chow test
+    assert sb["chow_harm_2012"]["p"] > 0.05
 
 
 def test_09_mcd64cmq_burned_area_correlation():
@@ -227,4 +229,39 @@ def test_09_export_duckdb_roundtrip(full_twin, tmp_path):
         assert n > 0
     view = con.execute("SELECT COUNT(*) FROM v_calendar").fetchone()[0]
     assert view > 0
+    con.close()
+
+
+def test_09_export_survives_duckdb_duplicate_key_scale(tmp_path):
+    """150k provenance rows over 3 hexagons (heavily duplicated h3_index):
+    the exporter must not build an ART index that DuckDB 1.3.x cannot
+    construct on duplicated keys; tables are clustered by h3_index."""
+    import duckdb
+    from src.products import export_duckdb as ex
+    rng = np.random.default_rng(0)
+    cells = np.array([606614382356463615, 606614382490681343,
+                      606614387456737279], dtype=np.int64)
+    n = 150_000
+    p1 = pd.DataFrame({"h3_index": rng.choice(cells, n),
+                       "frp_mw": rng.uniform(1, 50, n)})
+    monthly = pd.DataFrame({"h3_index": cells, "year": 2020, "month": 8,
+                            "country_iso": "ARG", "pyrome_id": 0,
+                            "phi_q50_mw": 1.0, "phi_q05_mw": 0.5,
+                            "phi_q95_mw": 2.0, "hist_median_2003_2020": 1.0,
+                            "anomaly_ratio": 1.0, "raw_count_sum": 3.0,
+                            "raw_frp_sum_mw": 9.0})
+    daily = pd.DataFrame({"h3_index": rng.choice(cells, n),
+                          "t": rng.integers(0, 9510, n),
+                          "phi_q50_mw": 1.0})
+    diag = monthly[["h3_index", "year", "month"]].assign(
+        quality_flag="NOMINAL", attribution_flag="WITHIN_NORMAL_VARIABILITY",
+        measured_fraction=1.0)
+    db = tmp_path / "fire_harmonized.duckdb"
+    ex.export_duckdb({"product1": p1, "product2_monthly": monthly,
+                      "product2_daily": daily, "product3": diag}, db,
+                     parquet_dir=str(tmp_path))
+    con = duckdb.connect(str(db), read_only=True)
+    assert con.execute("SELECT COUNT(*) FROM obs_harmonized_provenance"
+                       ).fetchone()[0] == n
+    assert con.execute("SELECT COUNT(*) FROM hex_centers").fetchone()[0] == 3
     con.close()

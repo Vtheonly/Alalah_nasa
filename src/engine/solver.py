@@ -649,23 +649,41 @@ class GMRFSolver:
             a, b, g = self._block_system_rows(idx, s, t_lo)
 
     # ---- sweeps ------------------------------------------------------------
-    def solve(self, sweeps: int = S.SOLVER_SWEEPS):
-        for _sw in range(sweeps):
+    def _sweeps(self, sweeps, max_sweeps, tol, t_lo=0):
+        """``sweeps`` mandatory 3-color x Day/Night sweeps, then continue
+        (up to ``max_sweeps``) until the max per-sweep change < ``tol``."""
+        n_done = 0
+        max_sweeps = max(int(max_sweeps), int(sweeps))
+        while n_done < max_sweeps:
+            z_prev = self.z
             for color in (0, 1, 2):
                 for s in (0, 1):
-                    self._newton_block(color, s)
+                    self._newton_block(color, s, t_lo=t_lo)
+            n_done += 1
+            change = float(torch.max(torch.abs(self.z - z_prev))) \
+                if self.z.numel() else 0.0
+            if n_done >= sweeps and change < tol:
+                break
+        self.sweeps_done = n_done
+        self.last_sweep_change = change if n_done else 0.0
         return self.z
 
+    def solve(self, sweeps: int = S.SOLVER_SWEEPS,
+              max_sweeps: int | None = None, tol: float = S.SWEEP_TOL):
+        """MAP solve: the spec's 6 sweeps + convergence guard.  Passing
+        ``max_sweeps = sweeps`` reproduces the fixed-sweep schedule."""
+        return self._sweeps(sweeps, S.MAX_SOLVER_SWEEPS if max_sweeps is None
+                            else max_sweeps, tol)
+
     def solve_fixed_lag(self, window_days: int = 14,
-                        sweeps: int = S.SOLVER_SWEEPS):
+                        sweeps: int = S.SOLVER_SWEEPS,
+                        max_sweeps: int | None = None,
+                        tol: float = S.SWEEP_TOL):
         """Re-solve the trailing window ``[t_start, T-1]`` anchored at the
         saved ``z[t_start - 1]`` (AR(1) coupling enters the gradient)."""
         t_start = max(0, self.T - window_days)
-        for _sw in range(sweeps):
-            for color in (0, 1, 2):
-                for s in (0, 1):
-                    self._newton_block(color, s, t_lo=t_start)
-        return self.z
+        return self._sweeps(sweeps, S.MAX_SOLVER_SWEEPS if max_sweeps is None
+                            else max_sweeps, tol, t_lo=t_start)
 
     # ---- posterior ---------------------------------------------------------
     def posterior_factors(self):
@@ -890,17 +908,20 @@ def estimate_chunk_vram_bytes(batch_size: int = S.BATCH_SIZE,
 
 def solve_chunk(data: SolverData, sweeps: int = S.SOLVER_SWEEPS,
                 use_cuda: bool | None = None, device: str = "cpu",
+                max_sweeps: int | None = None,
                 daily_mode: str = "sparse", keep_years=None,
                 keep_solver: bool = True, seed: int = S.GMM_RANDOM_STATE):
     solver = GMRFSolver(data, use_cuda=use_cuda, device=device, seed=seed)
-    z = solver.solve(sweeps)
+    z = solver.solve(sweeps, max_sweeps=max_sweeps)
     var, monthly, daily = solver.posterior(daily_mode=daily_mode,
                                            keep_years=keep_years)
     out = {"cells": np.asarray(data.cells, dtype=np.int64),
            "z_map": z.cpu().numpy(), "var": var.cpu().numpy(),
            "monthly": monthly, "daily": daily,
            "cloud": data.cloud, "cloud_source": data.cloud_source,
-           "op": data.op.cpu().numpy()}
+           "op": data.op.cpu().numpy(),
+           "sweeps_done": solver.sweeps_done,
+           "last_sweep_change": solver.last_sweep_change}
     if keep_solver:
         out["solver"] = solver
     return out
@@ -920,6 +941,7 @@ def _chunk_job(shared, ci, chunk, device, use_cuda, opts):
         platform_active=shared["platform_active"],
         platform_mask=shared["platform_mask"])
     res = solve_chunk(data, sweeps=opts["sweeps"], use_cuda=use_cuda,
+                      max_sweeps=opts.get("max_sweeps"),
                       device=device, daily_mode=opts["daily_mode"],
                       keep_years=opts["keep_years"],
                       keep_solver=opts["keep_solver"],
@@ -965,7 +987,8 @@ def solve_all_chunks(pass_table, active_cells, hex_pyromes, priors,
                      batch_size: int = S.BATCH_SIZE, paths=None,
                      sweeps: int = S.SOLVER_SWEEPS, daily_mode: str = "sparse",
                      keep_years=None, keep_states: bool = True,
-                     workers_per_gpu: int = 1, n_devices: int | None = None):
+                     workers_per_gpu: int = 1, n_devices: int | None = None,
+                     max_sweeps: int | None = None):
     """Distribute active cells over all GPUs (``batch_size = 1000`` cells
     per chunk, ``< 6 GB`` VRAM each).
 
@@ -986,7 +1009,8 @@ def solve_all_chunks(pass_table, active_cells, hex_pyromes, priors,
     checkpoint_dir = None
     if paths is not None:
         checkpoint_dir = str(paths.state_checkpoint_pt) + ".chunks"
-    opts = {"t_days": t_days, "sweeps": sweeps, "daily_mode": daily_mode,
+    opts = {"t_days": t_days, "sweeps": sweeps, "max_sweeps": max_sweeps,
+            "daily_mode": daily_mode,
             "keep_years": keep_years,
             "keep_states": keep_states or checkpoint_dir is not None,
             "keep_solver": n_dev <= 1, "checkpoint_dir": checkpoint_dir}

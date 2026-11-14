@@ -233,17 +233,22 @@ def residual_slopes(pass_cal: pd.DataFrame, daily: pd.DataFrame) -> dict | None:
         - j["mu_gain_det"].to_numpy(dtype=float)
     r = z_imp - z_hat
     out = {"n": int(len(j)), "mean_residual": float(np.mean(r))}
+    def _slope(x, y):
+        """OLS slope + p, or None when the regressor has no spread
+        (a constant-geometry subset has no identifiable slope)."""
+        x = np.asarray(x, dtype=float)
+        if len(x) < 10 or float(np.std(x)) < 1e-6:
+            return None, None
+        lr = stats.linregress(x, y)
+        return float(lr.slope), float(lr.pvalue)
     for col, key in (("mean_vza_deg", "vza"), ("mean_solar_hour",
                                                 "solar_hour")):
-        lr = stats.linregress(j[col].to_numpy(dtype=float), r)
-        out[f"slope_per_{key}"] = float(lr.slope)
-        out[f"p_{key}"] = float(lr.pvalue)
+        out[f"slope_per_{key}"], out[f"p_{key}"] = _slope(
+            j[col].to_numpy(dtype=float), r)
     for fam in ("MODIS", "VIIRS"):
         sel = (j["sensor_family"] == fam).to_numpy()
-        if sel.sum() >= 10:
-            out[f"slope_per_vza_{fam}"] = float(stats.linregress(
-                j.loc[sel, "mean_vza_deg"].to_numpy(dtype=float),
-                r[sel]).slope)
+        out[f"slope_per_vza_{fam}"], _p = _slope(
+            j.loc[sel, "mean_vza_deg"].to_numpy(dtype=float), r[sel])
     return out
 
 

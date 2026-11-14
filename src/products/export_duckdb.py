@@ -196,20 +196,31 @@ def export_duckdb(products: dict, duckdb_path, parquet_dir=None,
     try:
         for table, path in parquet_paths.items():
             con.execute(f"DROP TABLE IF EXISTS {table}")
-            con.execute(
-                f"CREATE TABLE {table} AS SELECT * FROM read_parquet(?)",
-                [path])
             if table in ("state_reconstructed_monthly",
                          "uncertainty_diagnostics"):
+                con.execute(f"CREATE TABLE {table} AS SELECT * FROM "
+                            "read_parquet(?)", [path])
+                # (h3_index, year, month) is UNIQUE -> safe ART index
                 con.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_cell_ym "
                             f"ON {table}(h3_index, year, month)")
-            elif table in ("obs_harmonized_provenance",
-                           "state_reconstructed_daily"):
-                con.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_h3 ON "
-                            f"{table}(h3_index)")
+            else:
+                # Non-unique h3_index: clustered by ORDER BY so DuckDB's
+                # min/max zone maps prune scans.  No ART index here: DuckDB
+                # 1.3.x (the Kaggle image) fails building ART indexes on
+                # heavily duplicated keys ("unrecognized enum value for
+                # NType") above ~1e5 rows.
+                con.execute(f"CREATE TABLE {table} AS SELECT * FROM "
+                            "read_parquet(?) ORDER BY h3_index", [path])
         con.execute("DROP TABLE IF EXISTS hex_centers")
+        con.execute("CREATE TABLE hex_centers (h3_index BIGINT, latitude "
+                    "DOUBLE, longitude DOUBLE, country_iso VARCHAR)")
+        centers = centers.assign(country_iso=centers["country_iso"].map(
+            lambda v: None if v is None or (isinstance(v, float) and v != v)
+            else str(v)).astype(object))
         con.register("_centers", centers)
-        con.execute("CREATE TABLE hex_centers AS SELECT * FROM _centers")
+        con.execute("INSERT INTO hex_centers SELECT CAST(h3_index AS BIGINT), "
+                    "latitude, longitude, CAST(country_iso AS VARCHAR) "
+                    "FROM _centers")
         con.unregister("_centers")
         con.execute("CREATE INDEX IF NOT EXISTS idx_hex_centers_ll ON "
                     "hex_centers(longitude, latitude)")

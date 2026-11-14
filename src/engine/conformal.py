@@ -582,7 +582,8 @@ def finalize_monthly(monthly: pd.DataFrame, *, pass_obs: pd.DataFrame,
 def harmonize_and_calibrate(pass_cal, pass_obs, prov, hex_pyromes, priors, artifacts,
               cloud_df, platform_active, t_days: int = S.T_DAYS,
               batch_size: int = S.BATCH_SIZE, paths=None,
-              keep_states: bool = True, workers_per_gpu: int = 1):
+              keep_states: bool = True, workers_per_gpu: int = 1,
+              max_sweeps: int | None = None):
     """THE single Environment-2 harmonization path (shared by the twin and
     ``scripts/run_env2_gpu_solve.py``): main GMRF solve -> held-out
     conformal folds -> finalized monthly Product 2/3 frame + sparse daily.
@@ -592,7 +593,8 @@ def harmonize_and_calibrate(pass_cal, pass_obs, prov, hex_pyromes, priors, artif
                                        pass_cal["h3_index"].unique())),
                             dtype=np.int64)
     common = dict(t_days=t_days, platform_active=platform_active,
-                  batch_size=batch_size, workers_per_gpu=workers_per_gpu)
+                  batch_size=batch_size, workers_per_gpu=workers_per_gpu,
+                  max_sweeps=max_sweeps)
     res = solve_all_chunks(pass_cal, active_cells, hex_pyromes, priors,
                                artifacts, cloud_df, paths=paths,
                                keep_states=keep_states, **common)

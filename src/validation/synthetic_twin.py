@@ -460,7 +460,9 @@ def _make_row(platform, fam, date_str, hhmm, lat, lon, frp, sample, pixarea,
     if is_sama:
         conf, conf_num = "l", 18.0
     return {
-        "country_iso": None, "sensor_family": fam, "platform": platform,
+        # twin cells lie in Argentina (wildfires) and Algeria (gas flares)
+        "country_iso": "DZA" if role == "flare" else "ARG",
+        "sensor_family": fam, "platform": platform,
         "data_tier": "ML_SCIENCE", "latitude": lat, "longitude": lon,
         "acq_date": date_str, "acq_hhmm": hhmm,
         "t_mir_k": float(t_mir), "t_tir_k": float(t_tir),

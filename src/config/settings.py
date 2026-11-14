@@ -42,7 +42,12 @@ SAMA_BOX = (-110.0, -55.0, 11.0, 7.0)
 # Solver numerics
 # ---------------------------------------------------------------------------
 MC_SAMPLES = 200                   # joint posterior trajectories
-SOLVER_SWEEPS = 6                  # 3-color x Day/Night Gauss-Seidel sweeps
+SOLVER_SWEEPS = 6                  # 3-color x Day/Night Gauss-Seidel sweeps (minimum)
+# Convergence guard: after the 6 spec sweeps, keep sweeping until the max
+# per-sweep state change < SWEEP_TOL (block Gauss-Seidel over the Day/Night
+# + spatial couplings converges linearly, ~0.8/sweep on the twin).
+MAX_SOLVER_SWEEPS = 40
+SWEEP_TOL = 1e-4
 NEWTON_STEPS = 15                  # damped Newton-Raphson iterations per block
 BATCH_SIZE = 1000                  # active cells per GPU chunk (< 6 GB VRAM)
 ARMIJO_ALPHAS = (1.0, 0.5, 0.25, 0.125, 0.0625)
