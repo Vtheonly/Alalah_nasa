@@ -61,6 +61,17 @@ _UMD_PATTERNS = {
     "MCD64CMQ": re.compile(r"MCD64CMQ", re.IGNORECASE),
 }
 
+# Product directories whose name differs from the file names inside them:
+# the UMD archive stores the MOD14CMQ / MYD14CMQ cloud grids under
+# ``data/MODIS/C6/Mx14CMQ`` (observed on the live server).  These are
+# descended into; files inside are still matched by ``_UMD_PATTERNS``.
+_UMD_PRODUCT_DIRS = re.compile(r"^M[OXY]D?14C(8|M)Q$", re.IGNORECASE)
+
+# Small ancillary grids are staged before the (hours-long) active-fire text
+# files so a schema / reader problem surfaces in minutes, not at the end.
+UMD_KEY_ORDER = ("MOD14C8Q", "MYD14C8Q", "MCD64CMQ", "MCD14ML",
+                 "VNP14IMGML", "VJ114IMGML", "VJ214IMGML")
+
 
 # ---------------------------------------------------------------------------
 # Provenance manifest
@@ -253,6 +264,7 @@ def walk_umd_tree(session, patterns: dict[str, re.Pattern] = _UMD_PATTERNS,
     queue: list[tuple[str, int]] = [(".", 0)]
     seen: set[str] = set()
     pruned: list[str] = []
+    unmatched: dict[str, list[str]] = {}
     while queue:
         if len(seen) >= max_dirs or time.time() - t0 > max_seconds:
             logger.warning("UMD walk stopped after %d listings / %.0fs "
@@ -272,6 +284,7 @@ def walk_umd_tree(session, patterns: dict[str, re.Pattern] = _UMD_PATTERNS,
             full = name if d in (".", "", "/") else f"{d}/{name}"
             if is_dir:
                 if (depth == 0 or _UMD_STRUCTURAL_DIRS.match(name)
+                        or _UMD_PRODUCT_DIRS.match(name)
                         or any(rx.search(name) for rx in patterns.values())):
                     queue.append((full, depth + 1))
                 elif depth <= 3:
@@ -283,6 +296,8 @@ def walk_umd_tree(session, patterns: dict[str, re.Pattern] = _UMD_PATTERNS,
                 if rx.search(name):
                     found[key].append(full)
                     break
+            else:
+                unmatched.setdefault(d, []).append(name)
         if len(seen) % progress_every == 0:
             logger.info("UMD walk: %d directories listed in %.0fs; files so "
                         "far %s", len(seen), time.time() - t0,
@@ -293,6 +308,14 @@ def walk_umd_tree(session, patterns: dict[str, re.Pattern] = _UMD_PATTERNS,
     if pruned:
         logger.info("UMD walk pruned (not product/structural): %s%s",
                     pruned[:60], " ..." if len(pruned) > 60 else "")
+    for d, names in unmatched.items():
+        # Data files in a descended directory that match no product: log a
+        # sample so a renamed product is visible instead of silently absent.
+        logger.info("UMD walk: %d data files in %s match no product, e.g. %s",
+                    len(names), d, sorted(names)[:5])
+    empty = [k for k in patterns if not found[k]]
+    if empty:
+        logger.warning("UMD walk: no files for %s", empty)
     return {k: sorted(v) for k, v in found.items() if v}
 
 
@@ -458,6 +481,9 @@ def fetch_umd_history(paths: DataPaths, years: list[int],
     try:
         files_all = walk_umd_tree(session)
         files, superseded = select_latest_collections(files_all)
+        files = {k: files[k] for k in sorted(
+            files, key=lambda k: (UMD_KEY_ORDER.index(k)
+                                  if k in UMD_KEY_ORDER else len(UMD_KEY_ORDER)))}
         if manifest:
             manifest.log("umd_archive", f"{session.method}://{S.UMD_FTP_HOST}",
                          "remote_walk",
@@ -545,10 +571,16 @@ def fetch_umd_history(paths: DataPaths, years: list[int],
                                         "%d rows in target boxes, %.0fs",
                                         n_done, len(todo), n_lines, n_bad,
                                         len(df), time.time() - t_file)
-                        elif key in ("MOD14C8Q", "MYD14C8Q"):
+                        elif key in ("MOD14C8Q", "MYD14C8Q", "MCD64CMQ"):
+                            hdf_path = _gunzip_if_needed(tmp_path)
                             meta = parse_cmg_filename(name)
+                            if meta is None:
+                                raise ValueError(
+                                    f"cannot parse product/year/period from "
+                                    f"CMG file name {name!r}")
+                        if key in ("MOD14C8Q", "MYD14C8Q"):
                             if meta:
-                                sds = read_hdf4_sds(tmp_path, CMQ_CLOUD_LAYERS,
+                                sds = read_hdf4_sds(hdf_path, CMQ_CLOUD_LAYERS,
                                                     required=("MeanCloudFraction",))
                                 f = parse_cloud_cmg(sds, meta["year"],
                                                     meta["period"],
@@ -558,9 +590,8 @@ def fetch_umd_history(paths: DataPaths, years: list[int],
                                     f[_in_boxes(f["lat_025"], f["lon_025"],
                                                 bboxes)])
                         elif key == "MCD64CMQ":
-                            meta = parse_cmg_filename(name)
                             if meta:
-                                sds = read_hdf4_sds(tmp_path, CMQ_BURN_LAYERS,
+                                sds = read_hdf4_sds(hdf_path, CMQ_BURN_LAYERS,
                                                     required=("BurnedArea",))
                                 f = parse_burned_area_cmg(sds, meta["year"],
                                                           meta["period"])
@@ -582,6 +613,7 @@ def fetch_umd_history(paths: DataPaths, years: list[int],
                                 manifest.critical(key, msg)
                             raise RuntimeError(msg) from exc
                     finally:
+                        Path(str(tmp_path) + ".unz").unlink(missing_ok=True)
                         if kept is not None and tmp_path.exists() and \
                                 not kept.exists():
                             kept.parent.mkdir(parents=True, exist_ok=True)
@@ -592,6 +624,19 @@ def fetch_umd_history(paths: DataPaths, years: list[int],
         if own:
             session.close()
     return result
+
+
+def _gunzip_if_needed(path: Path) -> Path:
+    """``x.hdf.gz`` -> decompressed sibling ``x.hdf.gz.unz`` (pyhdf needs a
+    plain file); other paths are returned unchanged."""
+    path = Path(path)
+    if not path.name.endswith(".gz"):
+        return path
+    import shutil as _sh
+    out = Path(str(path) + ".unz")
+    with gzip.open(path, "rb") as src, open(out, "wb") as dst:
+        _sh.copyfileobj(src, dst)
+    return out
 
 
 def file_sha256(path, chunk: int = 1 << 22) -> str:

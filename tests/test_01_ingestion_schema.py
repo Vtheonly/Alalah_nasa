@@ -629,3 +629,63 @@ def test_01_umd_walk_is_pruned_and_finds_products():
     assert len(found["MCD14ML"]) == 2
     assert not any("MCD64A1" in c for c in calls)
     assert len(calls) < 15
+
+
+def test_01_umd_walk_descends_mx14cmq_and_stages_cloud_first(paths, monkeypatch):
+    """Live UMD layout: the MOD14CMQ / MYD14CMQ cloud grids sit under
+    ``data/MODIS/C6/Mx14CMQ`` (a directory name no file pattern matches).
+    They must be discovered, staged BEFORE the active-fire text files, and
+    ``.hdf.gz`` grids must be decompressed before pyhdf reads them."""
+    import gzip
+    import numpy as np
+    from src.ingest import download_data as d
+    tree = {
+        "data/MODIS/C6/Mx14CMQ/MOD14CMQ.200011.006.01.hdf": b"HDF",
+        "data/MODIS/C6/Mx14CMQ/MYD14CMQ.200211.006.01.hdf.gz":
+            gzip.compress(b"HDF"),
+        "data/MODIS/C6/Mx14CMQ/README.MOD14CMQ.txt": b"doc",
+        "data/MODIS/C61/MCD14ML/MCD14ML.200011.061.01.txt.gz": gzip.compress(
+            (MCD14ML_HEADER + "\n20001101 0040 T -29.160 -67.500 330.5 "
+             "295.1 681. 25.3 74 0 D").encode()),
+    }
+    found = d.walk_umd_tree(_FakeUMD(tree))
+    assert len(found["MOD14C8Q"]) == 1 and len(found["MYD14C8Q"]) == 1
+    order, read_paths = [], []
+
+    def fake_read(path, layers, required=None):
+        read_paths.append(Path(path))
+        assert Path(path).read_bytes() == b"HDF"     # gz was decompressed
+        order.append("cloud")
+        return {"MeanCloudFraction": ({}, np.full((720, 1440), 40.0))}
+
+    monkeypatch.setattr(d, "read_hdf4_sds", fake_read)
+    from src.ingest import normalize_dedup as nd
+    real = nd.parse_umd_text
+
+    def spy(*a, **k):
+        order.append("fires")
+        return real(*a, **k)
+
+    monkeypatch.setattr(nd, "parse_umd_text", spy)
+    res = d.fetch_umd_history(paths, [2000, 2002], d.ProvenanceManifest(
+        paths.provenance_manifest), session=_FakeUMD(tree))
+    assert order == ["cloud", "cloud", "fires"]
+    cloud = pd.concat(res["cloud"])
+    assert set(cloud["platform"]) == {"MOD", "MYD"}
+    assert set(cloud["period_kind"]) == {"month"}
+    assert set(zip(cloud["year"], cloud["period"])) == {(2000, 11), (2002, 11)}
+    assert np.allclose(cloud["cloud_frac"], 0.4)
+    assert not any(p.exists() for p in read_paths)   # temp files deleted
+
+
+def test_01_unparseable_cmg_name_is_a_failure_not_a_silent_skip(paths,
+                                                                monkeypatch):
+    import numpy as np
+    from src.ingest import download_data as d
+    monkeypatch.setattr(d, "read_hdf4_sds", lambda *a, **k: {
+        "MeanCloudFraction": ({}, np.zeros((720, 1440)))})
+    tree = {f"data/MODIS/C6/Mx14CMQ/MOD14CMQ.weird{i}.2001.hdf": b"x"
+            for i in range(5)}
+    with pytest.raises(RuntimeError, match="all failed"):
+        d.fetch_umd_history(paths, [2001], d.ProvenanceManifest(
+            paths.provenance_manifest), session=_FakeUMD(tree))

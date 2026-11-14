@@ -432,3 +432,16 @@ one bad line discarded the whole file. Fixed in the codebase:
   Now pruned to the root, structural dirs (data/MODIS/VIIRS/Cnn/years/...)
   and product-named dirs; 900 s / 2,000-listing budget; progress + pruned
   names logged; per-file `UMD [k/N]` download/parse progress lines.
+* Follow-up 2 (same day): the pruned walk found `MOD14C8Q: 0, MYD14C8Q: 0`
+  because the live UMD archive keeps the 0.25 deg cloud grids under
+  `data/MODIS/C6/Mx14CMQ/` (directory name matches no file pattern) -- the
+  run would have downloaded for hours and then aborted on "no cloud grid".
+  Fixed: `_UMD_PRODUCT_DIRS` (`M[OXY]D?14C(8|M)Q`) is descended; files are
+  still matched as MOD14CMQ / MYD14CMQ (monthly, `period_kind='month'`; UMD
+  has no 0.25 deg 8-day grid -- the 8-day CMG is 0.5 deg C8H). Ancillary
+  grids (cloud, MCD64CMQ) are now staged FIRST (`UMD_KEY_ORDER`) so reader
+  problems surface in minutes; `.hdf.gz` grids are gunzipped before pyhdf;
+  an unparseable CMG file name is a failure (counts toward fail-fast), not a
+  silent skip; the walk logs data files in descended dirs that match no
+  product and warns for products with zero files. Already-staged
+  `umd_*.parquet` active-fire files are reused on rerun.
