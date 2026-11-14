@@ -1,2164 +1,1112 @@
-### First: Clarifying the "6 Places" Question
-
-Your intuition caught an important distinction: **the mathematical engine is 100% global and has zero location-specific rules.** Every single formula works identically anywhere on Earth because the math depends on **pixel geometry, viewing angle, time of day, cloud fraction, and ecosystem behavior**, never on country names.
-
-Then why did I mention **6 benchmark countries/regions** earlier? Purely because of **36-hour engineering survival** (file sizes, Kaggle's 20 GB output disk limit, and download reliability):
-
-* **Global raw CSVs (2000–2026)** contain roughly 120–160+ million hotspot rows (~35–55 GB of raw text). Downloading, clustering, and running pixel-level harmonization on the entire planet in 36 hours risks running out of disk space or failing at Hour 18.
-* **The Honest Dual-Scope Solution:** Because your math is location-independent, we structure the **data scope** in two safe tiers:
-  1. **Tier 1 (Guaranteed Core — Full Detail, ~36 km² Hexagons):** 6 climate-diverse countries/regions (~2–3 GB raw CSV, shrinking to ~400 MB compressed Parquet) covering every major fire regime on Earth (Argentina, Algeria, USA, Brazil, Indonesia, Australia).
-  2. **Tier 2 (Global Coarse Calendar — Conditional at Hour 4, ~1,770 km² Hexagons):** Inside your internet-enabled Kaggle CPU staging notebook, if NASA/UMD's global yearly archive streams cleanly before Hour 4, we summarize global rows *on the fly during streaming* into coarse hexagons (~1.5–2.5 GB total) and run the exact same mathematical engine on **the entire globe** too. If the global stream throttles, Tier 1 guarantees you finish with a complete, validated engine and web app.
+# PART I — Complete Decision Record, Technical Evolution, and Brutally Honest Audit
 
 ---
 
-### Second: Brutal Honesty Audit of Your 17-Point Specification
+## 1. Main Problem Definition, Underlying Challenges, Constraints, and Objectives
 
-The 17-point architecture you pasted is scientifically spot-on—it describes an ideal multi-year Earth Observation data assimilation system (comparable to what ECMWF/CAMS or NASA science teams build over several years). Before writing down all the equations, let us be **100% honest** about what part of those 17 points we can genuinely build mathematically in **36 hours and 12 GPU-hours**, and what must be simplified or scoped out:
+### 1.1 The Scientific and Practical Problem
+The project addresses the **2026 NASA Space Apps Challenge: *"Harmonization of MODIS and VIIRS Hot Spots"*** (authored by Marina Compagnucci, CONAE). The objective is twofold:
+1. **Scientific Data Reconstruction:** Synthesize over 26 years (November 2000 – November 14, 2026) of active-fire thermal anomaly records across MODIS (`Terra`, `Aqua`) and VIIRS (`Suomi-NPP`, `NOAA-20`, `NOAA-21`) into a single, physically consistent, uncertainty-quantified dataset where sensor transitions no longer induce artificial jumps.
+2. **Operational Decision Support:** Expose the harmonized dataset inside an interactive **Burning Activity Calendar Web Application** allowing emergency managers, scientists, and land managers to select an area of interest (map bounding box or coordinates), examine a Year × Month calendar heatmap, compare current burning activity against historical medians, visualize trends and anomalies, inspect uncertainty, and download CSV analytics.
 
-| Challenge from Your 17-Point List | Mathematical Status in Our 36-Hour Engine | What Is Genuinely Achieved vs. What Is Deferred |
+### 1.2 Why Existing Data Cannot Be Merged Directly
+Concatenating or rescaling MODIS and VIIRS hotspot tables fails for physical, geometric, orbital, and algorithmic reasons:
+* **Spatial Resolution & Detection Threshold Discontinuity:** MODIS detects at nominal `1 km` nadir (`~1.0 km²`, growing to `~9.6–9.7 km²` at `65°` view zenith angle [VZA]), with minimum detectable Fire Radiative Power ($F_{\min}$) ranging from `~3.7 MW` (nadir night) up to `~40 MW` (off-nadir day). VIIRS 375 m (`I-band`) detects at `~0.14 km²` nadir (`~0.62 km²` off-nadir), reaching `~0.5–2.5 MW`. Switching from MODIS to VIIRS in 2012 artificially multiplies raw hotspot counts by `3×–10×` even when physical burning is flat.
+* **Spectral Bandpass & Saturation Asymmetry:** MODIS uses `3.96 μm` (Channels 21/22, saturating near `500 K` / `331 K`). VIIRS uses `3.74 μm` (`I4`, saturating at `367 K`), relying on co-located `750 m` `M13` (`4.05 μm`) pixels for FRP retrieval, which causes shared fractional FRP across adjacent 375 m pixels or null/zero FRP when M13/background retrieval fails. Raw brightness temperatures (`brightness`/`bright_t31` vs `bright_ti4`/`bright_ti5`) are physically non-comparable.
+* **Scan-Edge Artifacts:** MODIS exhibits severe **bow-tie overlap** at high scan angles (adjacent scans overlap up to ~50%, double-counting the same fire pixels), whereas VIIRS applies **onboard pixel aggregation (`3:1`, `2:1`, `1:1`)** plus bow-tie pixel deletion.
+* **Constellation Multiplicity:** From 2000–2002 only `Terra` operated; `Aqua` joined in July 2002; `Suomi-NPP` joined January 2012; `NOAA-20` joined 2018; `NOAA-21` joined 2023/2024; and `Suomi-NPP` ceased FIRMS delivery on **November 2, 2026**. `SNPP`, `NOAA-20`, and `NOAA-21` share the ~13:30 / 01:30 orbital plane (~50 minutes apart), meaning summing raw detections across afternoon platforms counts the same burning fire multiple times.
+* **Post-2022 Orbital Clock Drift:** Starting in 2022, `Terra` (10:30 AM nominal) and `Aqua` (1:30 PM nominal) exited station-keeping, drifting progressively toward ~8:45 AM and ~3:30–3:50 PM respectively, confounding diurnal fire cycles with long-term trends.
+* **Clouds, Quality Tiers, and Non-Biomass Heat Sources:** Equatorial cloud cover drops single-pass detection probability below 30–40%; `NRT` streams drop the `type` column and assign `daynight` purely by ascending/descending orbit node rather than Solar Zenith Angle (`SZA < 85°`) used in Science `ML` products; South Atlantic Magnetic Anomaly (SAMA) nighttime artifacts and persistent Saharan gas flares contaminate raw counts.
+* **Fundamental Identifiability Limit:** Orbital thermal radiance (FRP) alone cannot uniquely invert sub-pixel flame temperature ($T_f$), flame area ($A_f$), fuel load, or combustion completeness without external fuel models. Any honest engine must restrict outputs to identifiable quantities (radiative flux $\Phi$, Fire Radiative Energy $\text{FRE}$, burning footprint area, and event proxies) and quantify ambiguity explicitly.
+
+### 1.3 Hard Operational & Resource Constraints
+1. **36-Hour Total Deadline** from start to finished dataset, validation suite, and web application.
+2. **12 GPU-Hour Budget** originally planned on Kaggle `4x NVIDIA L4` (~96 GB aggregate VRAM), subject to strict **offline execution (no internet)** and a **~20 GB `/kaggle/working` output persistence cap** (plus a `2×` quota burn warning on multi-GPU instances).
+3. **Bandwidth Asymmetry:** Operating from Algeria makes downloading 40–55 GB of global raw NASA CSVs locally and re-uploading to Kaggle prohibitive inside 36 hours.
+4. **Kaggle Runtime & Policy Constraints:** Kaggle GPU images (`v173`, late 2026) run **Python 3.12**; `pyhdf` lacks Python 3.12 `manylinux` wheels and requires `libhdf4-dev` compilation; `L4x4` accelerators are restricted to authorized Kaggle Code Competitions, whereas general free Kaggle notebooks provide **`T4 x2`** (2 × 15 GB VRAM).
+
+---
+
+## 2. Core System Principles (Finalized Invariants)
+
+We locked 10 non-negotiable system invariants (`INV-01` through `INV-10`):
+1. **INV-01 (No Imitation Learning):** Never train `VIIRS -> MODIS` (destroying detail) or `MODIS -> VIIRS` (hallucinating unobserved 2000–2011 small fires). Both sensor families inform a shared physical latent state via forward observation operators.
+2. **INV-02 (Never Sum Same-Orbit Platforms):** Treat `SNPP`, `NOAA-20`, and `NOAA-21` observations in the same half-day window as conditionally independent observations of the same latent physical state, never additive fires.
+3. **INV-03 (Pre-Drift Calibration Freeze):** Calibrate all cross-sensor MODIS–VIIRS operators strictly on the stable-orbit overlap window (`2012-01-20` to `2021-12-31`).
+4. **INV-04 (Explicit Operational Calendar & Outage Masking):** Only platforms physically operating and healthy on day $d$ enter the likelihood (`SNPP` closed after `2026-11-02`).
+5. **INV-05 (Separate Physical State from Observation Model):** Explicitly separate $Y_{s,t} = h_s(X_t, \theta_s, G_{s,t}, A_{s,t}) + \epsilon_{s,t}$ and $D_{s,t} \sim \text{Bernoulli}(p_s)$ from inference $P(X_t \mid Y_{1:t}, D_{1:t}, Q_{1:t}, G_{1:t})$.
+6. **INV-06 (No Raw Brightness Temperature Merging):** Never average `T21`/`T31` with `T_I4`/`T_I5`.
+7. **INV-07 (Honest Zero-Detection Censoring):** Model MODIS sub-threshold blindness ($F_{\min}$) via a Hurdle likelihood so 2000–2011 uncertainty widens honestly instead of clamping small fires to zero.
+8. **INV-08 (Static Thermal Anomaly Isolation):** Isolate volcanoes, offshore flares, SAMA nighttime artifacts, and multi-year industrial gas flares before biomass state reconstruction.
+9. **INV-09 (Zero Data Destruction):** Emit 3 complementary products preserving untouched raw provenance alongside latent states and uncertainty diagnostics.
+10. **INV-10 (No Coordinate Leakage):** Unsupervised pyrome discovery uses strictly behavioral fire features, never latitude or longitude.
+
+---
+
+## 3. Exhaustive Decision-by-Decision Record
+
+### Decision D1: Three-Environment Execution Architecture `[FINALIZED]`
+1. **Final Decision:** Decouple execution into **Environment 1** (Internet-ON CPU stager: cloud-to-cloud acquisition, HDF4 extraction, polygon filtering, Zstd Parquet conversion, Python 3.12 wheel packaging), **Environment 2** (Internet-OFF GPU compute: offline wheel install, geometry, calibration, GPU state-space solver, conformal calibration, validation, DuckDB/Parquet export), and **Environment 3** (Web server hosting FastAPI + DuckDB + frontend).
+2. **Reasoning:** Eliminates residential bandwidth bottlenecks, satisfies offline GPU notebook constraints, isolates C-dependency compilation (`libhdf4-dev` for `pyhdf`) inside Env 1 so Env 2 installs pure `manylinux` wheels in seconds, and prevents wasting scarce GPU hours on CSV parsing or idling web servers.
+3. **Alternatives Discussed & Rejected:** Local download/upload to Kaggle (fails 36h timeline); compiling CUDA/HDF4 extensions offline in Env 2 (high ABI breakage risk); tunneling a live UI out of Kaggle GPU notebooks (blocked by disabled internet and burns GPU quota).
+4. **Layer Design Role:** Establishes clean data-artifact boundaries (`staged_data/` + `offline_wheels/` $\rightarrow$ `fire_harmonized.duckdb` + 3 Parquet tables $\rightarrow$ REST API).
+5. **Consequences:** Requires manual dataset publication between Env 1 $\rightarrow$ Env 2 and artifact download between Env 2 $\rightarrow$ Env 3, while reducing Env 2 GPU waste to zero.
+6. **Evidence & Confidence:** **High confidence (Engineering judgment backed by Kaggle Python 3.12 `v173` and offline execution rules).**
+
+### Decision D2: Geographic Scope (`6 Multi-Biome Benchmark Countries`) `[FINALIZED — POLYGON PATCH REQUIRED]`
+1. **Final Decision:** Run full pixel-to-hexagon harmonization across 6 scientifically diverse countries: `ARG` (CONAE July–Aug 2026 Chilecito spotlight, Pampas, SAMA), `DZA` (Kabylie crown fires vs. Saharan gas flares), `BRA` (Amazon/Cerrado 2012–2021 calibration density, clouds, SAMA), `IDN` (extreme clouds, nighttime peat smoldering, abstention), `AUS` (low-FRP northern savannas + Black Summer saturation), and `USA` (split into `CONUS` + `Alaska` for boreal cluster testing).
+2. **Reasoning:** Our mathematical equations are 100% coordinate-agnostic; limiting data volume to 6 climate-diverse regimes keeps raw text to ~2–3 GB (~1.2–2.5 GB Zstd Parquet) instead of 35–55 GB globally, guaranteeing completion within 36 hours and `< 20 GB` disk while stress-testing every failure mode in EO literature.
+3. **Alternatives Discussed & Rejected:** Full global 2000–2026 pixel-level ingestion (`150M+` rows, breaks disk/time budget); conditional dual-tier `H3-Res4` global branch (rejected in our single-system lock to eliminate dead/competing code paths); single-country prototype (fails to validate cross-biome generalization).
+4. **Layer Design Role:** Implemented strictly as geographic masks in Env 1 and `src/config/settings.py`.
+5. **Consequences & Honest Audit Critique:** **Flaw caught in audit:** Draft `01_download_and_stage.py` filtered solely by rectangular bounding boxes, which accidentally pull in large regions of neighboring countries (Bolivia, Peru, Paraguay, Uruguay, Chile, Tunisia, Morocco, Mali), silently inflating active cell count and GPU work by ~30–50%. **Mandatory fix:** Clip strictly against Natural Earth `50m` Admin-0 country polygons (`shapely.contains_xy`) inside Env 1 (note GeoPandas 1.0 removed bundled `naturalearth_lowres`, so Env 1 must fetch the raw GeoJSON directly).
+6. **Evidence & Confidence:** **High confidence in the 6-country design; High confidence that polygon clipping must replace bbox-only filtering.**
+
+### Decision D3: Spatial Reference Grid (`Uber H3 Hexagons`) `[FINALIZED — RESOLUTION & ACTIVE-CELL BUDGET AUDITED]`
+1. **Final Decision (Prior Spec):** Equal-area Uber H3 hexagons at **Resolution 6** ($\bar{A} \approx 36.13\,\text{km}^2$) as the harmonization support grid, with fine micro-cells for static flare detection.
+2. **Reasoning:** Point-to-point matching between `1 km` MODIS and `375 m` VIIRS fails under off-nadir footprint growth; lat/lon degree grids distort pixel density toward the poles by $\cos(\text{lat})$; H3 provides equal-area cells globally and uniform 6-neighbor topology.
+3. **Alternatives Discussed & Rejected:** Raw point matching; $0.25^\circ$ lat/lon grid; dual `H3-Res6` + `H3-Res4` dual-resolution architecture.
+4. **Layer Design Role:** `src/geometry/h3_utils.py` wraps `h3 v3/v4` integer conversion (`int64` storage, explicit `h3.int_to_str`/`str_to_int` conversion for `h3 v4`), builds sparse active-cell graphs, and computes a **3-coloring** of the planar hex graph.
+5. **Consequences & Brutally Honest Audit Critique:**
+   * **Bug #1 (`h3 v4` Crash):** Draft `01_download_and_stage.py` converted `latlng_to_cell` to `int(..., 16)`, which causes `TypeError` / `H3CellInvalidError` when passed directly to `h3 v4` functions like `grid_disk` unless `h3_utils.py` converts consistently.
+   * **Bug #2 (Grossly Underestimated Cell Count):** Our earlier spec estimated `35,000–65,000` active H3-Res6 cells across the 6 countries. In reality, those 6 countries cover `~33.1 million km² ≈ 916,000` H3-Res6 hexagons; across 26 years (including 14 years of 375 m VIIRS agricultural/savanna burning), **250,000–450,000+ hexagons** will contain at least one detection—**5×–8× larger** than budgeted!
+   * **Bug #3 (`H3-Res10` Flare Jitter):** `H3-Res10` cells (`~66 m` radius) are smaller than off-nadir/drifting MODIS geolocation jitter (`50–300+ m`), causing single Saharan gas flares to split across multiple Res-10 cells and fail persistence thresholds. **Mandatory fix:** Use **H3 Resolution 8** (`~0.74 km²`, ~460 m edge) for static flare persistence masking.
+6. **Evidence & Confidence:** **High confidence in H3; Low confidence in our earlier 35k–65k Res-6 estimate—requires Polygon Clipping + GPU solver speedup (D10) to keep Res-6 viable within budget.**
+
+### Decision D4: Implementation Stack & Offline Packaging `[FINALIZED]`
+1. **Final Decision:** `DuckDB` + `Polars` + `PyArrow` for out-of-core CPU ETL; `scipy.spatial.cKDTree` + `csgraph.connected_components` + `shapely` for geometry/clustering; `scikit-learn` (`GaussianMixture`, `IsotonicRegression`) + `lightgbm` for calibration; pure `PyTorch` (`float64` kernels, `torch.multiprocessing`) for state-space solving; `FastAPI` + `DuckDB` + vanilla ES6 `MapLibre GL JS` + `Apache ECharts` for the web app. Offline wheel bundle strictly limited to `duckdb`, `polars`, and `h3` (`manylinux2014_x86_64`, Python 3.12).
+2. **Reasoning:** Avoids recompiling CUDA/C++ extensions (`RAPIDS`, `JAX`, `pyhdf`) offline inside Env 2; DuckDB + Polars process 30M+ rows in seconds on CPU without spending GPU hours; zero-build frontend eliminates Node/npm failure modes in Hours 24–32.
+3. **Alternatives Discussed & Rejected:** RAPIDS `cuDF`; `JAX`/`NumPyro`; `GeoPandas`/`PostGIS` for heavy ETL; dual React + Streamlit fallback UIs.
+4. **Consequences:** Offline wheel package stays `< 80 MB`, installs in ~10 seconds, and uses Kaggle's preinstalled PyTorch/LightGBM/SciPy/Shapely stack natively.
+5. **Evidence & Confidence:** **High confidence (95%).**
+
+### Decision D5: Data Acquisition, Ancillary Grids, and Deduplication `[SUPERSEDED DRAFT -> REQUIRES PATCHES]`
+1. **Final Decision (Intent):** Primary Science archives (`MCD14ML`, `VNP14IMGML`, `VJ114IMGML`, `VJ214IMGML`, `Mx14CMQ`/`Mx14C8Q` clouds, and burned area validation) from `fuoco.geog.umd.edu`; trailing 2026 NRT gap-fill from NASA FIRMS REST API; HDF4 extraction exclusively in Env 1; Science priority (`ML > SP > NRT`).
+2. **Brutally Honest Audit of Draft Bugs & Necessary Fixes:**
+   * **Broken Draft `01_download_and_stage.py`:** Still contained disabled `/api/country/csv` calls and brittle HTML scraping, completely mismatched UMD's real file formats (`MCD14ML` is space-delimited `.txt.gz` with `YYYYMMDD HHMM sat lat lon T21 T31 sample FRP conf type dn`, NOT `.csv.gz` with `scan/track`; `Vxx14IMGML` has `YYYYMMDD, HHMM, Sat, Lat, Lon, T_I4, T_I5, Sample, Pixarea, FRP, Conf, Type`, NOT `bright_ti4`/`scan`/`track`), and ignored FTP fallback (`fuoco.geog.umd.edu`).
+   * **Broken SFTP Fallback Plan (`53,000` `/api/area` calls):** If port 22 is firewalled on Kaggle CPU runners, calling `/api/area/csv/.../5/...` over 26 years × 7 boxes × 4 sensors hits `~53,000+` calls and crashes NASA's `5,000 tx / 10 min` limit. **Verified Superior Fallback:** Use **Source Cooperative's NASA FIRMS Portolan GeoParquet 2.0 mirror** (`https://data.source.coop/portolan-mirrors/firms-catalog/detections/year=<YYYY>/detections.parquet` or `s3://us-west-2.opendata.source.coop/...`), which already mirrors all `631M+` global MODIS+VIIRS FIRMS detections from Nov 2000 to today (updated hourly, DuckDB-queryable via `httpfs` with Hilbert spatial pruning), reserving `/api/area/csv/.../5/...` strictly for trailing NRT gap-filling if needed!
+   * **NRT vs. ML Deduplication Leak:** Draft `02_normalize_dedup_verify.py` keyed on `ROUND(lat, 4)` (~11 m) and exact `acq_hhmm`. Geolocation LUT shifts between NRT and Science ML move pixels by 40–300+ m, leaking duplicate rows. **Fix:** Drop `NRT` completely at the `(platform, acq_date)` level wherever `ML_SCIENCE` or `SP_SCIENCE` exists for that platform.
+   * **Burned Area Bloat (`MCD64A1/SHP` vs `MCD64CMQ`):** Downloading/intersecting gigabytes of 500 m `MCD64A1/SHP` files in Env 1 wastes hours; replacing it with UMD's **`MCD64CMQ`** (`0.25°` monthly gridded burned area, 2001–2025) runs in seconds across the full 25-year span.
+   * **Cloud Granularity Upgrade (Tentative -> Finalized Fix):** Upgrade from monthly `Mx14CMQ` to **8-day `MOD14C8Q` / `MYD14C8Q`** (falling back to monthly `Mx14CMQ` only if a month lacks 8-day files) so short cloudy storms are not smeared over 30 days.
+   * **`acq_hhmm` & `Day/Night` SZA Bug:** `acq_time` (`HHMM`, e.g., `51` = `00:51`) must parse via `(hhmm // 100) + (hhmm % 100) / 60.0`. Moreover, NASA FIRMS FAQ (Nov 10, 2026) documents that `ML` assigns `Day/Night` via **Solar Zenith Angle (`SZA < 85°`)**, whereas `NRT` assigns it solely by **ascending/descending orbit**—corrupting high-latitude Alaska transitions unless `SZA` is computed uniformly for every row!
+3. **Evidence & Confidence:** **High confidence in the corrected multi-source architecture; Medium confidence on Kaggle CPU port 22 availability until tested at Minute 15 (mitigated completely by the verified Source Cooperative Portolan GeoParquet mirror).**
+
+### Decision D6: Geometry Correction, Hygiene, and Single-Pass Clustering `[FINALIZED WITH FIXES]`
+1. **Final Decision:** Map `(lat, lon)` to `H3-Res6`; compute exact Solar Zenith Angle (`SZA < 85°`) and local solar time $\tau_i$ for consistent Day/Night assignment; derive `scan_km, track_km, A_i, vza_deg` from `Sample` via exact spherical Earth scan geometry when `scan/track` is absent (and preserve `Pixarea` when given); filter `type IN (1, 3)`, nighttime low-conf SAMA points, and `H3-Res8` persistent industrial flares (`type == 2` OR `Y >= 3 yrs, D_bar >= 15 days/yr, R_DN > 0.30`); within single-platform overpasses ($\Delta t \le 5\,\text{min}$), apply MODIS bow-tie overlap weighting ($\omega^{\text{bt}}_i = 1/(1 + \text{deg}(i))$ for $A_i > 1.5\,\text{km}^2$), cluster pixels via ECEF `cKDTree` + connected components ($d_{ij} \le 1.4\max(\sqrt{A_i},\sqrt{A_j})$), classify `i4_m13_fallback` (`sigma` inflation `1.35×`) vs true clipped Tobit saturation `sat_flag = 1`, and aggregate strictly per `(h3_index, solar_date, platform, dn_flag)`.
+2. **Reasoning:** Eliminates bow-tie FRP inflation, VIIRS pixel-splitting count inflation, NRT industrial flare leakage, and `SNPP + N20 + N21` multi-counting.
+3. **Alternatives Discussed & Rejected:** Multi-Hypothesis Tracking (MHT) across days (intractable across 26 years in 36h); dropping low-confidence fires (creates omission bias).
+4. **Consequences & Honest Caveat:** Static persistence thresholds (`3 yrs, 15 days/yr, 0.30`) are heuristic engineering judgments that could occasionally flag stationary multi-year peat smoldering in Indonesia unless visually verified against Algeria/Indonesia diagnostics. Also, missing non-detection passes (`Y == 0`) require explicit analytical swath probability $p_{\text{swath}}$, swath-averaged area/VZA, and orbital-drift solar time $\bar{\tau}(d)$, PLUS an empirical **`platform_active_day[p, d]`** check (`>= 5` total detections across target regions) so spacecraft safe-mode outages are never treated as zero-fire evidence.
+5. **Evidence & Confidence:** **High confidence (90%).**
+
+### Decision D7: Pre-Drift Observation Operator Calibration (`2012–2021`) `[FINALIZED WITH 3 CRITICAL MATH FIXES]`
+1. **Final Decision:** Calibrate strictly on stable-orbit `2012-01-20 .. 2021-12-31`: `K=7` coordinate-free GMM behavioral pyromes (`pyromes.py`), isotonic confidence reliability $w_i \in [0.15, 1.0]$, linear pixel-area detection limits $F_{\min, p}(A, \text{DN})$ + truncated Log-Normal MLE yielding analytical survival integrals $\psi^{\text{CNT}}, \psi^{\text{FRP}}$, Empirical Quantile Mapping (EQM) + LightGBM residual bias $\gamma_{\text{MODIS}, b}$ against near-nadir VIIRS reference (`VZA_VIIRS < 25°`), 2-harmonic Fourier diurnal & drift curve $D_{b,s}(\tau)$ (also fitting post-2022 Aqua vs NOAA-20 drift *strictly* on the diurnal coefficients), and heteroscedastic observation variance $\sigma^2_{p,g,d,\text{DN}} \in [0.025, 2.50]$.
+2. **Reasoning:** Models physics-driven biome, intensity-tail, VZA, and diurnal differences without collapsing MODIS vs. VIIRS into a single broken global constant.
+3. **Brutally Honest Math Bugs Caught & Corrected:**
+   * **Math Bug #1 (Fatal Cloud Double-Counting):** Earlier specs placed $\ln v_{p,g,d}$ (cloud visibility) inside $\mu^{\text{gain}}$ for **detected** observations (`Case A/B`). That assumes clouds halve the radiance of fires seen through clear-sky gaps, artificially multiplying detected FRP by $2\times\text{–}10\times$ in cloudy Indonesia/Amazonia! **Correction:** Remove $\ln v_{p,g,d}$ completely from Case A/B; cloud visibility belongs **strictly inside Case C** ($P(D=0 \mid z) = (1 - v) + v e^{-\Lambda(z)}$).
+   * **Math Bug #2 (24h vs. 12h Diurnal Collapse):** Earlier specs normalized $D(\tau)$ over 24 hours, divided both $Y_{\text{Day}}$ and $Y_{\text{Night}}$ by $D(\tau)$, and then weighted $\Phi_{\text{Day}}, \Phi_{\text{Night}}$ by $w_{\text{day}}, w_{\text{night}}$. That forced both $\Phi_{\text{Day}}$ and $\Phi_{\text{Night}}$ to estimate the 24h mean, collapsing `night_day_ratio` toward `~1.0` and causing extreme blowups on nocturnal smoldering fires! **Correction:** Normalize $D_{\text{day}}(\tau)$ to unit mean strictly within Daytime (`06:00–18:00`) and $D_{\text{night}}(\tau)$ to unit mean strictly within Nighttime (`18:00–06:00`), then integrate 24h mean flux as $0.5(\Phi_{\text{Day}} + \Phi_{\text{Night}})$.
+   * **Math Bug #3 (Unconditional $\psi^{\text{FRP}}$ Blowup & Wrong Monotonicity Sign):** Dividing isolated single-fire detections (`raw_event_count == 1`) unconditionally by small $\psi^{\text{FRP}}$ assumes hidden companion fires and inflates isolated fires; forcing `monotone_constraints=[-1]` on `VZA` inside LightGBM fights real data geometry when bow-tie/background bias pushes the opposite direction; and pairing Aqua with off-nadir S-NPP mixes both sensors' angle errors. **Correction:** Restrict calibration pairs to near-nadir `VZA_SNPP < 25°`, enforce monotonicity strictly on **quantile ordering** inside EQM (not on VZA), and condition $\psi^{\text{FRP}}$ smoothly via Hurdle detection expectation $\frac{\psi^{\text{FRP}}}{1 - e^{-\Lambda}}$ (clamped cleanly) so isolated large fires aren't blown up.
+4. **Remaining Limitation:** Polar-only satellites (~10:30, ~13:30, ~15:50) do not directly observe late-afternoon peaks (`16:00–19:00`), so absolute `FRE (TJ)` relies on 2-harmonic smoothness even while relative seasonal/annual anomalies remain accurate.
+5. **Evidence & Confidence:** **High confidence (90%) once the three math fixes are applied.**
+
+### Decision D8 & D9: Latent State-Space Model & Convexity-Guarded Likelihoods `[FINALIZED WITH CONSISTENCY FIX]`
+1. **Final Decision:** Daily latent Day & Night log-fluxes $z_{g,d,\text{Day}}, z_{g,d,\text{Night}}$ reconstructed via a Space × Time × Day-Night Gaussian Markov Random Field (GMRF) MAP-Laplace model with Empirical Bayes shrinkage priors $(\mu_{g,m,\text{DN}}, \rho_b, \sigma_{\text{proc},b}, \lambda_{0,b}, \beta_{\text{dn},b}, \eta_{\text{dn},b})$ estimated deterministically from 2012–2021 VIIRS. Combine (A) Gaussian log-FRP likelihood, (B) Right-Censored Tobit saturation likelihood (via `log_ndtr` + asymptotic tail), and (C) Hurdle Zero-Detection Poisson-Cloud mixture likelihood using exact analytical gradients and a **Gauss-Newton convexity guard** ($h_{\text{miss}} = \max(0.0, \ell''_{\text{miss}})$) guaranteeing Global Symmetric Positive Definiteness ($H \succ 0$).
+2. **Alternatives Discussed & Rejected:** Deep learning / ConvLSTMs (hallucination risk); Low-rank tensor completion (oversmooths high-rank extreme wildfire spikes); MCMC/HMC (computationally infeasible on 100k+ cells × 9,510 days in 36h); unguarded Newton (crashes Cholesky when $v < 1$ causes minor negative curvature in the 2-component Hurdle log-likelihood).
+3. **Audit Fix Applied:** Earlier drafts mixed $\Phi = e^z$ in likelihoods with $\Phi = \max(0, e^z - 0.05)$ in post-processing (biasing small `0.5 MW` fires by 10% and leaving positive Poisson rate at $z_{\min}$). Fixed uniformly to $\Phi = e^z$ across all likelihoods and post-processing with dormant baseline floor $z_{\min} = \ln(0.01\,\text{MW})$. Also replaced misleading linear `std_events = Phi / F_event` with explicit labeling (`energy_equivalent_events`) alongside Hurdle-adjusted cluster counts.
+4. **Evidence & Confidence:** **High confidence (95%).**
+
+### Decision D10: Multi-GPU `float64` Solver (`3-Color` Gauss-Seidel + Thomas $LDL^\top$ + Takahashi + Joint Cholesky) `[FINALIZED — KERNEL OPTIMIZATION & HARDWARE FLEXIBILITY APPLIED]`
+1. **Final Decision:** Partition active H3 cells across available GPUs (`torch.cuda.device_count()`, running on `T4 x2`, `1x L4`, or `4x L4`) in chunks sized safely under 6 GB VRAM (`batch_size = 1000`); run `6` outer sweeps over **H3 3-Coloring** (`color in {0, 1, 2}`, mathematically required for planar hexagons rather than 2-coloring) × alternating `Day/Night`; solve tridiagonal systems in **`torch.float64`** via Thomas $LDL^\top$ + Armijo backtracking; compute exact variances via Takahashi Recursion and sample $M=200$ joint correlated trajectories via $L^\top u = D^{-1/2}\varepsilon$ (soft-clamped to `z in [-8, 14]` before `exp` to prevent `4-sigma` outlier explosions).
+2. **Brutally Honest Hardware & Runtime Audit:**
+   * **Kaggle `L4x4` Policy Trap:** Kaggle Code Competitions restrict `L4x4` strictly to authorized competition notebooks; general free Kaggle users receive `T4 x2` (15 GB VRAM/GPU). Using dynamic `device_count()` and `< 6 GB` chunk memory makes the engine portable across both without OOM.
+   * **Sequential `9,510`-Step CUDA Kernel Launch Trap:** Running `for t in range(9510)` inside `@torch.jit.script` launches 9,510 tiny CUDA slice kernels per pass (~0.15–0.25s launch latency per solve × 540 solves = ~1.5–2 min/chunk $\implies$ 4–8+ hours across 300k Res-6 cells!).
+   * **Fix:** Implement a **single-launch CUDA C++ thread-per-cell Thomas/Takahashi/Cholesky kernel** via `torch.utils.cpp_extension.load_inline` (with the identical pure-PyTorch `float64` loop retained as the CPU verification reference tested against `load_inline` in `test_06`), eliminating 9,510× kernel launch overhead (~50× speedup!), PLUS require an Hour-14 single-chunk timing gate before full execution.
+3. **Evidence & Confidence:** **High confidence in `float64` Thomas/Takahashi math (`< 1e-10` vs dense inverse); High confidence that CUDA kernel fusion (`load_inline`) + polygon clipping solves the Res-6 runtime bottleneck.**
+
+### Decision D11, D12, D13: Conformal Uncertainty, Streaming Adaptation, and 3-Product Storage `[FINALIZED WITH SPARSE DAILY FIX]`
+1. **Final Decisions:**
+   * **Conformal Calibration (`conformal.py`):** Multiplicative log-space Split Conformal Quantile Rescaling (`CQR`) computed separately for `MODIS-only` (via held-out `2018–2020` VIIRS-masked folds) and `Multi-sensor` (`2018–2021` leave-one-VIIRS-platform-out folds), guaranteeing non-negative calibrated intervals `0 <= q05_cal <= q50 <= q95_cal`; explicit `ABSTAIN_LOW_EVIDENCE` flag when $\ge 5$ consecutive days have `cloud_frac > 0.85` with zero detections in cell + 1-ring neighbors; explicit `attribution_flag`.
+   * **Streaming Adaptation (`run_fixed_lag_update(window_days=14)`):** Re-solves trailing 14-day slices anchored at `t_start - 1` to assimilate late NRT/Science revisions while preserving `obs_time`, `ingest_ts`, and `revision_count`.
+   * **3 Output Products:** Stored in `fire_harmonized.duckdb` + Zstd Parquet (`obs_harmonized_provenance`, `state_reconstructed_monthly` & `daily`, `uncertainty_diagnostics`).
+2. **Audit Catch & Mandatory Fix:** Exporting **dense** daily rows (`~300k cells × 9,510 days ≈ 2.85B rows`) exceeds Kaggle's **20 GB** `/kaggle/working` disk cap! **Fix:** Emit `state_reconstructed_monthly` densely (`~20–40M` rows) and **`state_reconstructed_daily` sparsely** (emit daily rows strictly where `phi_q50_mw > 0.25`, or within $\pm 3$ days of a detection, or inside spotlight validation regions), keeping total output under `~3–4 GB`.
+3. **Unresolved Item Noted Honestly:** `run_fixed_lag_update` is an offline-callable API function, **not** an automated 24/7 polling cron daemon in Environment 3.
+4. **Evidence & Confidence:** **High confidence in CQR and 3-product separation; 100% certainty that sparse daily export is mandatory.**
+
+### Decision D14, D15, D16: Web App, Validation Protocol, and 166+ Test Suite `[FINALIZED]`
+1. **Final Decisions:**
+   * **Web App:** Single unified `FastAPI + DuckDB` backend (`/api/calendar`, `/api/timeseries`, `/api/map_hex`, `/api/diagnostics`, `/api/export.csv` sanitized against CSV formula injection) + vanilla HTML5/ES6 `MapLibre GL JS` + `Apache ECharts` frontend with accessible `viridis`/`cividis` ramps, uncertainty hatching/opacity, ROI bounding-box drawer, and 6 spotlight preset buttons (`Chilecito ARG 2026`, `Kabylie DZA`, `Hassi Messaoud Gas Flares`, `Alaska Boreal`, `Black Summer AUS`, `Kalimantan Peat IDN`).
+   * **Validation Protocol:** Chow & Pettitt structural-break tests (`2002`, `2012`, `2018`, `2023`, `2026-11`), 2019–2021 VIIRS-masked ablation (`log_RMSE`, empirical `CRPS`, 90% coverage, `Spearman rho`, Top-3 Peak Month Match), `MCD64CMQ` burned-area cross-check, residual VZA/solar-time slope checks, and spotlight case reports.
+   * **Testing:** 10 `pytest` suites (`166+` concrete unit, finite-difference, linear-algebra, synthetic digital-twin, conformal, structural-break, API security, and memory tests).
+2. **Unresolved Question:** Hosting location for Environment 3 (local Docker presentation vs. public Hugging Face Space / VPS with 3–4 GB DuckDB storage) has not yet been selected.
+3. **Evidence & Confidence:** **High confidence (95%).**
+
+---
+
+## 4. Consolidated Decision Status Ledger (Explicit Boundaries)
+
+| Category / Decision | Status | Exact Position / Unresolved Item |
 | :--- | :--- | :--- |
-| **1. Separating fire change vs. sensor change** | **Fully Implemented** | Explicit mathematical separation between physical state $X_t$ and forward sensor operator $h_s(X_t, \theta_s, G_{s,t}, A_{s,t})$. Includes explicit `attribution_ambiguous` flag when credible intervals overlap. |
-| **2. Instrument vs. observation vs. processing quality** | **Partially Implemented** | Models observation quality (VZA, clouds, confidence) and processing tier (`NRT` vs `Science ML`) + empirical post-2022 orbital drift. Defers raw L1B detector radiometric gain telemetry (needs raw swath files). |
-| **3. MODIS vs. VIIRS physical differences** | **Fully Implemented** | Accounts for spatial footprint ($1\text{ km}$ vs $375\text{ m}$), VZA stretching, bow-tie overlap/deletion, wavelength/saturation behavior, and biome-specific quantile scaling (no universal constant multiplier). |
-| **4. Intensity (FRP) vs. Size vs. Total Energy (FRE)** | **Fully Implemented** | Reconstructs instantaneous/daily flux $\Phi_t$ (MW), integrates 24h diurnal curve into **Fire Radiative Energy (FRE, GJ)**, estimates **effective burning footprint ($\text{km}^2$)**, and tracks **event counts ($E_t$)**. |
-| **5. Data association (events vs. duplicate pixels)** | **Implemented (Deterministic)** | Uses **ST-DBSCAN / Graph Connected Components** + bow-tie IoU down-weighting + orbital-train deduplication. Defers full Multi-Hypothesis Tracking (MHT) across overlapping multi-day trajectories. |
-| **6 & 7. Missing data + spatial/temporal misalignment** | **Fully Implemented** | Equal-area **Uber H3** projection + **2-harmonic diurnal alignment** + **Space-Time State-Space Bayesian Interpolation** tagging `measured` vs. `inferred` fractions. |
-| **8. Detection probability & false positives** | **Fully Implemented** | Analytical **Hurdle detection-probability model** $P(D=1 \mid F,Q,G,B)$ + static gas-flare/volcano persistence masking + SAMA artifact filter. |
-| **9. Saturation handling** | **Implemented (Censored Likelihood)** | Uses **Right-Censored (Tobit) likelihood** or inflated variance when saturation flags trigger (`bright_ti4 >= 366 K` without M13 fallback). |
-| **10. Variable Categories A / B / C** | **Fully Implemented** | Produces **3 distinct tables/products** preserving raw sensor measurements alongside harmonized latent states and diagnostic explanations. |
-| **11. Real-time streaming & out-of-order arrival** | **Adapted for 36h** | True Kafka/Flink streaming + particle filters cannot be built reliably in 36h on offline Kaggle. Replaced with **Fixed-Lag 14-Day Sliding Batch Assimilation** tracking both `obs_time` and `ingest_time` so late NRT/Science revisions cleanly update recent history. |
-| **12. Long-term drift vs. real fire trends** | **Implemented** | Calibrates strictly on pre-drift **2012–2021** overlap; applies continuous solar-time diurnal operator for 2022–2026 Terra/Aqua drift; runs Pettitt/Chow structural break checks. |
-| **13. 8 uncertainty types & abstention** | **Implemented** | Combines measurement, calibration, cloud-gap, and omission uncertainty via **Laplace covariance + Conformal Prediction**, plus an explicit **Abstain Flag** when clouds block an entire multi-day window. |
-| **14–16. Zero information loss, context, validation** | **Fully Implemented** | Retains raw provenance (`Product 1`), uses biome/landcover context for priors without fabricating fires, validates via **2019–2021 VIIRS-masked ablation** + **`MCD64A1` burned-area cross-check**. |
-| **17. Identifiability bounds** | **Explicitly Documented** | Engine estimates $\Phi, \text{FRE}, E, A_{\text{active}}$, and explicitly refuses to output unidentifiable variables like subpixel flame temperature ($T_f$), fuel load, or combustion efficiency without auxiliary fuel models. |
+| 10 Scientific Invariants (`INV-01..10`) | **Finalized** | Enforced across every module and test. |
+| 3-Environment Split (`Env1 -> Env2 -> Env3`) | **Finalized** | `pyhdf` isolated in Env 1; offline `manylinux` wheels in Env 2. |
+| Space × Time × Day-Night GMRF + Hurdle + Tobit + CQR | **Finalized (Patched in Part II)** | Audit fixes applied: removed `ln(v)` from Case A/B, 12h $D(\tau)$ normalization, uniform $\Phi=e^z$, outage mask, `H3-Res8` flare mask, near-nadir VIIRS ref. |
+| H3-Res6 Grid + Polygon Clipping + Sparse Daily + Fused Kernel | **Finalized in Part II** | Replaces buggy bbox-only + unoptimized sequential `9,510` loop + dense daily export. |
+| Dual `H3-Res4` Global Tier & Dual Streamlit Fallback UI | **Rejected** | Eliminated permanently to preserve one coherent codebase. |
+| `fuoco.geog.umd.edu` Port 22 & Source Coop Portolan Connectivity | **Unresolved (Verify at Hour 0.5)** | Port 22 vs HTTPS Portolan mirror must be checked at Minute 15 of Env 1. |
+| Kaggle Free `T4 x2` vs Authorized `L4x4` Runtime | **Unresolved Hardware Reality** | Code dynamically scales across `1..4` GPUs within `< 6 GB` VRAM/GPU; user must confirm eligible competition hardware. |
+| Automated Live Cron Polling for `run_fixed_lag_update` | **Deferred Past 36h** | Implemented and tested as a callable batch update API; 24/7 daemon deferred. |
+| External Hosting Target for Environment 3 Web Server | **Unresolved** | Local Docker vs Hugging Face Spaces / cloud VPS decision pending. |
+
+---
+---
+
+# PART II — Complete, Self-Contained Agent Implementation Specification (`AGENT_MASTER_SPEC.md`)
+
+*(Everything below this line is a completely standalone, self-contained technical handoff specification written from scratch for an AI coding agent with zero prior context. All corrections from Part I are integrated seamlessly into one unified, bug-free architecture.)*
 
 ---
 
-### Third: Every Single Mathematical Formula & Algorithm Step-by-Step
+# MASTER IMPLEMENTATION SPECIFICATION: MODIS–VIIRS PHYSICS-INFORMED BAYESIAN HARMONIZATION ENGINE & BURNING ACTIVITY CALENDAR
 
-Here is the complete, end-to-end mathematical pipeline from raw CSV rows to the **3 Final Products**, written slowly with every symbol defined and no steps skipped.
+## 0. Agent Directives and Scope Lock
+You are responsible for implementing a single, cohesive, mathematically rigorous Earth Observation harmonization engine and interactive web application in Python, PyTorch, DuckDB, and FastAPI/MapLibre/ECharts.
 
-#### Stage 1: Coordinate System & Pre-Cleaning Geometry (CPU: DuckDB + H3 + Numba)
-
-Every raw detection row $i$ from satellite-platform $p \in \{\text{Terra}, \text{Aqua}, \text{SNPP}, \text{N20}, \text{N21}\}$ arrives with $(\text{lat}_i, \text{lon}_i, t_{\text{UTC}, i}, \text{scan}_i, \text{track}_i, \text{FRP}_i, T_{\text{MIR}, i}, T_{\text{TIR}, i}, \text{conf}_i, \text{DN}_i, \text{type}_i)$.
-
-1. **Equal-Area Spatial Grid (Uber H3):**
-   * Map each point $(\text{lat}_i, \text{lon}_i)$ to its **H3 Hexagon ID** $g = \text{H3}_6(\text{lat}_i, \text{lon}_i)$ (mean area $A_g \approx 36.13\,\text{km}^2$).
-   * **Why H3 hexagons instead of lat/lon squares?** Lat/lon grid cells shrink toward the poles by $\cos(\text{latitude})$, distorting fire density; H3 hexagons have nearly constant area globally and uniform distances to all 6 neighbors.
-
-2. **Exact Local Solar Time & Window Assignment:**
-   * Convert UTC timestamp to local solar time:
-     $$\tau_i = \left(t_{\text{UTC}, i} + \frac{\text{lon}_i}{15^\circ}\right) \bmod 24$$
-   * Define **Local Solar Date** $d_i$ and **Diurnal Regime** $\text{DN}_i \in \{\text{Day}, \text{Night}\}$ (using solar zenith angle $< 85^\circ$ or sensor flag). Reconstructing **Day** and **Night** separately preserves combustion physics (flaming daytime grass fires vs. smoldering nighttime woody/peat fires).
-
-3. **Pixel Footprint Area & Viewing Zenith Angle ($\theta_{\text{VZA}}$):**
-   * Ground pixel area:
-     $$A_i = \text{scan}_i \times \text{track}_i \quad (\text{km}^2)$$
-   * Recover approximate View Zenith Angle $\theta_i \in [0^\circ, 65^\circ]$ by inverting the sensor's scan-growth geometry:
-     * For MODIS ($A_{\text{nadir}} \approx 1.0\,\text{km}^2$, growing to $9.6\,\text{km}^2$ at $\theta = 65^\circ$): fit exact lookup spline $\theta_i = g_{\text{MODIS}}(A_i)$.
-     * For VIIRS 375 m ($A_{\text{nadir}} \approx 0.14\,\text{km}^2$, growing to $0.62\,\text{km}^2$ across its `3:1`, `2:1`, `1:1` onboard pixel aggregation zones): fit piecewise lookup $\theta_i = g_{\text{VIIRS}}(A_i)$.
-
-4. **Confidence Harmonization & Static Thermal Source Masking (False Positive Removal):**
-   * **Calibrated Reliability Weight $w_i \in [0, 1]$:** We do not compare MODIS `0–100` directly to VIIRS `'l'/'n'/'h'`. During overlap years (2012–2021), we check what fraction of detections in each raw confidence bin have spatial/temporal corroboration from another sensor or adjacent day. That produces a calibrated reliability probability $w_i = P(\text{true thermal source} \mid \text{conf}_i, \text{DN}_i, \theta_i)$.
-   * **SAMA Artifact Filter:** Flag/drop nighttime low-confidence VIIRS rows inside the South Atlantic Magnetic Anomaly box ($11^\circ\text{E}\text{–}110^\circ\text{W},\; 7^\circ\text{N}\text{–}55^\circ\text{S}$).
-   * **Data-Driven Industrial/Gas-Flare Mask:** Because NRT data lacks `type` and older C2 VIIRS had mislabeled static sources, bin all historical points into fine H3 Resolution 10 micro-cells ($\sim 0.015\,\text{km}^2$). Compute for each micro-cell $m$:
-     * Number of distinct years active: $Y_m$
-     * Mean active days per year: $\bar{D}_m$
-     * Day-to-night invariance ratio: $R^{\text{DN}}_m = \frac{\min(\text{count}_{\text{day}}, \text{count}_{\text{night}})}{\max(\text{count}_{\text{day}}, \text{count}_{\text{night}}) + 1}$
-     * If $Y_m \ge 3$, $\bar{D}_m \ge 15$, and $R^{\text{DN}}_m > 0.3$ (burning steadily both day and night across years, characteristic of gas flares and smelters), flag `is_static_industrial = True` and exclude from biomass burning calendars (while preserving in **Product 1**).
-
-5. **Intra-Pass Bow-Tie Overlap Correction & Physical Event Clustering (Graph Theory):**
-   * Group rows strictly by **single satellite overpass** $(p, \text{pass\_id})$ where timestamps fall within $\Delta t \le 5\,\text{min}$.
-   * **Bow-tie Overlap Weighting (for MODIS pixels with $A_i > 1.5\,\text{km}^2$):** Build a spatial neighbor graph connecting two pixels $i, j$ from adjacent scan lines if distance $d_{ij} < 0.7 \cdot \frac{\text{track}_i + \text{track}_j}{2}$. Each pixel receives overlap weight:
-     $$\omega^{\text{bt}}_i = \frac{1}{1 + \text{degree}(i)}$$
-     This eliminates double-counting at MODIS swath edges before summing FRP.
-   * **Spatial Event Clustering (Connected Components / ST-DBSCAN):** Inside the same overpass $(p, \text{pass\_id})$, connect pixels $i, j$ if:
-     $$d_{ij} \le 1.4 \cdot \max\!\left(\sqrt{A_i}, \sqrt{A_j}\right)$$
-     Each connected component $k$ is **one physical fire cluster** inside that pass.
-   * **Per-Pass Sufficient Statistics for Hexagon $g$, Day $d$, Platform $p$, Regime $\text{DN}$:**
-     * Clean pass FRP: $Y_{p,g,d,\text{DN}} = \sum_{i} \omega^{\text{bt}}_i \cdot w_i \cdot \text{FRP}_i$
-     * Effective pixel footprint spread: $A^{\text{det}}_{p,g,d,\text{DN}} = \sum_{i} \omega^{\text{bt}}_i \cdot A_i$
-     * Pass cluster count: $E^{\text{raw}}_{p,g,d,\text{DN}}$ (number of connected clusters intersecting $g$)
-     * Pass mean pixel size $\bar{A}_{p,g,d,\text{DN}}$, mean viewing angle $\bar{\theta}_{p,g,d,\text{DN}}$, mean solar time $\bar{\tau}_{p,g,d,\text{DN}}$, and saturation flag `sat_flag` (1 if VIIRS `bright_ti4 >= 366 K` without valid M13 unsaturated backup, or high MODIS saturation).
-
-   * **Crucial Anti-Duplication Rule:** If *Suomi-NPP*, *NOAA-20*, and *NOAA-21* all pass over Hexagon $g$ on the same afternoon (~50 minutes apart), we store **three separate rows** $(Y_{\text{SNPP}}, Y_{\text{N20}}, Y_{\text{N21}})$—we **NEVER add them together**.
-
----
-
-#### Stage 2: Separating Measurement World from Physical World (Calibration on 2012–2021 Overlap)
-
-Recall your key equation:
-$$Y_{s,t} = h_s\big(X_t, \theta_s, G_{s,t}, A_{s,t}\big) + \epsilon_{s,t}$$
-
-In log-space (because fire power spans $0.5\,\text{MW}$ to $50{,}000\,\text{MW}$ and instrument errors are multiplicative percentages), we write the forward sensor equation for **latent physical state** $z_{g,d,\text{DN}} = \ln(\Phi_{g,d,\text{DN}} + \epsilon_0)$ (where $\epsilon_0 = 0.05\,\text{MW}$ and $\Phi$ is the **24-hour cloud-free physical radiative flux in MW**):
-
-$$\ln Y_{p,g,d,\text{DN}} = z_{g,d,\text{DN}} + \underbrace{\ln v_{p,g,d}}_{\text{Cloud visibility}} + \underbrace{\ln D_{b,\text{m}}(\bar{\tau}_{p,g,d})}_{\text{Time-of-day diurnal phase}} + \underbrace{\ln \psi^{\text{FRP}}_{p,b}(\bar{A}_p, \text{DN})}_{\text{Small-fire omission fraction}} + \underbrace{\ln \gamma_{p,b}(\bar{\theta}_p, \text{Quantile})}_{\text{Quantile & VZA bias}} + \epsilon_{p,g,d,\text{DN}}$$
-
-Here is how each piece of that forward operator $h_s(\cdot)$ is **mathematically learned** without making VIIRS imitate MODIS:
-
-1. **Behavioral Pyrome Discovery $b(g)$ (Unsupervised GMM without Coordinates):**
-   * For every hexagon $g$, compute coordinate-free physical features over 2012–2021: mean `FRP_night / FRP_day`, seasonal peak concentration (circular variance of active fire months), multi-year inter-annual variability, and median cluster size.
-   * Fit a **Gaussian Mixture Model (GMM, $K \approx 6\text{–}8$ clusters)** to discover functional fire regimes ("pyromes": e.g., Agricultural Pulse, Savanna Grass, Mediterranean Shrub, Boreal Crown Forest, Tropical Deforestation, Peatland).
-   * Why? Because MODIS vs. VIIRS behave completely differently in boreal megafires than in agricultural straw burns (matching the $+47\%$ vs $-20\%$ literature finding you cited!).
-
-2. **Sub-Threshold Detection Limit & Small-Fire Fraction $\psi_{p,b}$ (Truncated Pareto / Log-Normal Survival Model):**
-   * Sensor minimum detectable power increases linearly with pixel footprint area:
-     $$F_{\min, p}(\bar{A}_p, \text{DN}) = \alpha_{p,\text{DN}} + \beta_{p,\text{DN}}\,\bar{A}_p$$
-     (MODIS: $\sim 3.7\,\text{MW}$ nadir night up to $\sim 40\,\text{MW}$ daytime edge; VIIRS: $\sim 0.5\,\text{MW}$ nadir night up to $\sim 2.5\,\text{MW}$ daytime edge).
-   * In each pyrome $b$, take clear-sky nadir VIIRS clusters down to $F_{\text{ref}} = 0.5\,\text{MW}$ and fit a **Log-Normal / Tapered Pareto distribution** $f_b(F)$ via Maximum Likelihood Estimation (MLE).
-   * The fraction of true fires and true energy that sensor $p$ can physically detect above $F_{\min,p}$ is given by the exact survival integrals:
-     $$\psi^{\text{CNT}}_{p,b}(\bar{A}_p, \text{DN}) = \int_{F_{\min,p}}^\infty f_b(F)\,dF, \qquad \psi^{\text{FRP}}_{p,b}(\bar{A}_p, \text{DN}) = \frac{\int_{F_{\min,p}}^\infty F\,f_b(F)\,dF}{\int_{F_{\text{ref}}}^\infty F\,f_b(F)\,dF}$$
-
-3. **VZA & Intensity Quantile Mapping $\gamma_{p,b}$ (Monotonic Quantile Calibration):**
-   * Select all **synchronous 2012–2021 pairs** ($\Delta t \le 45\,\text{min}$) where Aqua MODIS and S-NPP VIIRS both observed the same `(hexagon, day, DN)` during stable orbits.
-   * **Empirical Quantile Mapping (EQM) + Monotonic LightGBM:** Stratify pairs by pyrome $b$, Day/Night, and pixel-area/VZA bins. Fit a smooth monotonic quantile transfer mapping $\gamma_{\text{MODIS}, b}(\bar{\theta}_p, \text{quantile})$ that aligns the cumulative distribution of MODIS FRP (after dividing out $\psi^{\text{FRP}}$) to the near-nadir VIIRS reference distribution.
-   * **Why Quantile Mapping instead of a single factor?** Because small fires and extreme 99th-percentile boreal megafires have different radiometric biases!
-
-4. **Diurnal Cycle & Orbital-Drift Phase $D_{b,m}(\tau)$ (2-Harmonic Fourier Regression):**
-   * Fit a periodic 24-hour curve per pyrome $b$ and season $m$:
-     $$\ln D_{b,m}(\tau) = a_0 + a_1\cos\!\left(\frac{2\pi\tau}{24}\right) + b_1\sin\!\left(\frac{2\pi\tau}{24}\right) + a_2\cos\!\left(\frac{4\pi\tau}{24}\right) + b_2\sin\!\left(\frac{4\pi\tau}{24}\right)$$
-     subject to normalization $\frac{1}{24}\int_0^{24} D_{b,m}(\tau)\,d\tau = 1.0$.
-   * **Where does the data to fit $D(\tau)$ come from?** From pairing Terra (~10:30 AM / 10:30 PM) vs. Aqua/VIIRS (~1:30 PM / 1:30 AM) during 2003–2021, PLUS Aqua's post-2022 orbital drift sweep (moving from 1:30 PM toward 3:30–3:50 PM) relative to stationary NOAA-20 at 1:30 PM!
-   * Evaluating $D_{b,m}(\bar{\tau}_{p,g,d})$ at each detection's exact solar time solves **both** Terra-vs-Aqua timing offsets **and** post-2022 orbital drift.
-
-5. **Cloud Visibility $v_{p,g,d}$ & Heteroscedastic Observation Error $\sigma^2_{p,g,d,\text{DN}}$:**
-   * **Visibility $v_{p,g,d}$:** Compute clear-sky observation probability from `MOD14CMQ`/`MYD14CMQ` cloud & missing pixel fractions: $v = \max(0.10,\; 1 - f_{\text{cloud}} - f_{\text{missing}})$ (or geometric swath-coverage × regional cloud climatology in fallback mode).
-   * **Heteroscedastic Noise Variance $\sigma^2_{p,g,d,\text{DN}}$:** Using the residuals from our 2012–2021 calibration pairs, fit a variance regression model predicting how noisy each sensor measurement is as a function of $(\text{sensor}, \bar{\theta}_p, w_i, v_{p,g,d})$:
-     $$\sigma^2_{p,g,d,\text{DN}} = \exp\!\big(\beta_0 + \beta_1 \bar{\theta}_p + \beta_2 (1 - \bar{w}) + \beta_3 (1 - v_{p,g,d}) + \beta_{\text{sensor}}\big)$$
-     *(So crisp near-nadir VIIRS gets small variance $\sigma \approx 0.18$, while high-angle low-confidence MODIS gets large variance $\sigma \approx 0.65$.)*
-
-Define the combined forward log-gain:
-$$\mu^{\text{gain}}_{p,g,d,\text{DN}} = \ln v_{p,g,d} + \ln D_{b(g), m(d)}(\bar{\tau}_{p,g,d}) + \ln \psi^{\text{FRP}}_{p,b}(\bar{A}_p, \text{DN}) + \ln \gamma_{p,b}(\bar{\theta}_p, q)$$
-
----
-
-#### Stage 3: Probabilistic Physical-State Reconstruction (4× L4 GPUs — PyTorch)
-
-Now we solve **Problem B** from your essay: inferring the true physical state $X_{g,d} = (z_{g,d,\text{Day}}, z_{g,d,\text{Night}})$ across all days $d = 1,\dots,T$ and all hexagons $g \in \mathcal{G}$ jointly, reconciling conflicting witnesses, missing data, saturation, and detection limits.
-
-1. **The Operational Satellite Matrix (`is_operational[p, d]`):**
-   * Explicitly encode when each platform actually existed in orbit:
-     * Terra: `2000-11-01` to present
-     * Aqua: `2002-07-04` to present
-     * S-NPP: `2012-01-20` to `2026-11-02`
-     * NOAA-20: `2018-04-01` (ML) / `2020-01-01` to present
-     * NOAA-21: `2023-03-01` (ML) / `2024-01-17` to present
-   * **Never treat an unlaunched or decommissioned satellite as a zero observation!** Only platforms with `is_operational[p, d] == 1` enter the likelihood on day $d$.
-
-2. **Three-Part Observation Likelihood for Each Operational Platform Pass $(p, g, d, \text{DN})$:**
-   * **Case A — Valid Unsaturated Detection ($Y_{p,g,d,\text{DN}} > 0$ and `sat_flag == 0`):**
-     $$\ell_{\text{obs}} = \frac{\big(\ln Y_{p,g,d,\text{DN}} - [z_{g,d,\text{DN}} + \mu^{\text{gain}}_{p,g,d,\text{DN}}]\big)^2}{2\,\sigma^2_{p,g,d,\text{DN}}}$$
-   * **Case B — Saturated Detection (`sat_flag == 1`, Challenge #9):**
-     Because actual fire power may exceed the sensor ceiling $Y_{\text{sat}}$, use a **Right-Censored Tobit Negative Log-Likelihood**:
-     $$\ell_{\text{sat}} = -\ln \left[1 - \Phi_{\mathcal{N}}\!\left(\frac{\ln Y_{p,g,d,\text{DN}} - [z_{g,d,\text{DN}} + \mu^{\text{gain}}_{p,g,d,\text{DN}}]}{\sigma_{p,g,d,\text{DN}}}\right)\right]$$
-     *(This penalizes $z$ if it drops below the observed saturated reading, while allowing unsaturated MODIS/M13 or neighboring days to pull $z$ upward freely!)*
-   * **Case C — Non-Detection ($Y_{p,g,d,\text{DN}} = 0$ while `is_operational == 1`, Challenge #8):**
-     Probability of zero detections given latent physical flux $\Phi = \max(0, e^z - \epsilon_0)$ and cloud visibility $v$:
-     $$P(D=0 \mid z) = (1 - v_{p,g,d}) + v_{p,g,d}\exp\!\Big(-\lambda_{0,b} \cdot \psi^{\text{CNT}}_{p,b}(\bar{A}_p, \text{DN}) \cdot \frac{\Phi}{\bar{F}_{\text{event}, b}}\Big)$$
-     Add negative log-likelihood $\ell_{\text{miss}} = -\ln P(D=0 \mid z)$.
-     *(Notice: When blurry 2005 MODIS has tiny $\psi^{\text{CNT}} \approx 0.08$, seeing `0` rules out huge wildfires but barely penalizes small fires—widening posterior uncertainty naturally instead of forcing small fires to zero!)*
-
-3. **Space × Time × Day-Night Joint Prior (GMRF State-Space Model, Challenge #6 & #15):**
-   To bridge cloudy days and link neighboring hexagons + Day/Night combustion:
-   * **Temporal Persistence (AR(1) toward regional seasonal prior $\mu_{g,m(d)}$):**
-     $$\ell_{\text{time}} = \sum_{d=2}^T \frac{\big((z_{g,d} - \mu_{g,m(d)}) - \rho_b (z_{g,d-1} - \mu_{g,m(d-1)})\big)^2}{2\,\sigma^2_{\text{proc}, b}}$$
-   * **Spatial Hexagon Neighbor Coupling (1-Ring GMRF Laplacian):**
-     Let $\mathcal{N}(g)$ be the 6 adjacent H3 hexagons of $g$ in the same pyrome $b$:
-     $$\ell_{\text{space}} = \sum_{d=1}^T \sum_{g' \in \mathcal{N}(g)} \frac{\alpha_{s, b} (z_{g,d} - z_{g',d})^2}{2\,\sigma^2_{\text{proc}, b}}$$
-     *(Using small spatial weight $\alpha_{s,b} \in [0.05, 0.20]$ lets a clear neighboring cell help bridge a patchy cloud without blurring sharp fire boundaries!)*
-   * **Day-Night Coupling:** Include a soft correlation penalty linking $(z_{g,d,\text{Day}} - \mu_{\text{Day}})$ and $(z_{g,d,\text{Night}} - \mu_{\text{Night}})$ so intense daytime wildfires inform nighttime smoldering estimates if a nighttime overpass was clouded out.
-
-4. **How 4× L4 GPUs Solve This Fast (Block-Coordinate Damped Newton + Tridiagonal Thomas Solver):**
-   * Sum total negative log-posterior:
-     $$J(Z) = \sum \ell_{\text{obs}} + \sum \ell_{\text{sat}} + \sum \ell_{\text{miss}} + \ell_{\text{time}} + \ell_{\text{space}}$$
-   * Notice the algebraic magic: if we hold neighboring hexagons $z_{g', d}$ fixed during one **Red-Black / Gauss-Seidel spatial sweep** (updating even-ring hexagons, then odd-ring hexagons), then for every single hexagon $g$ and every day $d$, day $d$ only connects directly to $d-1$ and $d+1$!
-   * That means the second-derivative Hessian matrix $H_g = \nabla^2_{z_g} J$ is **strictly tridiagonal** of size $T \times T$.
-   * On each of the **4× L4 GPUs**, PyTorch runs **batched Damped Newton-Raphson updates** across ~3,500 hexagons simultaneously using the **$O(T)$ Tridiagonal Thomas Solver** (Cholesky factorization $H_g = L_g D_g L_g^\top$ followed by forward/backward substitution) with backtracking Armijo line search. 4–6 spatial outer sweeps × 12 Newton steps converge across 26 years in **minutes**.
-
----
-
-#### Stage 4: Uncertainty Propagation, Conformal Guarantee & Secondary Physical Variables (GPU + CPU)
-
-1. **Exact Local Variance & Correlated Monte Carlo Propagation:**
-   * Apply **Takahashi's Recursion** to the converged tridiagonal Cholesky factor $(L_g, D_g)$ to extract exact daily posterior variances $\sigma^2_{\text{post}, g, d} = (H_g^{-1})_{d,d}$ and lag-1 covariances $(H_g^{-1})_{d,d-1}$ in $O(T)$ time on GPU.
-   * Sample $M = 200$ correlated daily Gaussian-Markov trajectories $z^{(m)}_{g, 1:T}$ per hexagon on GPU, transform back via $\Phi^{(m)}_{g,d} = \max(0, e^{z^{(m)}_{g,d}} - \epsilon_0)$, and integrate **Day + Night** into:
-     * **24h Total Physical Fire Radiative Flux** ($\Phi^{(m)}_{g,d} = w_{\text{day}}\Phi^{(m)}_{g,d,\text{Day}} + w_{\text{night}}\Phi^{(m)}_{g,d,\text{Night}}$, MW)
-     * **Fire Radiative Energy ($\text{FRE}^{(m)}_{g,d} = 0.0864 \cdot \Phi^{(m)}_{g,d}$, TJ/day)**
-     * **Standardized Physical Fire Events** ($E^{(m)}_{g,d} = \Phi^{(m)}_{g,d} / \bar{F}_{\text{event}, b}$)
-     * **Estimated Active Burning Footprint ($\widehat{A}^{\text{burn}}_{g,d}$, $\text{km}^2$)** via calibrated 2012–2021 quantile transfer function $g_{\text{area}, b}(\Phi, \Phi_{\text{night}}/\Phi_{\text{day}})$.
-
-2. **Split Conformal Calibration (Provable Coverage Guarantee):**
-   * On the held-out **2018–2020 calibration fold** (where VIIRS observations are masked so the engine sees only MODIS), compare MODIS-only reconstructed monthly flux $\widehat{\Phi}_{\text{MODIS-only}}$ and spread $\hat{\sigma}_{\text{raw}}$ against the full multi-sensor reference $\Phi_{\text{ref}}$.
-   * Compute normalized nonconformity scores:
-     $$r_j = \frac{|\Phi_{\text{ref}, j} - \widehat{\Phi}_{\text{MODIS-only}, j}|}{\hat{\sigma}_{\text{raw}, j} + \delta}$$
-   * Compute the empirical 90th percentile multiplier $\hat{q}_{0.90, b}$ per pyrome $b$ (and separately for multi-sensor vs. MODIS-only vs. heavy-cloud regimes). Multiply raw Laplace interval half-widths by $\hat{q}_{0.90, b}$ so output intervals carry a **verified finite-sample empirical coverage guarantee ($\ge 90\%$)**.
-
-3. **Uncertainty Decomposition, Attribution & Abstention Rules:**
-   * Explicitly report:
-     * `measured_fraction`: share of monthly energy directly backed by observed satellite detections vs. inferred across clouds/gaps.
-     * `attribution_flag`: checks whether raw vs. harmonized step change agrees (`REAL_FIRE_CHANGE`, `SENSOR_ARTIFACT_CORRECTED`, or `AMBIGUOUS_OVERLAPPING_CI`).
-     * `quality_flag = ABSTAIN_LOW_EVIDENCE`: triggered automatically whenever `mean_cloud_frac > 0.85` across consecutive passes with zero neighbor detections, refusing to produce falsely confident estimates.
-
-4. **Streaming / Rolling NRT Revision Mode (Challenge #11 Adaptation):**
-   * Maintain `obs_timestamp`, `ingest_timestamp`, and `data_tier` (`URT/NRT` vs `ML_Science`).
-   * For new trailing 2026 observations (or out-of-order late Science updates), run the exact same solver restricted to a **14-day sliding boundary window** (`[t_new - 14d, t_now]`), anchoring `t_new - 15d` to the saved state. This handles delayed arrivals and NRT-to-Science replacements cleanly without recomputing 26 years.
-
----
-
-### Fourth: The 3 Complementary Output Products (Matching Your Recommendation)
-
-At the end of the pipeline, DuckDB + Parquet stores all three distinct products cleanly:
-
-| Output Product | Granularity | Exact Mathematical Contents |
-| :--- | :--- | :--- |
-| **Product 1: Harmonized & Provenance Observations** | Per raw/clustered overpass event | Original untouched MODIS/VIIRS values (`frp`, `brightness`, `scan`, `track`, `conf`), `obs_time`, `ingest_time`, `data_tier`, `is_static_industrial`, `bowtie_weight`, `reliability_prob`, `vza_deg`, `censoring_fraction`, `correction_factor`, and `event_cluster_id`. |
-| **Product 2: Reconstructed Physical Fire State** | Per `(H3_hex, date)` & `(H3_hex, year, month)` | `phi_day_mw`, `phi_night_mw`, `phi_total_q50_mw`, `fre_tj`, `std_events_q50`, `est_active_area_km2`, `night_day_ratio`, `hist_median_2003_2020`, `anomaly_ratio`, `anomaly_zscore`. |
-| **Product 3: Uncertainty, Attribution & Explanation** | Matched 1-to-1 with Product 2 | Conformal-calibrated 90% intervals (`q05`, `q95`), `rel_uncertainty_width`, `measured_vs_inferred_ratio`, `active_platforms_bitmask`, `mean_cloud_frac`, `attribution_flag`, `quality_flag` (including `ABSTAIN_LOW_EVIDENCE`), and `revision_count`. |
-
----
-
-### Fifth: Brutal Honesty Check — Where Do We Start Next?
-
-Everything above is mathematically coherent, grounded in real Earth Observation literature, and **every single component fits cleanly inside ~600–800 lines of Python + PyTorch** running well within **12 GPU-hours on Kaggle `4× L4`**.
-
-Before writing code, notice the one crucial decision you need to confirm right now:
-1. **Do you have an internet-enabled standard Kaggle CPU session (or a Linux terminal/Colab/cloud box) to act as our Data Ingestion Stager?** Remember: your offline `4× L4` competition notebook cannot download NASA FIRMS files or `pip install` packages from GitHub directly.
-2. Tell me **which exact path you want right now**:
-   * **Path A:** Show me the **exact Hour 0–4 scripts** (1. building the minimal `.whl` dataset for offline Kaggle, and 2. the ingestion script that tests global `fuoco.geog.umd.edu` vs. 6-country FIRMS CSVs and packs them into Parquet).
-   * **Path B:** Show me a **self-contained 100-line Python/PyTorch prototype** of the exact math above (synthetic MODIS + VIIRS with clouds, bow-tie, 3-satellite overlaps, and 2005 blind zeros) so you can run it, inspect every single matrix and equation live, and verify you understand 100% of the code before touching Kaggle's GPUs.
-
-
-
-
-
-   Here is the complete, production-ready **Data Acquisition & Offline Staging Codebase** designed specifically for your **36-hour / Kaggle offline `4× L4` constraint**.
-
-Before running the code, look closely at **why these exact 6 countries** were selected—every single one stress-tests a different scientific failure mode that judges and climate scientists look for, while directly anchoring to CONAE’s challenge briefing and your environment.
-
----
-
-### 1. Why These Exact 6 Countries Give the Best Scientific & Competition Result
-
-| Country (`ISO3`) | Role in Your Harmonization & Validation Story | Specific Edge Cases & Literature Challenges Tested |
-| :--- | :--- | :--- |
-| **1. Argentina (`ARG`)** | **Challenge Anchor (CONAE Case Study)** | CONAE authored the challenge and showcased the **July–August 2026 Chilecito, La Rioja** wildfire activation. Also tests Pampas crop burns, Paraná Delta wetlands, and the **South Atlantic Magnetic Anomaly (SAMA)** nighttime false-alarm zone. |
-| **2. Algeria (`DZA`)** | **Static Gas Flare vs. Wildfire Separation** | Extreme Mediterranean forest megafires in the north (e.g., **August 2021** & **July 2023** Kabylie anomalies) vs. year-round Saharan oil/gas flares (Hassi Messaoud / Ouargla). Directly proves your static persistence mask prevents desert gas flares from corrupting wildfire calendars. |
-| **3. Brazil (`BRA`)** | **Calibration Backbone & Savanna/Deforestation** | Highest statistical overlap density in 2012–2021 across Amazon deforestation fronts and Cerrado savanna. Tests MODIS small-fire omission, heavy wet-season cloud attenuation, and SAMA filtering. |
-| **4. Indonesia (`IDN`)** | **Extreme Cloud Cover & Nighttime Peat Smoldering** | Equatorial clouds drop single-pass MODIS detection below 30%–40%. Stress-tests your **cloud visibility weighting ($v$)**, **Day vs. Night latent separation** (underground peat smoldering burns heavily at night), and the **low-evidence abstention flag**. |
-| **5. Australia (`AUS`)** | **Savanna Small Fires + Extreme Saturation Megafires** | Northern Australia provides frequent low-FRP savanna burns missed by MODIS; southeastern **2019–2020 Black Summer** fires test VIIRS I4 (`367 K`) saturation recovery and right-censored likelihoods. |
-| **6. United States (`USA`)** | **Boreal + Temperate + Agricultural Ground-Truth Benchmark** | Includes **Alaska boreal fire clusters** (testing the literature-documented boreal MODIS/VIIRS cluster discrepancy), **Western US** extreme crown fires, and **Southeast** small understory prescribed fires—plus the richest independent perimeter records for validation. |
-
-*Note on Global Coverage:* The ingestion script below streams NASA/UMD’s global monthly files one month at a time. While saving full pixel-level records for these 6 countries (~1.5–2.5 GB total in Zstd Parquet), it **can optionally compute a lightweight global coarse H3-Res4 daily summary simultaneously in the exact same pass** (`--global-coarse`) at almost zero extra download cost.
-
----
-
-### 2. How the Downloader Avoids Every Failure Trap
-
-1. **No Hardcoded Broken Links:** NASA FIRMS’s `/data/country/` portal uses annual CSVs (`viirs-snpp_{year}_{Country}.csv`) that often lag on the current year (2026) and vary by sensor directory. Meanwhile, the official upstream science archive at **University of Maryland SFTP (`fuoco.geog.umd.edu`, login `fire` / password `burnt`)** hosts complete monthly Collection 6/6.1 MODIS (`MCD14ML`) and reprocessed Collection 2 VIIRS 375 m (`VNP14IMGML`, `VJ114IMGML`, `VJ214IMGML`), plus `Mx14CMQ` cloud grids and `MCD64CMQ` burned-area grids.
-2. **3-Tier Automatic Acquisition:**
-   - **Tier 1 (Primary Science Archive):** Connects to `fuoco.geog.umd.edu` via SFTP (auto-discovering `C61`/`C6` and `C2` folders dynamically), streams each monthly `.csv.gz` one at a time, filters immediately to the 6 target regions, writes Parquet, and deletes the temp `.csv.gz` so disk stays under 500 MB.
-   - **Tier 2 (Trailing 2026 NRT Gap-Fill + SFTP Firewall Fallback):** Uses the official **NASA FIRMS REST API** (`/api/data_availability` + `/api/country/csv/{MAP_KEY}/{SOURCE}/{ISO3}/...`) to pull the last 2–5 months up to **November 13, 2026** (capturing CONAE’s July–Aug 2026 Chilecito fire and Suomi-NPP’s early Nov 2026 cutoff), and automatically backfills via `*_SP` if SFTP port 22 is blocked.
-   - **Tier 3 (HTML Country Scraper Backup):** If SFTP is blocked *and* no `MAP_KEY` is provided yet, dynamically parses `https://firms.modaps.eosdis.nasa.gov/country/` to discover live country CSV links without guessing URLs.
-
----
-
-### 3. Project Structure (`fire_harmonizer_ingest/`)
-
-Create these 4 files in your GitHub repository (and run Step 1 inside an **internet-enabled standard Kaggle CPU notebook**—using **0 GPU-hours**—to produce your two clean Kaggle Input Datasets for the offline `4× L4` GPU notebook):
-
-1. `00_build_offline_wheels.sh` — Builds the tiny offline `.whl` dataset for Kaggle `L4×4`.
-2. `config_regions.py` — Exact country bounding definitions (`USA` cleanly split into `CONUS` + `Alaska` so it doesn't wrap the Pacific), satellite schedules, and schemas.
-3. `01_download_and_stage.py` — 3-tier streaming downloader (UMD SFTP + Cloud/BA grids + FIRMS API `SP`/`NRT` + Country HTML fallback).
-4. `02_normalize_dedup_verify.py` — Schema unifier (handling MODIS `brightness` vs. VIIRS `bright_ti4`, numeric vs. `'l'/'n'/'h'` confidence, missing `type` in NRT), Science-over-NRT deduplication, and full coverage audit.
-
----
-
-### 4. File 1: `00_build_offline_wheels.sh`
-
-Run this in an internet-enabled Kaggle CPU session (or matching Python 3.10/3.11 Linux box) to package **only** the lightweight wheels not already pre-installed in Kaggle’s GPU image. Never bundle PyTorch/CUDA (already in Kaggle’s base image).
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-# Check exact Python version of your target Kaggle GPU notebook first!
-PY_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-echo "Target Python version: ${PY_VER}"
-
-mkdir -p offline_wheels
-
-# Only fetch prebuilt manylinux binary wheels (zero C++/CUDA compilation risk)
-pip download \
-  --dest offline_wheels \
-  --only-binary=:all: \
-  --platform manylinux2014_x86_64 \
-  --platform manylinux_2_17_x86_64 \
-  --python-version "${PY_VER}" \
-  duckdb \
-  polars \
-  h3 \
-  paramiko \
-  beautifulsoup4 \
-  lxml
-
-# Optional: pyhdf for MOD14CMQ HDF4 cloud grids (may require matching wheel check)
-pip download --dest offline_wheels pyhdf || echo "Warning: pyhdf wheel skipped; geometric visibility fallback will be used."
-
-echo "Offline wheels ready in ./offline_wheels:"
-ls -lh offline_wheels | head -n 30
-```
-
-In your offline `4× L4` notebook, installation takes ~10 seconds:
-```bash
-pip install --no-index --find-links=/kaggle/input/your-wheels-dataset duckdb polars h3
-```
-
----
-
-### 5. File 2: `config_regions.py`
-
-```python
-from dataclasses import dataclass
-from typing import Dict, List, Tuple
-
-
-@dataclass(frozen=True)
-class CountrySpec:
-    iso3: str
-    firms_name: str
-    # List of (min_lon, min_lat, max_lon, max_lat) boxes to avoid antimeridian wrap
-    boxes: List[Tuple[float, float, float, float]]
-    biome_note: str
-
-
-# Scientifically optimal 6-country multi-biome benchmark suite
-TARGET_COUNTRIES: Dict[str, CountrySpec] = {
-    "ARG": CountrySpec(
-        iso3="ARG",
-        firms_name="Argentina",
-        boxes=[(-73.8, -55.5, -53.5, -21.5)],
-        biome_note="CONAE July 2026 Chilecito anchor, Pampas ag burns, Patagonia, SAMA zone",
-    ),
-    "DZA": CountrySpec(
-        iso3="DZA",
-        firms_name="Algeria",
-        boxes=[(-8.7, 18.9, 12.0, 37.2)],
-        biome_note="Mediterranean crown fires (Kabylie 2021/2023) vs. Saharan static gas flares",
-    ),
-    "BRA": CountrySpec(
-        iso3="BRA",
-        firms_name="Brazil",
-        boxes=[(-74.0, -33.8, -34.7, 5.4)],
-        biome_note="Amazon deforestation + Cerrado savanna calibration backbone + clouds + SAMA",
-    ),
-    "IDN": CountrySpec(
-        iso3="IDN",
-        firms_name="Indonesia",
-        boxes=[(95.0, -11.1, 141.1, 6.2)],
-        biome_note="Extreme equatorial clouds + nighttime peat smoldering + abstention test",
-    ),
-    "AUS": CountrySpec(
-        iso3="AUS",
-        firms_name="Australia",
-        boxes=[(112.9, -43.8, 154.0, -10.0)],
-        biome_note="Northern low-FRP savanna burns + 2019-2020 Black Summer I4 saturation",
-    ),
-    "USA": CountrySpec(
-        iso3="USA",
-        firms_name="United_States",
-        boxes=[
-            (-125.0, 24.4, -66.8, 49.5),   # CONUS
-            (-170.0, 51.2, -129.9, 71.5),  # Alaska (boreal cluster behavior)
-        ],
-        biome_note="Western megafires, SE prescribed small burns, Alaska boreal clusters",
-    ),
-}
-
-# Exact operational platform timeline (UTC dates) for state-space masking
-PLATFORM_TIMELINE = {
-    "Terra":   ("2000-11-01", "2026-12-31"),
-    "Aqua":    ("2002-07-04", "2026-12-31"),
-    "SNPP":    ("2012-01-20", "2026-11-02"),  # FIRMS S-NPP delivery ceased Nov 2, 2026
-    "NOAA-20": ("2018-04-01", "2026-12-31"),
-    "NOAA-21": ("2023-03-01", "2026-12-31"),
-}
-
-# Unified canonical output columns
-UNIFIED_COLUMNS = [
-    "country_iso",
-    "sensor_family",   # MODIS | VIIRS
-    "platform",        # Terra | Aqua | SNPP | NOAA-20 | NOAA-21
-    "data_tier",       # ML_SCIENCE | SP_SCIENCE | NRT
-    "latitude",
-    "longitude",
-    "acq_date",        # YYYY-MM-DD (UTC)
-    "acq_hhmm",        # int 0..2359 (UTC)
-    "t_mir_k",         # MODIS brightness (Ch 21/22) or VIIRS bright_ti4
-    "t_tir_k",         # MODIS bright_t31 or VIIRS bright_ti5
-    "scan_km",
-    "track_km",
-    "frp_mw",
-    "daynight",        # D | N
-    "conf_raw",        # string preserved natively ('l','n','h' or '0'..'100')
-    "conf_num",        # harmonized numeric [0..100] proxy prior to calibration
-    "type_raw",        # int8 (-1 if missing in NRT)
-    "version_raw",
-    "ingest_ts",
-]
-```
-
----
-
-### 6. File 3: `01_download_and_stage.py`
-
-Run this in your **internet-enabled Kaggle CPU notebook** (or cloud VM).
-* If you have a free NASA FIRMS `MAP_KEY` (instant registration via email on NASA FIRMS), pass `--firms-key YOUR_KEY` so the trailing 2026 NRT months (and `SP` fallback if port 22 is firewalled) pull automatically up to today (`2026-11-13`).
-* Add `--global-coarse` if you also want the full global `H3-Res4` daily summary computed on the fly while streaming UMD files.
-
-```python
-#!/usr/bin/env python3
-"""
-3-Tier Fault-Tolerant NASA/UMD MODIS & VIIRS Data Downloader and Streaming Parquet Stager.
-Designed for internet-enabled Kaggle CPU staging notebooks (0 GPU-hours).
-"""
-import argparse
-import datetime as dt
-import gzip
-import io
-import os
-import re
-import socket
-import time
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-
-import polars as pl
-import requests
-
-from config_regions import TARGET_COUNTRIES
-
-try:
-    import paramiko
-except ImportError:
-    paramiko = None
-
-try:
-    import h3
-    def latlon_to_h3(lat: float, lon: float, res: int) -> int:
-        if hasattr(h3, "latlng_to_cell"):
-            return int(h3.latlng_to_cell(lat, lon, res), 16)
-        return int(h3.geo_to_h3(lat, lon, res), 16)
-except ImportError:
-    h3 = None
-    latlon_to_h3 = None
-
-UMD_HOST = "fuoco.geog.umd.edu"
-UMD_USER = "fire"
-UMD_PASS = "burnt"
-FIRMS_BASE = "https://firms.modaps.eosdis.nasa.gov"
-
-
-def filter_df_to_countries(df: pl.DataFrame) -> pl.DataFrame:
-    """Fast vectorized multi-box geographic filter across all 6 target countries."""
-    if df.is_empty():
-        return df
-
-    # Build a combined boolean mask + country assignment using Polars expressions
-    expr_country = pl.lit(None, dtype=pl.Utf8)
-    any_box_mask = pl.lit(False)
-
-    for iso, spec in TARGET_COUNTRIES.items():
-        country_mask = pl.lit(False)
-        for (min_lon, min_lat, max_lon, max_lat) in spec.boxes:
-            box_mask = (
-                (pl.col("longitude") >= min_lon)
-                & (pl.col("longitude") <= max_lon)
-                & (pl.col("latitude") >= min_lat)
-                & (pl.col("latitude") <= max_lat)
-            )
-            country_mask = country_mask | box_mask
-        any_box_mask = any_box_mask | country_mask
-        expr_country = pl.when(country_mask).then(pl.lit(iso)).otherwise(expr_country)
-
-    return (
-        df.filter(any_box_mask)
-        .with_columns(expr_country.alias("country_iso"))
-    )
-
-
-def standardize_chunk(df: pl.DataFrame, sensor_hint: str, data_tier: str, ingest_ts: str) -> pl.DataFrame:
-    """Normalize MODIS and VIIRS columns without losing raw fidelity."""
-    cols = set(df.columns)
-
-    # Detect MODIS vs VIIRS dynamically from schema
-    is_viirs = ("bright_ti4" in cols) or ("VIIRS" in sensor_hint.upper())
-    sensor_family = "VIIRS" if is_viirs else "MODIS"
-
-    mir_col = "bright_ti4" if "bright_ti4" in cols else "brightness"
-    tir_col = "bright_ti5" if "bright_ti5" in cols else "bright_t31"
-
-    # Normalize satellite platform names across UMD ML vs FIRMS CSV/API conventions
-    sat_expr = pl.col("satellite").cast(pl.Utf8).str.strip_chars()
-    platform_expr = (
-        pl.when(sat_expr.is_in(["T", "Terra", "TERRA"])).then(pl.lit("Terra"))
-        .when(sat_expr.is_in(["A", "Aqua", "AQUA"])).then(pl.lit("Aqua"))
-        .when(sat_expr.is_in(["N", "SNPP", "Suomi-NPP", "NPP"])).then(pl.lit("SNPP"))
-        .when(sat_expr.is_in(["1", "N20", "J1", "NOAA-20", "JPSS-1"])).then(pl.lit("NOAA-20"))
-        .when(sat_expr.is_in(["2", "N21", "J2", "NOAA-21", "JPSS-2"])).then(pl.lit("NOAA-21"))
-        .otherwise(sat_expr)
-    )
-
-    # Harmonize confidence cleanly: preserve conf_raw, build numeric proxy conf_num
-    conf_str = pl.col("confidence").cast(pl.Utf8).str.strip_chars().str.to_lowercase()
-    conf_num_expr = (
-        pl.when(conf_str.is_in(["l", "low"])).then(pl.lit(20.0))
-        .when(conf_str.is_in(["n", "nom", "nominal"])).then(pl.lit(65.0))
-        .when(conf_str.is_in(["h", "high"])).then(pl.lit(95.0))
-        .otherwise(conf_str.cast(pl.Float32, strict=False))
-        .fill_null(50.0)
-        .cast(pl.Float32)
-    )
-
-    type_expr = (
-        pl.col("type").cast(pl.Int8, strict=False).fill_null(-1)
-        if "type" in cols
-        else pl.lit(-1, dtype=pl.Int8)
-    )
-    ver_expr = (
-        pl.col("version").cast(pl.Utf8)
-        if "version" in cols
-        else pl.lit("unknown", dtype=pl.Utf8)
-    )
-
-    out = df.select([
-        pl.col("country_iso").cast(pl.Utf8),
-        pl.lit(sensor_family, dtype=pl.Utf8).alias("sensor_family"),
-        platform_expr.alias("platform"),
-        pl.lit(data_tier, dtype=pl.Utf8).alias("data_tier"),
-        pl.col("latitude").cast(pl.Float32),
-        pl.col("longitude").cast(pl.Float32),
-        pl.col("acq_date").cast(pl.Utf8),
-        pl.col("acq_time").cast(pl.Int32, strict=False).fill_null(0).alias("acq_hhmm"),
-        pl.col(mir_col).cast(pl.Float32, strict=False).alias("t_mir_k"),
-        pl.col(tir_col).cast(pl.Float32, strict=False).alias("t_tir_k"),
-        pl.col("scan").cast(pl.Float32, strict=False).alias("scan_km"),
-        pl.col("track").cast(pl.Float32, strict=False).alias("track_km"),
-        pl.col("frp").cast(pl.Float32, strict=False).alias("frp_mw"),
-        pl.col("daynight").cast(pl.Utf8).str.slice(0, 1).alias("daynight"),
-        conf_str.alias("conf_raw"),
-        conf_num_expr.alias("conf_num"),
-        type_expr.alias("type_raw"),
-        ver_expr.alias("version_raw"),
-        pl.lit(ingest_ts, dtype=pl.Utf8).alias("ingest_ts"),
-    ])
-    return out
-
-
-def discover_sftp_dirs(sftp) -> Dict[str, str]:
-    """Dynamically locate available MODIS & VIIRS ML directories on fuoco.geog.umd.edu."""
-    candidates = {
-        "MODIS_ML": ["data/MODIS/C61/MCD14ML", "data/MODIS/C6/MCD14ML", "modis/C61/mcd14ml", "modis/C6/mcd14ml"],
-        "VIIRS_SNPP_ML": ["data/VIIRS/C2/VNP14IMGML", "data/VIIRS/C1/VNP14IMGML"],
-        "VIIRS_N20_ML": ["data/VIIRS/C2/VJ114IMGML"],
-        "VIIRS_N21_ML": ["data/VIIRS/C2/VJ214IMGML"],
-    }
-    found = {}
-    for key, paths in candidates.items():
-        for p in paths:
-            try:
-                files = sftp.listdir(p)
-                if any(f.endswith((".csv", ".csv.gz", ".gz")) for f in files):
-                    found[key] = p
-                    print(f"[SFTP] Found {key}: /{p} ({len(files)} files)")
-                    break
-            except IOError:
-                continue
-    return found
-
-
-def fetch_umd_cmg_ancillary(sftp, out_dir: Path) -> None:
-    """Download lightweight 0.25-deg MODIS cloud/overpass (Mx14CMQ) and burned area (MCD64CMQ) grids."""
-    cmg_dir = out_dir / "ancillary_cmg"
-    cmg_dir.mkdir(parents=True, exist_ok=True)
-    ancillary_candidates = {
-        "Mx14CMQ": ["data/MODIS/C61/Mx14CMQ", "data/MODIS/C6/Mx14CMQ", "modis/C6/cmg/monthly/hdf"],
-        "MCD64CMQ": ["data/MODIS/C61/MCD64CMQ", "data/MODIS/C6/MCD64CMQ"],
-    }
-    for name, paths in ancillary_candidates.items():
-        for remote_dir in paths:
-            try:
-                files = sorted(f for f in sftp.listdir(remote_dir) if f.endswith((".hdf", ".nc", ".gz")))
-                if not files:
-                    continue
-                target_sub = cmg_dir / name
-                target_sub.mkdir(exist_ok=True)
-                print(f"[SFTP-CMG] Downloading {len(files)} files from /{remote_dir}...")
-                for fname in files:
-                    local_f = target_sub / fname
-                    if not local_f.exists():
-                        sftp.get(f"{remote_dir}/{fname}", str(local_f))
-                break
-            except IOError:
-                continue
-
-
-def try_sftp_ingest(out_dir: Path, start_year: int, include_global_coarse: bool) -> Dict[str, str]:
-    """
-    Tier 1 Ingestion from fuoco.geog.umd.edu.
-    Streams monthly files -> writes country Parquet -> deletes raw gz immediately.
-    Returns latest date string seen per product.
-    """
-    if paramiko is None:
-        print("[SFTP] paramiko not installed; skipping SFTP.")
-        return {}
-
-    raw_stage = out_dir / "staged_raw"
-    raw_stage.mkdir(parents=True, exist_ok=True)
-    tmp_dir = out_dir / "_tmp"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-
-    latest_dates: Dict[str, str] = {}
-    ingest_ts = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    try:
-        sock = socket.create_connection((UMD_HOST, 22), timeout=12)
-        sock.close()
-    except OSError as exc:
-        print(f"[SFTP] Port 22 unreachable on {UMD_HOST}: {exc}. Will fall back to FIRMS HTTPS.")
-        return {}
-
-    transport = paramiko.Transport((UMD_HOST, 22))
-    transport.connect(username=UMD_USER, password=UMD_PASS)
-    sftp = paramiko.SFTPClient.from_transport(transport)
-
-    try:
-        dirs = discover_sftp_dirs(sftp)
-        if not dirs:
-            return {}
-
-        fetch_umd_cmg_ancillary(sftp, out_dir)
-        global_rollups = []
-
-        for prod_key, remote_dir in dirs.items():
-            files = sorted(
-                f for f in sftp.listdir(remote_dir)
-                if f.endswith((".csv.gz", ".csv"))
-            )
-            for fname in files:
-                # Extract YYYYMM from filenames like VNP14IMGML.201801.C2.03.csv.gz or MCD14ML.200508...
-                m = re.search(r"(20\d{2}|19\d{2})(\d{2})", fname)
-                if m and int(m.group(1)) < start_year:
-                    continue
-
-                part_tag = m.group(0) if m else fname.replace(".", "_")
-                out_pq = raw_stage / f"{prod_key}_{part_tag}.parquet"
-                if out_pq.exists():
-                    continue
-
-                tmp_file = tmp_dir / fname
-                try:
-                    sftp.get(f"{remote_dir}/{fname}", str(tmp_file))
-                    if fname.endswith(".gz"):
-                        with gzip.open(tmp_file, "rb") as gz:
-                            df = pl.read_csv(gz.read(), infer_schema_length=5000, ignore_errors=True)
-                    else:
-                        df = pl.read_csv(tmp_file, infer_schema_length=5000, ignore_errors=True)
-                finally:
-                    if tmp_file.exists():
-                        tmp_file.unlink()
-
-                if df.is_empty():
-                    continue
-
-                # Optional on-the-fly global coarse H3-Res4 rollup before filtering!
-                if include_global_coarse and latlon_to_h3 is not None:
-                    # Lightweight aggregation for global calendar view (~50 MB total across 26 yrs)
-                    pdf = df.select(["latitude", "longitude", "acq_date", "frp", "satellite"]).to_pandas()
-                    pdf["h3_r4"] = [latlon_to_h3(la, lo, 4) for la, lo in zip(pdf["latitude"], pdf["longitude"])]
-                    agg = (
-                        pl.from_pandas(pdf)
-                        .group_by(["h3_r4", "acq_date", "satellite"])
-                        .agg([
-                            pl.len().alias("raw_count"),
-                            pl.col("frp").sum().alias("raw_frp_sum"),
-                        ])
-                        .with_columns(pl.lit(prod_key).alias("source_prod"))
-                    )
-                    global_rollups.append(agg)
-
-                filtered = filter_df_to_countries(df)
-                if not filtered.is_empty():
-                    norm = standardize_chunk(filtered, prod_key, "ML_SCIENCE", ingest_ts)
-                    norm.write_parquet(out_pq, compression="zstd")
-                    max_d = norm.select(pl.col("acq_date").max()).item()
-                    if max_d and (prod_key not in latest_dates or max_d > latest_dates[prod_key]):
-                        latest_dates[prod_key] = max_d
-                    print(f"[SFTP] {fname} -> {norm.height:,} target-country rows (max date {max_d})")
-
-        if global_rollups:
-            pl.concat(global_rollups).write_parquet(out_dir / "global_coarse_h3_r4_raw.parquet", compression="zstd")
-            print("[SFTP] Saved global coarse H3-Res4 rollup.")
-    finally:
-        sftp.close()
-        transport.close()
-
-    return latest_dates
-
-
-def firms_api_fetch_range(
-    map_key: str,
-    source: str,
-    iso3: str,
-    start_date: dt.date,
-    end_date: dt.date,
-    data_tier: str,
-    out_file: Path,
-) -> None:
-    """Pull date range in 10-day chunks from FIRMS REST API (/api/country/csv/)."""
-    if out_file.exists():
-        return
-
-    chunks = []
-    cur = start_date
-    ingest_ts = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    while cur <= end_date:
-        span = min(10, (end_date - cur).days + 1)
-        url = f"{FIRMS_BASE}/api/country/csv/{map_key}/{source}/{iso3}/{span}/{cur.isoformat()}"
-        for attempt in range(4):
-            resp = requests.get(url, timeout=60)
-            if resp.status_code == 200 and not resp.text.startswith("Invalid"):
-                txt = resp.text.strip()
-                if txt and "\n" in txt:
-                    df = pl.read_csv(io.StringIO(txt), infer_schema_length=2000, ignore_errors=True)
-                    if not df.is_empty():
-                        df = df.with_columns(pl.lit(iso3).alias("country_iso"))
-                        chunks.append(standardize_chunk(df, source, data_tier, ingest_ts))
-                break
-            elif resp.status_code == 429:
-                time.sleep(30 * (attempt + 1))
-            else:
-                time.sleep(3)
-        cur += dt.timedelta(days=span)
-        time.sleep(0.15)  # Polite pacing well within 5000 tx / 10 min limit
-
-    if chunks:
-        pl.concat(chunks).write_parquet(out_file, compression="zstd")
-        print(f"[FIRMS-API] Saved {source} / {iso3} ({start_date}..{end_date}) -> {sum(c.height for c in chunks):,} rows")
-
-
-def backfill_via_firms_api(
-    map_key: str,
-    out_dir: Path,
-    sftp_latest: Dict[str, str],
-    start_year: int,
-    nrt_only_if_sftp_ok: bool = True,
-) -> None:
-    """
-    Uses /api/data_availability to pull:
-      1) Full SP archive if SFTP failed, AND
-      2) Trailing NRT months up to today (2026-11-13) after ML/SP stops.
-    """
-    avail_url = f"{FIRMS_BASE}/api/data_availability/csv/{map_key}/all"
-    resp = requests.get(avail_url, timeout=30)
-    resp.raise_for_status()
-    avail_df = pl.read_csv(io.StringIO(resp.text))
-    print("[FIRMS-API] Live Data Availability:")
-    print(avail_df)
-
-    avail_map = {
-        row["data_id"]: (dt.date.fromisoformat(row["min_date"]), dt.date.fromisoformat(row["max_date"]))
-        for row in avail_df.iter_rows(named=True)
-    }
-
-    api_dir = out_dir / "staged_api"
-    api_dir.mkdir(parents=True, exist_ok=True)
-
-    pairs = [
-        ("MODIS_ML", "MODIS_SP", "MODIS_NRT"),
-        ("VIIRS_SNPP_ML", "VIIRS_SNPP_SP", "VIIRS_SNPP_NRT"),
-        ("VIIRS_N20_ML", "VIIRS_NOAA20_SP", "VIIRS_NOAA20_NRT"),
-        ("VIIRS_N21_ML", "VIIRS_NOAA21_SP", "VIIRS_NOAA21_NRT"),
-    ]
-
-    for ml_key, sp_src, nrt_src in pairs:
-        sftp_done = ml_key in sftp_latest
-        sp_min, sp_max = avail_map.get(sp_src, (None, None))
-        nrt_min, nrt_max = avail_map.get(nrt_src, (None, None))
-
-        # 1. If SFTP did not succeed, pull full SP via API
-        if (not sftp_done or not nrt_only_if_sftp_ok) and sp_min and sp_max:
-            eff_start = max(sp_min, dt.date(start_year, 1, 1))
-            for iso3 in TARGET_COUNTRIES:
-                out_f = api_dir / f"{sp_src}_{iso3}_{eff_start}_{sp_max}.parquet"
-                firms_api_fetch_range(map_key, sp_src, iso3, eff_start, sp_max, "SP_SCIENCE", out_f)
-
-        # 2. Always pull trailing NRT window after latest ML/SP date!
-        cutoff_str = sftp_latest.get(ml_key)
-        if cutoff_str:
-            gap_start = dt.date.fromisoformat(cutoff_str) + dt.timedelta(days=1)
-        elif sp_max:
-            gap_start = sp_max + dt.timedelta(days=1)
-        else:
-            gap_start = nrt_min
-
-        if nrt_min and nrt_max and gap_start <= nrt_max:
-            eff_nrt_start = max(gap_start, nrt_min)
-            for iso3 in TARGET_COUNTRIES:
-                out_f = api_dir / f"{nrt_src}_{iso3}_{eff_nrt_start}_{nrt_max}.parquet"
-                firms_api_fetch_range(map_key, nrt_src, iso3, eff_nrt_start, nrt_max, "NRT", out_f)
-
-
-def fallback_scrape_country_csvs(out_dir: Path, start_year: int) -> None:
-    """
-    Tier 3 zero-key HTTP fallback: scrapes exact live annual CSV URLs from
-    https://firms.modaps.eosdis.nasa.gov/country/ rather than guessing URL patterns.
-    """
-    from bs4 import BeautifulSoup
-
-    print("[HTTP-FALLBACK] Scraping live country CSV URLs from FIRMS /country/...")
-    html = requests.get(f"{FIRMS_BASE}/country/", timeout=30).text
-    soup = BeautifulSoup(html, "lxml")
-
-    links = [a.get("href", "") for a in soup.find_all("a", href=True)]
-    csv_links = [
-        (href if href.startswith("http") else f"{FIRMS_BASE}{href}")
-        for href in links
-        if ".csv" in href and "/data/country/" in href
-    ]
-
-    # If HTML uses JS dropdown instead of static <a> links, discover sensor folders cleanly
-    target_names = {c.firms_name for c in TARGET_COUNTRIES.values()}
-    ingest_ts = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    fb_dir = out_dir / "staged_http"
-    fb_dir.mkdir(parents=True, exist_ok=True)
-
-    for url in csv_links:
-        if not any(name in url for name in target_names):
-            continue
-        m_yr = re.search(r"/(20\d{2})/", url)
-        if m_yr and int(m_yr.group(1)) < start_year:
-            continue
-        fname = url.split("/")[-1].replace(".csv", ".parquet")
-        out_f = fb_dir / fname
-        if out_f.exists():
-            continue
-        r = requests.get(url, timeout=60)
-        if r.status_code == 200:
-            df = pl.read_csv(io.StringIO(r.text), infer_schema_length=2000, ignore_errors=True)
-            iso_match = next(iso for iso, spec in TARGET_COUNTRIES.items() if spec.firms_name in url)
-            df = df.with_columns(pl.lit(iso_match).alias("country_iso"))
-            norm = standardize_chunk(df, url, "SP_SCIENCE", ingest_ts)
-            norm.write_parquet(out_f, compression="zstd")
-            print(f"[HTTP-FALLBACK] {fname} -> {norm.height:,} rows")
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--out-dir", type=Path, default=Path("./kaggle_fire_dataset"))
-    parser.add_argument("--start-year", type=int, default=2000)
-    parser.add_argument("--firms-key", type=str, default=os.environ.get("FIRMS_MAP_KEY", ""))
-    parser.add_argument("--global-coarse", action="store_true", help="Also build H3-Res4 global rollup")
-    parser.add_argument("--skip-sftp", action="store_true", help="Force HTTPS FIRMS API path")
-    args = parser.parse_args()
-
-    args.out_dir.mkdir(parents=True, exist_ok=True)
-    sftp_latest: Dict[str, str] = {}
-
-    if not args.skip_sftp:
-        sftp_latest = try_sftp_ingest(args.out_dir, args.start_year, args.global_coarse)
-
-    if args.firms_key:
-        backfill_via_firms_api(
-            map_key=args.firms_key,
-            out_dir=args.out_dir,
-            sftp_latest=sftp_latest,
-            start_year=args.start_year,
-            nrt_only_if_sftp_ok=True,
-        )
-    elif not sftp_latest:
-        print("[WARN] SFTP unavailable AND no --firms-key provided. Running zero-key country scraper...")
-        fallback_scrape_country_csvs(args.out_dir, args.start_year)
-
-
-if __name__ == "__main__":
-    main()
-```
-
----
-
-### 7. File 4: `02_normalize_dedup_verify.py`
-
-Run this immediately after `01_download_and_stage.py` to merge `ML_SCIENCE` + `SP_SCIENCE` + `NRT`, cleanly drop `NRT` duplicates wherever Science-Quality `ML`/`SP` exists, partition into crisp **Zstd Parquet** (`<= 2 GB` total), and print a full scientific coverage audit across every satellite and year.
-
-```python
-#!/usr/bin/env python3
-"""
-Merge, Deduplicate (Science ML/SP > NRT), Partition by Country/Year, and Audit Coverage.
-"""
-import argparse
-from pathlib import Path
-import duckdb
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", type=Path, default=Path("./kaggle_fire_dataset"))
-    args = parser.parse_args()
-
-    final_dir = args.data_dir / "clean_parquet"
-    final_dir.mkdir(parents=True, exist_ok=True)
-
-    globs = []
-    for sub in ["staged_raw", "staged_api", "staged_http"]:
-        p = args.data_dir / sub
-        if p.exists() and list(p.glob("*.parquet")):
-            globs.append(str(p / "*.parquet"))
-
-    if not globs:
-        raise FileNotFoundError(f"No staged parquet files found inside {args.data_dir}")
-
-    con = duckdb.connect(database=":memory:")
-    con.execute("SET threads = 4;")
-    con.execute("SET memory_limit = '10GB';")
-
-    union_sql = " UNION ALL ".join(f"SELECT * FROM read_parquet('{g}')" for g in globs)
-
-    # Deduplicate prioritizing Science quality (ML_SCIENCE=1, SP_SCIENCE=2, NRT=3)
-    # Key: same platform, date, minute, ~10m rounded location
-    dedup_sql = f"""
-    CREATE TEMP TABLE cleaned_fires AS
-    WITH ranked AS (
-        SELECT
-            *,
-            CAST(SUBSTR(acq_date, 1, 4) AS INTEGER) AS year,
-            CASE data_tier
-                WHEN 'ML_SCIENCE' THEN 1
-                WHEN 'SP_SCIENCE' THEN 2
-                ELSE 3
-            END AS tier_rank
-        FROM ({union_sql})
-        WHERE frp_mw IS NOT NULL AND frp_mw >= 0
-          AND latitude BETWEEN -90 AND 90
-          AND longitude BETWEEN -180 AND 180
-    ),
-    deduped AS (
-        SELECT *,
-            ROW_NUMBER() OVER (
-                PARTITION BY platform, acq_date, acq_hhmm, ROUND(latitude, 4), ROUND(longitude, 4)
-                ORDER BY tier_rank ASC, ingest_ts DESC
-            ) AS rn
-        FROM ranked
-    )
-    SELECT
-        country_iso, year, sensor_family, platform, data_tier,
-        latitude, longitude, acq_date, acq_hhmm,
-        t_mir_k, t_tir_k, scan_km, track_km, frp_mw,
-        daynight, conf_raw, conf_num, type_raw, version_raw, ingest_ts
-    FROM deduped
-    WHERE rn = 1;
-    """
-    print("[VERIFY] Deduplicating Science > NRT and sorting...")
-    con.execute(dedup_sql)
-
-    # Export partitioned Zstd Parquet for ultra-fast offline Kaggle L4x4 GPU loading
-    out_pq_root = final_dir / "active_fires"
-    con.execute(f"""
-        COPY cleaned_fires
-        TO '{out_pq_root}'
-        (FORMAT PARQUET, PARTITION_BY (country_iso, year), COMPRESSION ZSTD, OVERWRITE_OR_IGNORE 1);
-    """)
-
-    print("\n=== COVERAGE & CONTINUITY AUDIT BY COUNTRY & PLATFORM ===")
-    audit = con.execute("""
-        SELECT
-            country_iso,
-            platform,
-            MIN(acq_date) AS min_date,
-            MAX(acq_date) AS max_date,
-            COUNT(*) AS total_rows,
-            SUM(CASE WHEN data_tier = 'NRT' THEN 1 ELSE 0 END) AS nrt_rows,
-            SUM(CASE WHEN type_raw = 2 THEN 1 ELSE 0 END) AS static_type2_rows,
-            ROUND(MEDIAN(frp_mw), 2) AS median_frp_mw
-        FROM cleaned_fires
-        GROUP BY country_iso, platform
-        ORDER BY country_iso, min_date;
-    """).fetchdf()
-    print(audit.to_string(index=False))
-
-    # Specific check for CONAE July-August 2026 Chilecito, La Rioja activation & Nov 2026 SNPP cutoff
-    conae_check = con.execute("""
-        SELECT platform, data_tier, COUNT(*) AS rows, MAX(acq_date) AS latest
-        FROM cleaned_fires
-        WHERE country_iso = 'ARG'
-          AND acq_date BETWEEN '2026-07-01' AND '2026-11-15'
-          AND latitude BETWEEN -30.5 AND -28.0
-          AND longitude BETWEEN -68.5 AND -66.5
-        GROUP BY platform, data_tier
-        ORDER BY platform;
-    """).fetchdf()
-    print("\n=== CONAE CHILECITO / LA RIOJA (JUL-NOV 2026) SPOT CHECK ===")
-    print(conae_check.to_string(index=False))
-
-
-if __name__ == "__main__":
-    main()
-```
-
----
-
-### 8. Exact Execution Commands (Hour 0 to Hour 4)
-
-Run these commands inside a **standard Kaggle CPU notebook (Internet ON, 0 GPU-hours spent)**:
-
-1. **Get your free NASA FIRMS `MAP_KEY`** (takes 30 seconds on `firms.modaps.eosdis.nasa.gov/api/area/`, emailed automatically).
-2. **Stage wheels + datasets cloud-to-cloud:**
-```bash
-# Step A: Package offline wheels (~80 MB)
-bash 00_build_offline_wheels.sh
-
-# Step B: Download 2000-2026 data for the 6 optimal countries (+ optional global coarse)
-export FIRMS_MAP_KEY="YOUR_FREE_MAP_KEY_HERE"
-python3 01_download_and_stage.py --out-dir /kaggle/working/fire_data --start-year 2000 --global-coarse
-
-# Step C: Deduplicate (Science > NRT), compress to Parquet, and print coverage audit
-python3 02_normalize_dedup_verify.py --data-dir /kaggle/working/fire_data
-```
-3. **Inspect the audit table printed by `02_normalize_dedup_verify.py`:**
-   - Verify `ARG` shows **July–Aug 2026 Chilecito detections** across Terra/Aqua/NOAA-20/NOAA-21/SNPP.
-   - Verify `SNPP` `max_date` stops right around **`2026-11-02`** while `NOAA-20` and `NOAA-21` continue through **`2026-11-13`**.
-   - Verify `DZA` shows `static_type2_rows > 0` (Saharan industrial gas flares preserved in `Product 1` for persistence-mask verification).
-4. **Publish as Kaggle Dataset:** Click **"Save Version -> Save & Run All"**, then from Output click **"+ New Dataset"** (`fire-harmonizer-staged-parquet`), plus a second tiny dataset for `offline_wheels`.
-
-Once your data audit passes, tell me the output summary (or say **"Data staged — give me the offline L4x4 GPU harmonization engine"**) and I will give you the complete **Phase 2–3 GPU Engine (`03_geometry_cluster.py`, `04_calibrate_operators.py`, `05_gpu_bayesian_conformal.py`, `06_validate_and_export.py`)** ready to plug directly into your offline `4× L4` Kaggle competition notebook!
-
-
-
-Below is a **complete, self-contained Master Engineering Specification** formatted so you can paste or pass it directly to an autonomous coding agent. Every scientific trap, mathematical formula, derivative, dataset endpoint, Kaggle offline constraint, and 160+ automated verification test is explicitly specified with zero ambiguity.
-
----
-
-# MASTER ENGINEERING SPECIFICATION FOR AUTONOMOUS AGENT:
-# MODIS–VIIRS PHYSICS-INFORMED BAYESIAN HARMONIZATION ENGINE & BURNING ACTIVITY CALENDAR
-
-## 1. Mission, Context, and Hard Operational Constraints
-
-### 1.1 Challenge Context
-* **Origin:** 2026 NASA Space Apps Challenge — *"Harmonization of MODIS and VIIRS Hot Spots"* (authored by Marina Compagnucci, CONAE — The Argentinian Space Agency).
-* **Current Date Context:** November 14, 2026.
-* **Core Goal:** Reconstruct a unified, sensor-independent, uncertainty-aware scientific record of terrestrial burning activity spanning 2000–2026 by reconciling fragmented MODIS and VIIRS active-fire observations, and expose it through an interactive **Burning Activity Calendar Web Application** (map ROI selection, Year x Month calendar heatmap, historical median anomaly comparisons, provenance timeline, and CSV download).
-* **Spotlight Challenge Validation Event:** CONAE highlighted the **July–August 2026 wildfire activation in Chilecito, La Rioja, Argentina** (`lat ~ -29.16, lon ~ -67.50`).
-
-### 1.2 Hard Engineering & Resource Constraints
-1. **Total Time Budget:** **36 hours** from start to final deliverable.
-2. **Compute Budget:** **12 GPU-hours** total quota on **4x NVIDIA L4 GPUs (~96 GB aggregate VRAM, 24 GB/GPU)** via a Kaggle Code Competition environment.
-   * **CRITICAL QUOTA RULE:** Kaggle `L4x4` instances often consume quota at a **2x burn rate** (`12 GPU-hours = ~6 wall-clock hours max on L4x4`). Never open an interactive `L4x4` session to debug syntax or parse CSVs. All ETL, unit testing, and dry-runs MUST run on CPU (0 GPU-hours). Use `L4x4` strictly for batch script execution (`torch.multiprocessing` across `cuda:0..3`).
-3. **Offline Execution Constraint:** The `L4x4` Kaggle competition notebook has **INTERNET STRICTLY DISABLED** and a **~20 GB `/kaggle/working` output persistence limit**.
-   * **Mandatory Environment Separation:**
-     * **Environment 1 (Data & Wheel Stager — Internet ON):** Standard Kaggle CPU notebook (or external Linux terminal). Downloads NASA/UMD datasets cloud-to-cloud, converts to Zstd Parquet (`<= 3 GB`), downloads prebuilt `manylinux` `.whl` packages (`<= 100 MB`), and uploads both as Kaggle Input Datasets.
-     * **Environment 2 (Offline Harmonization Engine — Internet OFF, `4x L4`):** Mounts Code Repo (GitHub imported as Kaggle Dataset) + Wheel Dataset + Parquet Data Dataset. Runs offline `pip install --no-index`, executes calibration, GPU Bayesian state-space inference, conformal calibration, and validation suite, exporting final DuckDB + Parquet artifacts (`<= 4 GB`).
-     * **Environment 3 (Web Application Server):** Runs outside Kaggle (local Docker / Hugging Face Spaces / Render) reading the exported DuckDB/Parquet artifacts from Environment 2.
-
----
-
-## 2. Non-Negotiable Scientific Invariants (Agent Must Never Violate)
-
-1. **INV-01 (No Imitation Learning):** NEVER train a model `f(VIIRS) -> MODIS` (which destroys 2012–2026 fine detail) or blindly `f(MODIS) -> VIIRS` (which hallucinates unobserved 2000–2011 small fires). Both sensors must inform a **common latent physical fire state** via sensor-specific forward observation operators.
-2. **INV-02 (Never Sum Same-Orbit Satellites):** Suomi-NPP, NOAA-20, and NOAA-21 share the ~13:30 / 01:30 MLT orbital plane (~50 min apart). Multiple VIIRS detections of the same hexagon in the same half-day window are **repeated conditional observations of the same physical state** (reducing variance), NEVER additive fire counts or additive FRP.
-3. **INV-03 (Pre-Drift Calibration Freeze):** Terra (10:30 AM) and Aqua (1:30 PM) began severe orbital drift in **2022** (drifting toward ~8:45 AM and ~3:30–3:50 PM respectively). Cross-sensor MODIS–VIIRS observation operators MUST be calibrated strictly on the **stable-orbit overlap period (Jan 2012 – Dec 2021)**. Post-2022 drift is corrected via the explicit solar-time diurnal operator $D(\tau)$ and evaluated as a hold-out test.
-4. **INV-04 (Explicit Operational Satellite Calendar):** Never treat an unlaunched or decommissioned satellite as observing zero fires. Encode exact operational windows:
-   * `Terra`: `2000-11-01` to present
-   * `Aqua`: `2002-07-04` to present
-   * `SNPP`: `2012-01-20` to `2026-11-02` (FIRMS S-NPP delivery ceased Nov 2, 2026)
-   * `NOAA-20`: `2018-04-01` (Science ML) / `2020-01-01` (NRT) to present
-   * `NOAA-21`: `2023-03-01` (Science ML) / `2024-01-17` (NRT) to present
-5. **INV-05 (Separate Physical World from Measurement World):** Explicitly implement $Y_{s,t} = h_s(X_t, \theta_s, G_{s,t}, A_{s,t}) + \epsilon_{s,t}$ and $D_{s,t} \sim \text{Bernoulli}(p_s(X_t, G_{s,t}, Q_{s,t}))$.
-6. **INV-06 (No Raw Brightness Temperature Averaging):** Never average MODIS `brightness`/`bright_t31` ($3.96\,\mu\text{m}$) with VIIRS `bright_ti4`/`bright_ti5` ($3.74\,\mu\text{m}$, saturates at 367 K). They measure different bands at vastly different pixel-dilution areas ($1\,\text{km}^2$ vs $0.14\,\text{km}^2$).
-7. **INV-07 (Honest Censoring & Uncertainty):** When 2000–2011 MODIS sees zero fires, account for its pixel-area detection limit ($F_{\min} \approx 3.7\text{–}40\,\text{MW}$) via the Hurdle likelihood so posterior uncertainty widens honestly instead of clamping small fires to zero with fake certainty.
-8. **INV-08 (Static Thermal Source Separation):** Filter volcanoes (`type=1`), offshore (`type=3`), SAMA nighttime low-confidence false alarms ($11^\circ\text{E–}110^\circ\text{W}, 7^\circ\text{N–}55^\circ\text{S}$), and persistent industrial/gas flares (`type=2` + multi-year recurrence mask, critical since NRT drops `type` and older C2 VIIRS had mislabeled `type=2`).
-9. **INV-09 (Preservation of Raw Provenance):** Never overwrite raw inputs; emit **3 distinct output products** (Harmonized Provenance Observations, Reconstructed Physical State, Uncertainty & Diagnostics).
-10. **INV-10 (No Coordinate Leakage in Regime Models):** Unsupervised fire-regime ("pyrome") clustering must use only physical/behavioral features, never raw latitude/longitude.
-
----
-
-## 3. Data Acquisition & Spatial Scope (Environment 1)
-
-### 3.1 Target Spatial Scope (Dual-Tier Strategy)
-The mathematical engine is **100% global and location-agnostic** (depends only on H3 equal-area geometry, solar time, scan area, and behavioral pyromes). To guarantee completion within 36 hours and `< 20 GB` disk:
-* **Tier 1 (Guaranteed Core — H3 Resolution 6, $\bar{A} \approx 36.13\,\text{km}^2$):** Full pixel-to-hexagon 2000–2026 harmonization across **6 scientifically optimal benchmark countries** (~2–3 GB CSV $\rightarrow$ ~1.2 GB Zstd Parquet):
-  1. `ARG` (Argentina): `lat [-55.5, -21.5], lon [-73.8, -53.5]` — CONAE July–Aug 2026 Chilecito spotlight, Pampas agricultural burns, SAMA zone.
-  2. `DZA` (Algeria): `lat [18.9, 37.2], lon [-8.7, 12.0]` — Northern Mediterranean crown wildfires (Kabylie 2021/2023) vs. Saharan static gas flares (Hassi Messaoud).
-  3. `BRA` (Brazil): `lat [-33.8, 5.4], lon [-74.0, -34.7]` — Dense 2012–2021 calibration backbone across Amazon deforestation + Cerrado savanna + clouds + SAMA.
-  4. `IDN` (Indonesia): `lat [-11.1, 6.2], lon [95.0, 141.1]` — Extreme equatorial cloud cover (`<30–40%` detection rate) + nighttime peat smoldering + low-evidence abstention stress test.
-  5. `AUS` (Australia): `lat [-43.8, -10.0], lon [112.9, 154.0]` — Low-FRP northern savanna burns + 2019–2020 Black Summer VIIRS I4 saturation megafires.
-  6. `USA` (United States — split to avoid antimeridian wrap):
-     * `USA_CONUS`: `lat [24.4, 49.5], lon [-125.0, -66.8]`
-     * `USA_ALASKA`: `lat [51.2, 71.5], lon [-170.0, -129.9]` — Boreal cluster discrepancy benchmark (where literature notes MODIS can be ~47% higher in dense boreal clusters vs ~20% global mean offset).
-* **Tier 2 (Global Coarse Calendar — Conditional at Hour 4, H3 Resolution 4, $\bar{A} \approx 1,770\,\text{km}^2$):** While streaming monthly global files from UMD SFTP, aggregate global counts/FRP on the fly into an `H3-Res4` daily summary table (`~50–150 MB` Parquet). If UMD SFTP completes cleanly before Hour 4, run the harmonization solver on the global coarse grid as well.
-
-### 3.2 Exact Data Sources & 3-Tier Ingestion Protocol
-1. **Tier 1 Upstream Science Archive (`sftp://fuoco.geog.umd.edu` or `ftps://fuoco.geog.umd.edu`):**
-   * Credentials: user `fire`, password `burnt`.
-   * Dynamically inspect paths for:
-     * MODIS Collection 6.1/6 Standard ML: `data/MODIS/C61/MCD14ML` (or `C6`)
-     * VIIRS 375 m Collection 2 (post-May-2025 reprocessed): `data/VIIRS/C2/VNP14IMGML` (S-NPP), `VJ114IMGML` (NOAA-20), `VJ214IMGML` (NOAA-21)
-     * Optional Diagnostic Bridge (750 m VIIRS M-band): `data/VIIRS/C2/VNP14ML`
-     * Cloud & Overpass Denominator Grids: `Mx14CMQ` (`MOD14CMQ`/`MYD14CMQ` 0.25-deg monthly HDF4 containing `CloudPix`, `MissingPix`, `LandPix`, `CloudCorrFirePix`)
-     * Independent Validation Burned Area Grid: `MCD64CMQ` (0.25-deg monthly burned area)
-   * Streaming rule: Download one monthly `.csv.gz` into `/tmp`, filter immediately to target bounding boxes (+ optional global H3-Res4 rollup), standardize schema, write compressed Parquet, and delete `/tmp/*.csv.gz` immediately so peak temp disk stays `< 500 MB`.
-2. **Tier 2 NASA FIRMS REST API (`https://firms.modaps.eosdis.nasa.gov`):**
-   * Query `/api/data_availability/csv/{MAP_KEY}/all` first to discover exact available `min_date`/`max_date` for `MODIS_SP`, `MODIS_NRT`, `VIIRS_SNPP_SP`, `VIIRS_SNPP_NRT`, `VIIRS_NOAA20_SP`, `VIIRS_NOAA20_NRT`, `VIIRS_NOAA21_SP`, `VIIRS_NOAA21_NRT`.
-   * Always pull trailing `*_NRT` chunks in 10-day windows via `/api/country/csv/{MAP_KEY}/{SOURCE}/{ISO3}/{DAYS}/{DATE}` covering the gap from the last ML/SP science date right up to **2026-11-14** (capturing July–Aug 2026 Chilecito and Nov 2, 2026 S-NPP termination).
-   * If SFTP port 22 is blocked, automatically backfill full `*_SP` history via API.
-3. **Tier 3 Zero-Key HTTP Country Backup:**
-   * Parse `https://firms.modaps.eosdis.nasa.gov/country/` HTML dynamically with `BeautifulSoup` to locate live annual `/data/country/.../*.csv` links rather than hardcoding URL path patterns.
-
-### 3.3 Schema Unification & Deduplication (`02_normalize_dedup_verify.py`)
-* Unify column differences:
-  * `brightness` / `bright_ti4` -> `t_mir_k` (`float32`)
-  * `bright_t31` / `bright_ti5` -> `t_tir_k` (`float32`)
-  * `satellite` aliases: `T`/`Terra` -> `Terra`, `A`/`Aqua` -> `Aqua`, `N`/`SNPP` -> `SNPP`, `1`/`J1`/`N20`/`NOAA-20` -> `NOAA-20`, `2`/`J2`/`N21`/`NOAA-21` -> `NOAA-21`
-  * Preserve `conf_raw` natively (`'l'/'n'/'h'` or `'0'..'100'`), compute initial numeric proxy `conf_num` (`low=20, nominal=65, high=95` or parsed float) prior to empirical reliability calibration.
-  * Preserve `type_raw` (`int8`, `-1` if absent in NRT).
-* Deduplicate overlapping `ML_SCIENCE` (`rank=1`), `SP_SCIENCE` (`rank=2`), and `NRT` (`rank=3`) records on key `(platform, acq_date, acq_hhmm, ROUND(latitude, 4), ROUND(longitude, 4))`, keeping `tier_rank ASC, ingest_ts DESC`.
-
-### 3.4 Offline `.whl` Package Strategy
-* Package **only** missing `manylinux2014_x86_64` prebuilt wheels matching Kaggle's Python version (`3.10` or `3.11`): `duckdb`, `polars`, `h3`, `paramiko`, `beautifulsoup4`, `lxml`, plus `pyhdf` if available cleanly (never recompile CUDA/PyTorch wheels; use Kaggle's preinstalled `torch`, `scipy`, `scikit-learn`, `lightgbm`, `numpy`, `pandas`, `pyarrow`, `pytest`).
-
----
-
-## 4. Complete Mathematical & Algorithmic Architecture (Environment 2)
-
-### Module 1: Spatial-Temporal Support, Geometry & False-Positive Hygiene
-1. **Equal-Area Spatial Support:** Map $(\text{lat}_i, \text{lon}_i) \mapsto g = \text{H3}_6(\text{lat}_i, \text{lon}_i)$ using a version-safe H3 wrapper supporting both `h3 v4` (`latlng_to_cell`) and `h3 v3` (`geo_to_h3`).
-2. **Local Solar Time & Day/Night Split:**
-   $$\tau_i = \left(\text{utc\_hours}_i + \frac{\text{lon}_i}{15.0}\right) \bmod 24.0$$
-   Assign local solar date $d_i$ and regime $\text{DN}_i \in \{\text{Day}, \text{Night}\}$. Reconstruct **Day** and **Night** latent physical states separately to preserve flaming vs. smoldering/peat combustion regimes.
-3. **Pixel Area & Viewing Zenith Angle ($\theta_i$):**
-   $$A_i = \text{scan}_i \times \text{track}_i \quad (\text{km}^2)$$
-   Invert sensor-specific area-expansion lookup splines:
-   * MODIS: monotone spline mapping $A_i \in [1.0, 9.6]\,\text{km}^2 \mapsto \theta_i \in [0^\circ, 65^\circ]$.
-   * VIIRS I-band: piecewise lookup across `3:1`, `2:1`, `1:1` aggregation zones mapping $A_i \in [0.14, 0.62]\,\text{km}^2 \mapsto \theta_i \in [0^\circ, 65^\circ]$.
-4. **Static Industrial / Volcano / SAMA Filtering:**
-   * Drop `type_raw IN (1, 3)` and VIIRS nighttime low-confidence detections inside SAMA (`-110 <= lon <= 11` and `-55 <= lat <= 7`).
-   * Bin all detections into `H3 Resolution 10` micro-cells ($\sim 0.015\,\text{km}^2$). For each micro-cell $m$, compute active years $Y_m$, mean active days/year $\bar{D}_m$, and day/night symmetry $R^{\text{DN}}_m = \frac{\min(n_{\text{day}}, n_{\text{night}})}{\max(n_{\text{day}}, n_{\text{night}}) + 1}$. Flag `is_static_industrial = True` if `type_raw == 2` OR ($Y_m \ge 3$ AND $\bar{D}_m \ge 15$ AND $R^{\text{DN}}_m > 0.30$). Exclude flagged detections from biomass-fire fusion while retaining them in **Product 1**.
-5. **Intra-Pass Bow-Tie Correction & Physical Fire-Event Clustering:**
-   * Group detections strictly by single platform overpass `(platform, pass_id)` where timestamps fall within $\Delta t \le 5\,\text{min}$.
-   * **Bow-tie overlap weighting (MODIS pixels with $A_i > 1.5\,\text{km}^2$):** Build spatial adjacency graph connecting pixels $i, j$ within the same overpass when great-circle distance $d_{ij} < 0.7 \cdot \frac{\text{track}_i + \text{track}_j}{2}$ across adjacent scan tracks. Assign weight $\omega^{\text{bt}}_i = \frac{1}{1 + \text{degree}(i)}$.
-   * **Spatial Event Clustering (Connected Components / ST-DBSCAN):** Within the same single-platform overpass, connect pixels $i, j$ when $d_{ij} \le 1.4 \cdot \max(\sqrt{A_i}, \sqrt{A_j})$. Each connected component is one raw pass cluster.
-   * **Saturation Flag (`sat_flag`):** Mark `sat_flag = 1` if VIIRS `t_mir_k >= 366.0` K without unsaturated M13 recovery or MODIS saturation limits are hit.
-   * **Aggregate to Sufficient-Statistic Overpass Table** keyed by `(h3_index, solar_date, platform, dn_flag)`:
-     * `y_frp_mw`: $\sum \omega^{\text{bt}}_i \cdot w_i \cdot \text{frp\_mw}_i$
-     * `raw_event_count`: number of connected clusters intersecting `h3_index`
-     * `det_footprint_km2`: $\sum \omega^{\text{bt}}_i \cdot A_i$
-     * `mean_area_km2`, `mean_vza_deg`, `mean_solar_hour`, `mean_rel_weight`, `sat_flag`.
-
-### Module 2: Observation Operators & Pre-Drift Calibration (2012–2021 Stable Overlap)
-For latent log-flux $z_{g,d,\text{DN}} = \ln(\Phi_{g,d,\text{DN}})$ (where $\Phi$ is 24-hour cloud-free physical radiative flux in MW, and $\epsilon_0 = 0.05\,\text{MW}$ sets the deep background baseline $z_{\min} = \ln \epsilon_0$), the forward observation equation is:
-$$\ln Y_{p,g,d,\text{DN}} = z_{g,d,\text{DN}} + \mu^{\text{gain}}_{p,g,d,\text{DN}} + \epsilon_{p,g,d,\text{DN}}, \qquad \epsilon_{p,g,d,\text{DN}} \sim \mathcal{N}(0, \sigma^2_{p,g,d,\text{DN}})$$
-where the total forward log-gain is:
-$$\mu^{\text{gain}}_{p,g,d,\text{DN}} = \ln v_{p,g,d} + \ln D_{b(g), m(d)}(\bar{\tau}_{p,g,d}) + \ln \psi^{\text{FRP}}_{p,b}(\bar{A}_p, \text{DN}) + \ln \gamma_{p,b}(\bar{\theta}_p, q)$$
-
-1. **Coordinate-Free Behavioral Pyrome Discovery ($b(g)$):**
-   * Extract per-hexagon behavioral vectors over 2012–2021: median `night/day FRP ratio`, circular variance of active months, inter-annual CV, and median cluster power. Never include `lat` or `lon`. Fit a **Gaussian Mixture Model ($K = 6\text{–}8$ pyromes)**.
-2. **Calibrated Confidence Reliability ($w_i \in [0, 1]$):**
-   * On 2012–2021 overlap data, compute empirical probability that a detection in raw confidence bin $c$ is corroborated within $\pm 1$ day or by another sensor. Fit monotonic calibration mapping $w_i = P(\text{corroborated} \mid \text{sensor}, c, \text{DN}, \theta_i)$.
-3. **Physical Detection Limits & Survival Fractions ($\psi^{\text{CNT}}, \psi^{\text{FRP}}$):**
-   * Sensor minimum detectable power:
-     $$F_{\min, p}(\bar{A}, \text{DN}) = \alpha_{p,\text{DN}} + \beta_{p,\text{DN}}\,\bar{A}$$
-     (MODIS anchored from ~3.7 MW nadir night to ~40 MW daytime edge; VIIRS anchored from ~0.5 MW nadir night to ~2.5 MW daytime edge; refine $(\alpha, \beta)$ per pyrome via empirical logistic detection curves on 2012–2021 Aqua–SNPP pairs).
-   * Fit a per-pyrome **Log-Normal fire cluster intensity distribution** $f_b(F)$ via MLE on clear-sky nadir VIIRS clusters down to $F_{\text{ref}} = 0.5\,\text{MW}$. Compute exact analytical detection survival integrals:
-     $$\psi^{\text{CNT}}_{p,b}(\bar{A}, \text{DN}) = \int_{F_{\min,p}}^\infty f_b(F)\,dF, \qquad \psi^{\text{FRP}}_{p,b}(\bar{A}, \text{DN}) = \frac{\int_{F_{\min,p}}^\infty F\,f_b(F)\,dF}{\int_{F_{\text{ref}}}^\infty F\,f_b(F)\,dF}$$
-4. **VZA & Intensity Quantile Mapping ($\gamma_{p,b}$):**
-   * On synchronous 2012–2021 Aqua vs. S-NPP pairs ($\Delta t \le 45\,\text{min}$), after dividing out $\psi^{\text{FRP}}$, fit **Empirical Quantile Mapping + Monotonic LightGBM** conditioned on `(pyrome, DN, mean_vza_deg, intensity_quantile)` to correct scan-angle and radiometric bias without flattening extreme megafires.
-5. **2-Harmonic Diurnal & Orbital-Drift Operator ($D_{b,m}(\tau)$):**
-   $$\ln D_{b,m}(\tau) = a_0 + a_1\cos\!\left(\frac{2\pi\tau}{24}\right) + b_1\sin\!\left(\frac{2\pi\tau}{24}\right) + a_2\cos\!\left(\frac{4\pi\tau}{24}\right) + b_2\sin\!\left(\frac{4\pi\tau}{24}\right)$$
-   normalized numerically so $\frac{1}{24}\int_0^{24} D_{b,m}(\tau)\,d\tau = 1.0$. Fit coefficients using Terra (10:30/22:30) vs. Aqua/SNPP (13:30/01:30) over 2003–2021 plus post-2022 Aqua solar-time drift relative to stationary NOAA-20.
-6. **Cloud Visibility ($v_{p,g,d}$) & Heteroscedastic Variance ($\sigma^2_{p,g,d,\text{DN}}$):**
-   * From `Mx14CMQ`, extract monthly clear-sky fraction $v = \max(0.10,\; 1 - f_{\text{cloud}} - f_{\text{missing}})$ (fallback if `pyhdf` unavailable: orbital swath latitude coverage probability $\times$ regional seasonal cloud climatology, logged in `quality_flag`).
-   * Fit residual variance model on 2012–2021 calibration errors:
-     $$\sigma^2_{p,g,d,\text{DN}} = \text{clip}\Big(\exp\big(\beta_0 + \beta_1\bar{\theta}_p + \beta_2(1 - \bar{w}) + \beta_3(1 - v) + \beta_{\text{sensor}}\big),\; 0.02,\; 2.5\Big)$$
-
-### Module 3: Space x Time x Day-Night Bayesian Reconstruction (4x L4 GPUs)
-Shard H3 cells across 4 worker processes (`cuda:0..3`), grouping each cell with its 1-ring H3 neighbors on the same GPU. For each active hexagon $g$ and daily timeline $d = 1,\dots,T$:
-
-1. **Exact Likelihood Terms & Analytical Derivatives (with Exact Positive-Definite Guards):**
-   For each platform $p$ with `is_operational[p, d] == 1`:
-   * **Case A — Unsaturated Detection ($Y > 0$, `sat_flag == 0`):**
-     $$\ell_{\text{obs}}(z) = \frac{(z + \mu_{\text{gain}} - \ln Y)^2}{2\sigma^2}, \qquad \ell'_{\text{obs}}(z) = \frac{z + \mu_{\text{gain}} - \ln Y}{\sigma^2}, \qquad \ell''_{\text{obs}}(z) = \frac{1}{\sigma^2}$$
-   * **Case B — Right-Censored Saturated Detection (`sat_flag == 1`, $Y \ge Y_{\text{sat}}$):**
-     Let $w(z) = \frac{z + \mu_{\text{gain}} - \ln Y_{\text{sat}}}{\sigma}$ and inverse Mills ratio $\lambda(w) = \frac{\phi_{\mathcal{N}}(w)}{\Phi_{\mathcal{N}}(w)} = \exp(\text{log\_pdf}(w) - \text{log\_ndtr}(w))$:
-     $$\ell_{\text{sat}}(z) = -\text{log\_ndtr}(w), \qquad \ell'_{\text{sat}}(z) = -\frac{\lambda(w)}{\sigma}, \qquad \ell''_{\text{sat}}(z) = \frac{\lambda(w)\big(w + \lambda(w)\big)}{\sigma^2} > 0$$
-   * **Case C — Non-Detection ($Y = 0$ while operational):**
-     Let $k = \frac{\lambda_{0,b}\,\psi^{\text{CNT}}_{p,b}(\bar{A}, \text{DN})}{\bar{F}_{\text{event}, b}} > 0$, $\Lambda(z) = k\,e^z$, $q(z) = (1 - v) + v\,e^{-\Lambda(z)}$, and $r(z) = \frac{v\,e^{-\Lambda(z)}}{q(z)}$:
-     $$\ell_{\text{miss}}(z) = -\ln q(z), \qquad \ell'_{\text{miss}}(z) = r(z)\,\Lambda(z)$$
-     Exact second derivative:
-     $$\ell''_{\text{miss}}(z) = r(z)\,\Lambda(z)\,\Big[1 - \Lambda(z)\big(1 - r(z)\big)\Big]$$
-     **MANDATORY CONVEXITY GUARD:** Because $(1 - v) + v e^{-\Lambda}$ can exhibit minor negative curvature when $v < 1$ and $\Lambda \in (1, 4)$, the solver MUST use exact $\ell'_{\text{miss}}(z)$ for the gradient while clamping the Newton/Gauss-Newton Hessian term to $h_{\text{miss}}(z) = \max\big(0.0,\; \ell''_{\text{miss}}(z)\big)$! This preserves the exact MAP stationary condition $\nabla J(z^*) = 0$ while mathematically guaranteeing Symmetric Positive Definiteness ($H \succ 0$) at every step.
-
-2. **Space x Time x Day-Night Prior:**
-   * **Temporal AR(1) persistence** toward regional cell-month prior $\mu_{g, m(d)}$:
-     $$\ell_{\text{time}} = \sum_{d=2}^T \frac{\big[(z_{g,d} - \mu_{g,m(d)}) - \rho_b(z_{g,d-1} - \mu_{g,m(d-1)})\big]^2}{2\sigma^2_{\text{proc}, b}}$$
-   * **1-Ring Spatial GMRF Coupling** (via Red-Black 2-coloring of H3 cells so neighbors are held constant per half-sweep):
-     $$\ell_{\text{space}} = \sum_{d=1}^T \sum_{g' \in \mathcal{N}(g)} \frac{\alpha_{s, b}(z_{g,d} - z_{g',d})^2}{2\sigma^2_{\text{proc}, b}}, \qquad \alpha_{s,b} \in [0.05, 0.15]$$
-   * **Soft Day–Night Coupling:** Couple standardized Day and Night anomalies $\frac{\eta_{\text{dn}}}{2\sigma^2_{\text{proc}}}[(z_{d,\text{Day}}-\mu_{d,\text{Day}}) - \beta_{\text{dn}}(z_{d,\text{Night}}-\mu_{d,\text{Night}})]^2$ so daytime megafires constrain clouded nighttime passes.
-
-3. **Batched GPU Solver (`torch.float64` Precision for Solves!):**
-   * Run 4–6 Red-Black spatial outer sweeps; inside each sweep, run 12–20 Damped Newton-Raphson iterations with Armijo backtracking line search.
-   * **CRITICAL PRECISION RULE:** Perform the $O(T)$ **Batched Tridiagonal Thomas Cholesky Solver** ($H_g = L_g D_g L_g^\top$) and **Takahashi Precision Recursion** in **`torch.float64`** (`~3,500 cells x 9,500 days x 8 B = ~266 MB` per GPU—easily fits inside 24 GB L4 VRAM with zero floating-point cancellation!).
-
-### Module 4: Uncertainty Propagation, Conformal Guarantee & Secondary Physical Variables
-1. **Takahashi Variance Recursion + Correlated AR(1) Monte Carlo:**
-   * Extract exact daily marginal variances $\Sigma_{d,d}$ and lag-1 covariances $\Sigma_{d,d-1}$ from $(L_g, D_g)$ in $O(T)$.
-   * Draw $M = 200$ correlated daily Gaussian-Markov trajectories $z^{(m)}_{g, 1:T}$ on GPU.
-   * Transform back to physical variables per trajectory $m$:
-     * 24h Physical Fire Radiative Flux: $\Phi^{(m)}_{g,d} = \max(0,\; w_{\text{day}}e^{z^{(m)}_{g,d,\text{Day}}} + w_{\text{night}}e^{z^{(m)}_{g,d,\text{Night}}} - \epsilon_0)$ (MW)
-     * Daily Fire Radiative Energy: $\text{FRE}^{(m)}_{g,d} = 0.0864 \cdot \Phi^{(m)}_{g,d}$ (TJ/day)
-     * Standardized Fire Events: $E^{(m)}_{g,d} = \Phi^{(m)}_{g,d} / \bar{F}_{\text{event}, b}$
-     * Estimated Active Burning Footprint ($\widehat{A}^{\text{burn}}_{g,d}$, $\text{km}^2$): calibrated 2012–2021 quantile transfer function of $(\Phi^{(m)}_{g,d}, \text{night/day ratio}, b)$.
-   * Sum daily trajectories inside each `(h3_index, year, month)` and compute posterior `q05`, `q50`, `q95`, `mean`.
-2. **Split Conformal Coverage Calibration (Distribution-Free Guarantee):**
-   * On held-out **2018–2020 ablation folds** (where VIIRS is masked during inference so the engine sees only MODIS), evaluate monthly predictions $\widehat{\Phi}_{\text{MODIS-only}}$ and raw interval spread $\hat{\sigma}_{\text{raw}}$ against full-sensor reference $\Phi_{\text{ref}}$.
-   * Compute nonconformity scores $r_j = \frac{|\Phi_{\text{ref}, j} - \widehat{\Phi}_{\text{MODIS-only}, j}|}{\hat{\sigma}_{\text{raw}, j} + \delta}$.
-   * Compute empirical 90th-percentile conformal multiplier $\hat{q}_{0.90, b}$ per pyrome and regime, and rescale raw Laplace interval widths by $\hat{q}_{0.90, b}$ so output intervals satisfy finite-sample coverage $\ge 90\%$.
-3. **Attribution, Abstention & Fixed-Lag Streaming Mode:**
-   * Compute `measured_fraction` (share of monthly flux backed by direct detections vs. state-space gap-filling).
-   * Flag `quality_flag = ABSTAIN_LOW_EVIDENCE` whenever 5+ consecutive days have `mean_cloud_frac > 0.85` and zero neighbor detections.
-   * Flag `attribution_flag` (`REAL_FIRE_CHANGE`, `SENSOR_ARTIFACT_CORRECTED`, `AMBIGUOUS_OVERLAPPING_CI`).
-   * Implement `run_fixed_lag_update(window_days=14)` to assimilate late NRT/Science revisions cleanly over trailing 14-day slices without re-solving all 26 years.
-
----
-
-## 5. Exact Output Products & Data Schemas (`fire_harmonized.duckdb` + Parquet)
-
-The engine MUST export **3 distinct products**:
-
-1. **Product 1 (`obs_harmonized_provenance.parquet`):** Preserves untouched raw sensor fields (`platform`, `data_tier`, `acq_date`, `acq_hhmm`, `frp_mw`, `t_mir_k`, `t_tir_k`, `scan_km`, `track_km`, `conf_raw`, `type_raw`, `ingest_ts`), plus derived diagnostics (`h3_index`, `solar_hour`, `pixel_area_km2`, `vza_deg`, `is_static_industrial`, `is_sama_filtered`, `bowtie_weight`, `reliability_prob`, `event_cluster_id`, `forward_gain_c`, `obs_sigma`).
-2. **Product 2 (`state_reconstructed_monthly.parquet` & `state_reconstructed_daily.parquet`):**
-   * Keys: `h3_index`, `h3_res`, `country_iso`, `pyrome_id`, `year`, `month` (plus `solar_date` in daily).
-   * Raw unharmonized baselines: `raw_count_sum`, `raw_frp_sum_mw` (for transparent before/after comparison).
-   * Reconstructed physical states: `phi_day_mw`, `phi_night_mw`, `phi_q05_mw`, `phi_q50_mw`, `phi_q95_mw`, `phi_mean_mw`, `phi_flux_mw_km2`, `fre_tj_q50`, `std_events_q05`, `std_events_q50`, `std_events_q95`, `est_active_area_km2`, `night_day_ratio`.
-   * Calendar indices: `hist_median_2003_2020`, `anomaly_ratio`, `anomaly_zscore`, `climatology_pctile`.
-3. **Product 3 (`uncertainty_diagnostics.parquet`):** Matched 1-to-1 with Product 2: `conformal_q_factor`, `rel_uncertainty_width`, `measured_fraction`, `inferred_fraction`, `active_platforms_bitmask`, `mean_cloud_frac`, `has_nrt_gapfill`, `attribution_flag`, `quality_flag`, `revision_count`.
-
----
-
-## 6. Web Application Specification (Environment 3)
-
-Build a clean decoupled web app reading `fire_harmonized.duckdb`:
-* **Backend (`FastAPI` + `DuckDB`):**
-  * `GET /api/calendar?bbox=...&start_year=2000&end_year=2026&metric=phi_q50_mw`: returns Year x Month matrix with conformal uncertainty & provenance flags.
-  * `GET /api/timeseries?...`: returns monthly harmonized series + raw broken baseline + `q05–q95` CI bands + satellite transition markers (`2002 Aqua`, `2012 SNPP`, `2018 N20`, `2022 Drift`, `2023 N21`, `Nov 2026 SNPP End`).
-  * `GET /api/map_hex?bbox=...&year=...&month=...`: returns H3 polygons (GeoJSON) colored by harmonized flux / anomaly / uncertainty.
-  * `GET /api/export.csv?...`: sanitized harmonized CSV download preserving provenance & uncertainty.
-* **Frontend (`MapLibre GL JS` + `Apache ECharts` — with `Streamlit + PyDeck` emergency backup if frontend exceeds Hour 28):**
-  * Interactive map with draw-box / click-hex / preset spotlight buttons (`Chilecito Argentina Jul-Aug 2026`, `Kabylie Algeria 2021-2023`, `Hassi Messaoud Gas Flare Check`, `Alaska Boreal`, `Black Summer Australia`, `Kalimantan Peat Indonesia`).
-  * Accessible colorblind-safe `viridis`/`cividis`/`plasma` ramps; visual hatching/opacity indicator for high-uncertainty periods (pre-2012 censoring or heavy clouds).
-
----
-
-## 7. Mandatory 160+ Automated Verification & Falsification Test Suite
-
-The coding agent **MUST implement and pass all 10 `pytest` suites below (`>= 166` parameterized test cases)**. No phase is considered complete until its corresponding tests pass cleanly.
-
-### Suite 1: `tests/test_01_ingestion_schema.py` (18 Tests)
-* `test_satellite_alias_mapping` (parametrized across `T/Terra/TERRA`, `A/Aqua`, `N/SNPP/NPP`, `1/N20/J1/NOAA-20`, `2/N21/J2/NOAA-21`).
-* `test_confidence_mixed_types` (parametrized across `'l'`, `'n'`, `'h'`, `'low'`, `'nominal'`, `'high'`, `'0'`, `'30'`, `'100'`, invalid `None`).
-* `test_missing_type_column_in_nrt` (asserts `type_raw = -1` without exception).
-* `test_science_over_nrt_dedup_priority` (identical location/time in `ML_SCIENCE`, `SP_SCIENCE`, `NRT` always keeps `ML_SCIENCE`).
-* `test_usa_split_no_antimeridian_wrap` (verifies Honolulu/Aleutian boundaries don't pull Pacific non-target points).
-* `test_local_solar_time_wraparound` (parametrized across `lon = -180, -67.5, 0, +180` and `utc = 0005, 2355`, checking solar date rollback/rollforward).
-
-### Suite 2: `tests/test_02_geometry_masking.py` (18 Tests)
-* `test_pixel_area_computation_and_bounds` (parametrized MODIS vs VIIRS nadir and edge scan/track).
-* `test_vza_monotonic_inversion` (strictly increasing `A_pix -> VZA` in `[0, 65]` deg).
-* `test_bowtie_overlap_conservation` (2 overlapping MODIS edge pixels of 40 MW each yield total weight-adjusted FRP = 40 MW, NOT 80 MW; 3 overlapping chain pixels adjust accurately).
-* `test_sama_nighttime_low_conf_filter` (night low-conf VIIRS inside SAMA filtered; high-conf wildfire in Argentina preserved; daytime outside SAMA untouched).
-* `test_static_gas_flare_mask_separates_algeria_flares` (synthetic pixel active 30 days/yr for 5 years with flat day/night ratio flagged `is_static_industrial = True`; seasonal July-Aug Kabylie wildfire active 5 days in 1 year stays `False`).
-* `test_h3_wrapper_v3_v4_compat` (validates integer H3 index round-trip & 1-ring neighbor lookup).
-
-### Suite 3: `tests/test_03_event_clustering.py` (14 Tests)
-* `test_viirs_nine_pixel_fire_yields_one_cluster` (3x3 contiguous 375m pixels cluster into `raw_event_count = 1`).
-* `test_two_separated_fires_stay_distinct` (fires separated by `> 2.5 * max_diag` stay `2` clusters).
-* `test_same_afternoon_viirs_train_never_summed` (`SNPP + N20 + N21` within 50 min produce 3 separate rows in sufficient-stats table, NOT summed FRP or summed event count).
-* `test_pass_time_split_threshold` (detections > 5 min apart do not cross-cluster in bow-tie weighting).
-
-### Suite 4: `tests/test_04_observation_operators.py` (20 Tests)
-* `test_fmin_area_linearity_and_ordering` (MODIS `F_min` day > night; MODIS `F_min` > VIIRS `F_min` at all VZAs).
-* `test_survival_integrals_bounds_and_monotonicity` (`0 < psi_cnt, psi_frp <= 1`; monotonically decreases as `F_min` rises).
-* `test_diurnal_fourier_periodicity_and_unit_mean` (`D(0) == D(24)` within `1e-6`, numerical integral `(1/24) * sum D(t) dt == 1.0 +/- 1e-4` across all pyromes).
-* `test_quantile_mapping_monotonicity` (sorted input quantiles map to non-decreasing corrected quantiles).
-* `test_heteroscedastic_sigma_ordering` (`sigma(VIIRS, nadir, high_conf, clear) < sigma(MODIS, edge, low_conf, cloudy)`).
-* `test_pyrome_gmm_coordinate_invariance` (shifting `lat/lon` inputs leaves pyrome assignments 100% invariant).
-
-### Suite 5: `tests/test_05_likelihood_derivatives.py` (22 Tests)
-* `test_obs_grad_hess_finite_diff` (parametrized across `z in [-3, 0, 5, 10]`, `|analytic - numerical| < 1e-6`).
-* `test_tobit_sat_grad_hess_finite_diff` (parametrized across `w in [-5, -1, 0, +1, +5]`, checking `log_ndtr` + inverse Mills ratio stability without `NaN`/`Inf`!).
-* `test_tobit_saturation_asymmetry` (penalizes `z` strongly below `Y_sat`, zero penalty far above `Y_sat`).
-* `test_hurdle_zero_grad_hess_finite_diff` (parametrized across cloud visibility `v in [0.1, 0.5, 0.9, 1.0]` and `Lambda in [0.01, 0.5, 2.0, 10.0]`).
-* `test_hurdle_convexity_guard_ensures_nonnegative_hessian` (verifies `h_miss >= 0` even in partial-cloud transition `v=0.7, Lambda=2.5` where raw 2nd derivative dips negative).
-* `test_2005_blind_modis_zero_preserves_small_fire_flatness` (MODIS edge zero imposes large penalty at `100 MW` and near-zero curvature at `1.5 MW`).
-
-### Suite 6: `tests/test_06_gpu_solver_math.py` (20 Tests)
-* `test_batched_thomas_vs_dense_solve` (`float64` batched solver matches `torch.linalg.solve` on random SPD tridiagonal matrices of size `T=500` within `1e-10`).
-* `test_takahashi_vs_dense_inverse` (Takahashi diagonal & lag-1 off-diagonal match `torch.linalg.inv(H)` within `1e-10`).
-* `test_armijo_line_search_monotonic_objective` (every damped Newton iteration strictly decreases $J(Z)$).
-* `test_red_black_spatial_gmrf_convergence` (spatial coupling reduces residual error under patchy 1-cell cloud mask).
-* `test_cpu_cuda_numerical_parity` (if CUDA available, GPU output matches CPU `float64` within `1e-8`).
-* `test_extreme_megafire_and_zero_numerical_stability` (no `NaN`/`Inf` across `10^-4 MW` to `10^6 MW` across `T=9500` days).
-
-### Suite 7: `tests/test_07_synthetic_twin_truth.py` (18 Tests — End-to-End Physical Falsification)
-Build a complete synthetic 26-year simulator (`2000–2026`) with **known ground-truth fire trajectory $X_{\text{true}}(g,d)$** and simulate Terra, Aqua, SNPP, NOAA-20, NOAA-21 with realistic `F_min`, bow-tie overlap, 10:30/13:30 diurnal phase, 2022–2026 orbital drift, Nov 2026 SNPP cessation, 30% cloud gaps, and gas flares. Assert:
-* `test_synthetic_eliminates_2012_viirs_jump` (raw series exhibits `>+150%` jump; harmonized step change at Jan 2012 is `< +/- 10%`).
-* `test_synthetic_eliminates_2018_2024_constellation_inflation` (adding N20 + N21 does not inflate monthly flux mean, while shrinking CI width!).
-* `test_synthetic_survives_nov2026_snpp_cutoff` (flux remains unbiased past Nov 2, 2026).
-* `test_synthetic_corrects_2022_orbital_drift` (post-2022 Aqua drift does not create spurious downward/upward bias).
-* `test_synthetic_recovers_true_flux_correlation` (monthly Pearson/Spearman vs. `X_true` $> 0.90$).
-* `test_synthetic_recovers_real_drought_anomaly_without_smoothing_it_away` (a real 5x spike in 2021 is preserved within `+/- 15%`).
-
-### Suite 8: `tests/test_08_conformal_uncertainty.py` (12 Tests)
-* `test_split_conformal_empirical_coverage` (parametrized across `alpha in [0.05, 0.10, 0.20]`, empirical coverage on held-out test split lies within `[1 - alpha - 0.03, 1 - alpha + 0.05]`).
-* `test_2005_uncertainty_wider_than_2024_uncertainty` (`mean(rel_width_2005) > mean(rel_width_2024)` strictly).
-* `test_cloudy_month_uncertainty_wider_than_clear_month` (verified across controlled cloud masks).
-* `test_abstention_flag_triggers_on_prolonged_blind_clouds` (`>5 days` at `cloud > 0.85` with zero detections sets `ABSTAIN_LOW_EVIDENCE`).
-* `test_fixed_lag_14d_matches_full_batch` (re-assimilating trailing 14 days with delayed NRT/Science replacement agrees with full run within `1e-3`).
-
-### Suite 9: `tests/test_09_validation_diagnostics.py` (12 Tests)
-* `test_chow_pettitt_structural_break_detection` (verifies statistical break test catches unharmonized 2012 break `p < 0.001` and passes harmonized control `p > 0.05`).
-* `test_2019_2021_viirs_ablation_crps_and_rank` (withholding VIIRS in 2019–2021 improves CRPS, RMSE, and peak-month Spearman $\rho$ over raw MODIS baseline).
-* `test_product_schemas_and_invariants` (all 3 Parquet/DuckDB tables exist, `q05 <= q50 <= q95`, `measured_fraction in [0, 1]`, `phi >= 0`, `fre_tj == 0.0864 * phi_sum`).
-
-### Suite 10: `tests/test_10_webapp_api_scale.py` (12 Tests)
-* `test_fastapi_endpoints_return_200_and_valid_json` (`/calendar`, `/timeseries`, `/map_hex`, `/diagnostics`).
-* `test_csv_export_sanitized_against_formula_injection` (fields starting with `=`, `+`, `-`, `@` cannot exploit Excel CSV injection).
-* `test_empty_bbox_and_boundary_dates_graceful` (returns structured empty response, never HTTP 500).
-* `test_query_latency_under_300ms` (DuckDB query on realistic multi-country table finishes `< 0.3s`).
-* `test_gpu_memory_footprint_budget` (batch of 4,000 hexagons x 9,500 days in `float64` stays `< 18 GB` VRAM on single 24 GB L4).
-
----
-
-## 8. Strict 36-Hour Execution Schedule & Go/No-Go Gates
-
-* **Hours 0–4 (Environment 1 — CPU Stager, 0 GPU-hrs):** Build `.whl` offline bundle; run `01_download_and_stage.py` + `02_normalize_dedup_verify.py` for the 6 target countries (+ global coarse H3-Res4 if UMD SFTP finishes by Hour 4). **GATE 1 (Hour 4):** Publish clean Parquet Dataset + Wheel Dataset to Kaggle. If UMD SFTP throttles, lock Tier-1 6-country dataset immediately.
-* **Hours 4–12 (CPU — Geometry, Clustering, Test Suites 1–5):** Build Modules 1–2 (`geometry`, `clustering`, `operators`, `pyromes`). Run `pytest tests/test_01* .. tests/test_05*` on CPU.
-* **Hours 12–16 (CPU Dry-Run + Test Suites 6–7):** Implement PyTorch GPU solver & synthetic twin simulator. Dry-run full solver on 2% sample (`ARG + DZA`) on CPU; pass `test_06*` & `test_07*`. **GATE 2 (Hour 16):** Zero NaNs, 100% synthetic tests pass, push code to GitHub Dataset.
-* **Hours 16–20 (`4x L4` Batch Run #1 — ~2–4 GPU-hrs billed):** Execute full calibration + 2000–2026 reconstruction across all 6 countries (+ global Tier-2 if staged) + Conformal Calibration (`test_08*`). Export DuckDB + 3 Parquet products (`<= 4 GB`).
-* **Hours 20–24 (`4x L4` Batch Run #2 — ~2 GPU-hrs billed):** Run real-data 2019–2021 VIIRS-masked ablation, structural-break tests, `MCD64CMQ` burned-area cross-check, spotlight case studies (`Chilecito Jul–Aug 2026`, `Kabylie & Hassi Messaoud DZA`, `Nov 2026 SNPP cutoff`), and `test_09*`. Keep ~6 GPU-hrs unused reserve for bugfixes!
-* **Hours 24–32 (Environment 3 — Web App + Suite 10):** Build FastAPI + DuckDB + MapLibre GL JS + ECharts Burning Activity Calendar. **GATE 3 (Hour 29):** If MapLibre/React hits blocking issues, immediately switch to pre-planned Streamlit + PyDeck fallback so a working UI is guaranteed. Run `test_10*`.
-* **Hours 32–36 (Final Audit & Packaging):** Run entire `pytest` suite (`166+` tests), verify zero broken downloads, confirm CONAE Chilecito 2026 & Algeria flare checks visually in UI, generate validation summary notebook/PDF, and freeze final submission.
-
----
-
-### How to Give This to Your Coding Agent
-1. Save the specification above as `AGENT_MASTER_SPEC.md` in your repo root.
-2. Give the agent this exact instruction:
-   > *"Read `AGENT_MASTER_SPEC.md` completely. Build the repository module-by-module strictly obeying all 10 Scientific Invariants, the 3-environment offline Kaggle separation, and the exact mathematical formulas (including `float64` Thomas/Takahashi solves and the convex Hurdle Hessian guard). After implementing each module, write and run its corresponding `pytest` suite from Section 7 until 100% of all tests pass before moving to the next module. Start with Phase 1 (Environment 1 ingestion, wheel bundler, and Suites 1–2)."*
-
-
-
-   You are right to catch that. The previous spec still contained **branching alternatives** ("optional `VNP14ML`", "conditional Tier 2 global vs. Tier 1", "MapLibre or Streamlit fallback", "pyhdf or geometric fallback"), left several model hyperparameters unanchored, omitted the exact repository file manifest, and contained subtle traps (like hexagonal 2-coloring vs. 3-coloring, `pyhdf` failing on Kaggle Python 3.12, and NASA FIRMS `/api/country` currently being disabled).
-
-Those loose ends are fixed below. Every single design choice is now locked to **one single unified architecture, zero dead branches, zero debating paths, exact file-by-file module contracts, exact parameter estimators, and 166+ mandatory `pytest` tests**.
-
-Copy the entire specification below into `AGENT_MASTER_SPEC.md` and pass it to your coding agent.
-
----
-
-# AGENT_MASTER_SPEC.md
-# Single-System Engineering Specification: MODIS–VIIRS Harmonization Engine & Burning Activity Calendar
-
-## 0. Agent Execution Directive
-Build **one single, cohesive, production-grade Python system** obeying this exact specification.
-* **Do NOT create alternative pipelines, "fallback UIs," optional sensor side-branches, or speculative dead code.** Every file listed in Section 4 must connect strictly into one end-to-end data flow.
-* **Do NOT invent unverified URLs, endpoints, or dependencies.** Obey every verified constraint in Sections 1–3.
-* **Every mathematical equation in Section 5 must be implemented verbatim** with exact numerical stability guards, and **every `pytest` suite in Section 8 (`166+` tests) must pass 100%** before any stage is declared complete.
-
----
-
-## 1. Complete Context, Situation, and Hard Constraints
-
-### 1.1 Challenge & Scientific Mission
-* **Competition:** 2026 NASA Space Apps Challenge — *"Harmonization of MODIS and VIIRS Hot Spots"* (authored by Marina Compagnucci, CONAE — The Argentinian Space Agency).
+Execute **strictly the single architecture specified in this document**:
+* Implement every file, mathematical formula, parameter estimator, physical invariant, data check, and automated test defined below.
+* Do **not** invent alternative modeling architectures, create duplicate scripts, leave stub functions, or modify mathematical definitions without maintaining exact equivalence verified by numerical unit tests.
 * **Reference Date:** November 14, 2026.
-* **Primary Challenge Requirement:** Build a harmonized 2000–2026 active-fire record across MODIS and VIIRS where sensor origin no longer produces false step jumps, and serve it in an interactive **Burning Activity Calendar Web Application** (map ROI selection, Year x Month heatmap, current vs. historical median anomaly comparisons, uncertainty visualization, and downloadable CSV).
-* **Spotlight Challenge Case:** July–August 2026 wildfire activation in **Chilecito, La Rioja, Argentina** (`lat ~ -29.16, lon ~ -67.50`).
-
-### 1.2 Hard Operational Constraints (Your Exact Setup)
-1. **Deadline:** **36 hours** total execution budget.
-2. **GPU Environment (`Kaggle Code Competition`):** **4x NVIDIA L4 GPUs (~96 GB aggregate VRAM, 24 GB/GPU)** with a strict **12 GPU-hour quota**, **internet strictly disabled**, and a **~20 GB `/kaggle/working` output cap**.
-   * **Quota Burn Warning:** Kaggle multi-GPU (`L4x4`) instances can bill quota at **2x wall-clock speed** (`12 GPU-hours = ~6 real hours max`). Never run interactive debugging or CSV parsing on `L4x4`. Develop and test 100% on CPU (`0` GPU-hours), then run `L4x4` strictly via batch execution (`torch.multiprocessing` across `cuda:0..3`).
-3. **Kaggle Docker Runtime Facts (Verified):**
-   * Current Kaggle GPU Docker images (`v173`, Oct 2026) run **Python 3.12** (`3.12.16`) and pre-install `torch`, `numpy`, `scipy`, `pandas`, `pyarrow`, `scikit-learn`, `lightgbm`, `rasterio`, and `shapely`.
-   * `pyhdf` does **not** publish prebuilt `manylinux` wheels for Python 3.12 (only CPython 3.6–3.9) and requires compiling against `libhdf4-dev`. Therefore, **zero HDF4 parsing may occur in offline Environment 2**. All HDF4 extraction runs inside internet-enabled **Environment 1** (`apt-get install -y libhdf4-dev`), outputting clean Parquet only.
-4. **3-Environment Separation (Mandatory):**
-   * **Environment 1 (Data & Wheel Stager — Standard Kaggle CPU Notebook or Linux terminal, Internet ON, 0 GPU-hours):** Downloads NASA/UMD data cloud-to-cloud (never via slow residential upload from Algeria), converts everything to Zstd Parquet (`<= 2.5 GB`), packages missing Python 3.12 `manylinux` wheels (`duckdb`, `polars`, `h3`), and stages them as Kaggle Input Datasets.
-   * **Environment 2 (Offline Harmonization Compute — Kaggle `4x L4` GPU, Internet OFF):** Mounts GitHub code dataset + offline `.whl` dataset + staged Parquet dataset via a unified `paths.py` resolver (so the exact same codebase also runs locally during testing). Executes offline `pip install --no-index`, calibration, GPU Bayesian inference, conformal calibration, validation tests, and exports `fire_harmonized.duckdb` + 3 Parquet products (`<= 3 GB`).
-   * **Environment 3 (Web Application Server — Local / Cloud Host):** Runs `FastAPI + DuckDB` serving a single-bundle `MapLibre GL JS + Apache ECharts` frontend directly against `fire_harmonized.duckdb`.
 
 ---
 
-## 2. Ten Non-Negotiable Scientific Invariants (System Laws)
+## 1. Detailed Problem Statement
 
-Every module and test enforces these laws:
-1. **INV-01 (No Sensor Imitation):** Never train a model to map `VIIRS -> MODIS` or blindly `MODIS -> VIIRS`. Both sensors inform a shared physical latent state via sensor-specific forward observation operators.
-2. **INV-02 (Never Sum Same-Orbit Platforms):** Suomi-NPP, NOAA-20, and NOAA-21 orbit in the ~13:30 / 01:30 MLT plane (~50 min apart). Detections from multiple VIIRS platforms in the same half-day window are **separate conditional likelihood terms**, NEVER additive counts or additive FRP.
-3. **INV-03 (Pre-Drift Calibration Freeze):** Terra (10:30 AM) and Aqua (1:30 PM) exited stable orbits in **2022** (drifting toward ~8:45 AM and ~3:30–3:50 PM). Calibrate cross-sensor operators strictly on **2012-01-20 to 2021-12-31**.
-4. **INV-04 (Explicit Satellite Operational Calendar):** Only operational platforms enter the likelihood on day $d$:
-   * `Terra`: `2000-11-01` to `2026-12-31`
-   * `Aqua`: `2002-07-04` to `2026-12-31`
-   * `SNPP`: `2012-01-20` to `2026-11-02` (FIRMS delivery ceased Nov 2, 2026)
-   * `NOAA-20`: `2018-04-01` to `2026-12-31`
-   * `NOAA-21`: `2023-03-01` to `2026-12-31`
-5. **INV-05 (Physical vs. Measurement Separation):** Explicitly implement $Y_{s,t} = h_s(X_t, \theta_s, G_{s,t}, A_{s,t}) + \epsilon_{s,t}$ and $D_{s,t} \sim \text{Bernoulli}(p_s(X_t, G_{s,t}, Q_{s,t}))$.
-6. **INV-06 (No Raw Brightness Averaging):** Never average MODIS `brightness`/`bright_t31` ($3.96\,\mu\text{m}$) with VIIRS `bright_ti4`/`bright_ti5` ($3.74\,\mu\text{m}$, saturates at 367 K).
-7. **INV-07 (Honest Zero-Detection Censoring):** Pre-2012 MODIS non-detections account for MODIS's pixel-area threshold ($F_{\min} \approx 3.7\text{–}40\,\text{MW}$) via the Hurdle likelihood so posterior uncertainty widens honestly instead of forcing small fires to zero.
-8. **INV-08 (Static Thermal Anomaly Isolation):** Separate volcanoes (`type=1`), offshore (`type=3`), nighttime low-confidence South Atlantic Magnetic Anomaly (SAMA: `lon in [-110, 11], lat in [-55, 7]`) artifacts, and persistent industrial/gas flares (`type=2` + H3-Res10 multi-year persistence mask, critical since NRT lacks `type` and older C2 VIIRS mislabeled `type=2`).
-9. **INV-09 (Zero Data Destruction):** Export **3 distinct complementary products** preserving untouched raw provenance alongside reconstructed states and uncertainty diagnostics.
-10. **INV-10 (No Coordinate Leakage):** Unsupervised behavioral pyrome clustering uses strictly physical/temporal features—never `latitude` or `longitude`.
+### 1.1 The Scientific and Operational Challenge
+Satellite thermal anomaly ("active fire hotspot") archives span more than 26 years (November 2000 – November 2026), providing critical evidence for emergency response, early warning, climate research, and fire regime monitoring. However, this record is physically fractured across two incompatible satellite sensor families operating across five spacecraft:
+1. **MODIS** (`1 km` nominal nadir spatial resolution) aboard **Terra** (launched Dec 1999; data Nov 2000–present) and **Aqua** (launched May 2002; data July 2002–present).
+2. **VIIRS** (`375 m` I-band nominal nadir spatial resolution) aboard **Suomi-NPP / S-NPP** (Jan 20, 2012 – Nov 2, 2026), **NOAA-20** (April 2018 – present), and **NOAA-21** (2023/2024 – present).
 
----
+The core challenge (authored by CONAE — the Argentinian Space Agency) is to build a harmonized active-fire record from 2000 to November 2026 in which **the sensor of origin no longer dictates trends or anomalies**, and expose it through an interactive **Burning Activity Calendar Web Application** enabling users to select an Area of Interest (AOI), inspect a Year × Month calendar heatmap, compare recent burning against multi-year historical medians, inspect uncertainty, and download sanitized CSV analytics.
 
-## 3. Single Unified Scope & Data Acquisition Contract (Environment 1)
+### 1.2 Root Physical and Engineering Causes of Sensor Incompatibility
+Raw MODIS and VIIRS records cannot be concatenated, averaged, or scaled by a single constant ratio for seven fundamental reasons:
+1. **Spatial Resolution and Sub-Threshold Omission:** At nadir, one MODIS pixel covers $\sim 1.0\,\text{km}^2$ whereas one VIIRS I-band pixel covers $\sim 0.14\,\text{km}^2$ (`~7×` smaller area). Consequently, MODIS misses low-intensity agricultural, prescribed, and understory fires below $F_{\min} \approx 3.7\text{–}40\,\text{MW}$, whereas VIIRS detects fires down to $F_{\min} \approx 0.5\text{–}2.5\,\text{MW}$. Switching directly from MODIS to VIIRS in 2012 causes raw hotspot counts to jump by `3×–10×` purely from instrument sensitivity.
+2. **Off-Nadir Pixel Stretching and Bow-Tie Artifacts:** Across its $\pm 55^\circ$ scan angle, MODIS pixels stretch to `~4.84 × 2.01 km ≈ 9.7 km²` and adjacent 10-line scans overlap by up to ~50% ("bow-tie effect"), double-counting off-nadir fires. VIIRS instead performs onboard pixel aggregation (`3:1` from $0^\circ\text{–}31.59^\circ$, `2:1` from $31.59^\circ\text{–}44.68^\circ$, `1:1` from $44.68^\circ\text{–}56.06^\circ$) and deletes redundant bow-tie fill pixels, growing only to `~0.62 km²` at swath edge.
+3. **Spectral Bandpass and Saturation Differences:** MODIS uses `3.96 μm` (Channels 21/22) and `11 μm` (`Ch 31`). VIIRS uses `3.74 μm` (`I4`, saturating at `367 K`) and `11.45 μm` (`I5`), relying on co-located `750 m` `M13` channels for unsaturated Fire Radiative Power (FRP)—which splits one 750 m FRP retrieval across coincident 375 m sub-pixels or occasionally yields `0`/null FRP under extreme background failure. Raw brightness temperatures cannot be averaged across sensors.
+4. **Constellation Multiplicity (Same-Orbit Overcounting):** `S-NPP`, `NOAA-20`, and `NOAA-21` share the ~13:30 / 01:30 solar plane separated by ~50 minutes. Adding their counts or FRPs together in 2018–2026 triples the apparent fire count relative to 2012–2017 (`S-NPP` alone). Conversely, `S-NPP` data delivery ceased on **November 2, 2026**, which causes a sudden drop if unmodeled.
+5. **Post-2022 Orbital Drift:** Beginning in 2022, `Terra` (10:30 AM nominal) and `Aqua` (1:30 PM nominal) left controlled sun-synchronous orbits, drifting toward ~8:45 AM and ~3:30–3:50 PM respectively by late 2026. Because fire intensity peaks in early-to-mid afternoon, drifting sampling times confound sensor clock shifts with climate trends.
+6. **Cloud Obscuration, SAMA False Alarms, Static Industrial Flares, and Processing Tiers:** Clouds block overpasses asymmetrically across tropical wet seasons (`< 30–40%` detection rate). Nighttime low-confidence VIIRS detections inside the South Atlantic Magnetic Anomaly (SAMA) produce spurious radiation spikes. Industrial gas flares (especially in Saharan oil fields) and volcanoes contaminate biomass wildfire calendars—complicated further because Near Real-Time (`NRT`) feeds omit the `type` column and assign `daynight` purely from ascending/descending orbit direction rather than Solar Zenith Angle (`SZA < 85°`) used in Science (`ML`) products.
+7. **Physical Identifiability Bounds:** Orbital FRP alone cannot uniquely resolve sub-pixel flame temperature ($T_f$), exact flame area ($A_f$), fuel load, or combustion efficiency. The engine must output identifiable physical quantities (radiative flux $\Phi$, Fire Radiative Energy $\text{FRE}$, burning footprint area, and energy-equivalent/cluster event indices) and explicitly represent uncertainty and low-evidence abstention.
 
-### 3.1 Single Locked Spatial Scope (H3 Resolution 6, $\bar{A} \approx 36.13\,\text{km}^2$)
-There is **one** uniform spatial engine running at **Uber H3 Resolution 6** across **6 scientifically optimal multi-biome benchmark regions** (all equations are location-agnostic; regions are defined strictly by coordinates in `src/config/settings.py`):
-1. `ARG` (Argentina): `[-73.8, -55.5, -53.5, -21.5]` — CONAE July–Aug 2026 Chilecito spotlight, Pampas crop burns, SAMA zone.
-2. `DZA` (Algeria): `[-8.7, 18.9, 12.0, 37.2]` — Northern Kabylie 2021/2023 crown wildfires vs. Saharan Hassi Messaoud static gas flares.
-3. `BRA` (Brazil): `[-74.0, -33.8, -34.7, 5.4]` — High-density 2012–2021 Amazon + Cerrado calibration backbone, heavy wet-season clouds, SAMA.
-4. `IDN` (Indonesia): `[95.0, -11.1, 141.1, 6.2]` — Equatorial cloud persistence + nighttime peat smoldering + abstention flag stress test.
-5. `AUS` (Australia): `[112.9, -43.8, 154.0, -10.0]` — Northern low-FRP savanna burns + 2019–2020 Black Summer VIIRS I4 (`367 K`) saturation megafires.
-6. `USA` (United States, split to prevent Pacific antimeridian wrapping):
-   * `USA_CONUS`: `[-125.0, 24.4, -66.8, 49.5]` — Western crown megafires + SE prescribed small burns.
-   * `USA_ALASKA`: `[-170.0, 51.2, -129.9, 71.5]` — Boreal fire clusters (testing the documented MODIS +47% boreal cluster discrepancy vs. ~20% global offset).
-
-### 3.2 Exact Data Sources (No Dead HTML Scrapers, No Broken `/api/country` Calls)
-1. **Primary Historical Science Archive (`sftp://fuoco.geog.umd.edu`, user `fire`, pass `burnt`):**
-   * Active Fire Monthly CSVs (`.csv.gz`):
-     * `data/MODIS/C61/MCD14ML` (or `C6` fallback discovery if `C61` path varies)
-     * `data/VIIRS/C2/VNP14IMGML` (S-NPP 375 m, post-May-2025 reprocessed)
-     * `data/VIIRS/C2/VJ114IMGML` (NOAA-20 375 m)
-     * `data/VIIRS/C2/VJ214IMGML` (NOAA-21 375 m)
-   * Stream one monthly `.csv.gz` into `/tmp`, immediately filter to the 7 target boxes above, standardize columns, write Zstd Parquet, and unlink `/tmp/*.csv.gz` immediately.
-   * Monthly Cloud & Overpass Denominator Grid (`0.25 deg` HDF4): `Mx14CMQ` (`MOD14CMQ` / `MYD14CMQ` on `fuoco.geog.umd.edu` `modis/C6/cmg/monthly/hdf` or `data/MODIS/C61/Mx14CMQ`). Extract `CloudPix`, `MissingPix`, `LandPix`, `CloudCorrFirePix` inside Environment 1 (using `pyhdf` compiled via `apt-get install -y libhdf4-dev`) directly into a single `< 25 MB` **`cloud_visibility_025deg.parquet`** (`year, month, lat_bin, lon_bin, cloud_frac, missing_frac, land_frac, cmq_corr_pix`). Delete raw `.hdf` immediately.
-   * Independent Validation Burned Area (`MCD64A1` Shapefiles): Pull `data/MODIS/C61/MCD64A1/SHP` (or `C6`) for validation years (`2018–2025`) matching our target boxes, aggregate monthly burned area per `H3-Res6` cell via `shapely`/`geopandas` into **`burned_area_val_h3.parquet`**.
-2. **Trailing 2026 NRT Gapfill & SFTP Firewall Backfill (`NASA FIRMS REST API`):**
-   * **API Endpoint Law (Verified):** NASA FIRMS currently marks `/api/countries` and `/api/country` as **unavailable**. Use ONLY:
-     * `GET /api/data_availability/csv/{MAP_KEY}/ALL` to read live `min_date`/`max_date` per source.
-     * `GET /api/area/csv/{MAP_KEY}/{SOURCE}/{west,south,east,north}/5/{YYYY-MM-DD}` (`DAY_RANGE` MUST be `<= 5` per FIRMS Area API limit!).
-   * Always fetch trailing `*_NRT` (`MODIS_NRT`, `VIIRS_SNPP_NRT`, `VIIRS_NOAA20_NRT`, `VIIRS_NOAA21_NRT`) from `latest_ml_date + 1 day` through `2026-11-14`. If SFTP port 22 is blocked, use this exact same `area/csv` function to fetch `*_SP`.
-3. **Deduplication & Schema Normalization:**
-   * Normalize `brightness`/`bright_ti4 -> t_mir_k`, `bright_t31`/`bright_ti5 -> t_tir_k`, satellite codes (`T/Terra`, `A/Aqua`, `N/SNPP`, `1/N20/J1/NOAA-20`, `2/N21/J2/NOAA-21`), mixed `confidence` (`conf_raw` + numeric `conf_num`), and `type_raw` (`-1` if missing in NRT).
-   * Deduplicate on `(platform, acq_date, acq_hhmm, ROUND(latitude, 4), ROUND(longitude, 4))` keeping `tier_rank ASC` (`ML_SCIENCE=1 < SP_SCIENCE=2 < NRT=3`) then `ingest_ts DESC`.
-   * Partition final clean raw archive into **`active_fires/`** (`Zstd Parquet` partitioned by `country_iso, year`).
-
-### 3.3 Exact Offline Wheel List (Environment 1 -> Kaggle Dataset)
-Inspect Kaggle Python version (`python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"` — `3.12` on current Kaggle images) and run `pip download --only-binary=:all: --platform manylinux2014_x86_64 --python-version <PY_VER>` for **strictly the missing Environment 2 packages**:
-* `duckdb`
-* `polars`
-* `h3`
-*(Verify `torch`, `numpy`, `scipy`, `pandas`, `pyarrow`, `scikit-learn`, `lightgbm`, `pytest`, `shapely` are preinstalled on Kaggle; only add to the download command if absent in a quick CPU check. Environment 1 additionally installs `paramiko`, `requests`, and compiles `pyhdf` locally via `libhdf4-dev`—never bundle `pyhdf` into offline Environment 2.)*
+### 1.3 Success Criteria
+The final implementation is successful if and only if:
+1. **Structural Continuity:** Step jumps across sensor transitions (`2002` Aqua, `2012` S-NPP, `2018` N20, `2023` N21, `Nov 2026` S-NPP end) and `2022–2026` orbital drift are mathematically removed in stationary control regimes (verified by Chow/Pettitt structural break tests and synthetic twin falsification).
+2. **Real Anomaly Preservation:** Genuine wildfire spikes—especially CONAE's spotlight **July–August 2026 Chilecito, La Rioja, Argentina** wildfire (`lat ~ -29.16, lon ~ -67.50`), **Kabylie, Algeria (2021/2023)**, and **Australian Black Summer (2019–2020)**—remain accurately preserved without oversmoothing.
+3. **Static Anomaly Isolation:** Saharan industrial gas flares (e.g., Hassi Messaoud, Algeria) and SAMA artifacts are cleanly masked from wildfire calendars while remaining auditable in raw provenance outputs.
+4. **Calibrated Uncertainty:** Pre-2012 MODIS-only uncertainty intervals are strictly wider than 2012–2026 multi-sensor intervals, cloudy gaps widen intervals and trigger explicit `ABSTAIN_LOW_EVIDENCE` flags under prolonged blindness, and Split Conformal Calibration achieves $\ge 90\%$ empirical coverage on held-out 2018–2020 ablation tests.
+5. **Independent Physical Validation:** Harmonized monthly FRE correlates more strongly with independent `MCD64CMQ` burned area than unharmonized FIRMS hotspot counts.
+6. **100% Automated Verification:** All 10 `pytest` suites (`166+` concrete mathematical, physical, numerical, and API tests) pass completely, and the interactive Burning Activity Calendar web app responds in `< 300 ms`.
 
 ---
 
-## 4. Exact Repository File Structure & Data Contracts
+## 2. Project Context, Hard Operational Constraints, and Execution Environments
 
-Build strictly these files—no extraneous prototypes, no duplicate runners:
+### 2.1 Hard Operational Constraints
+1. **Execution Window:** **36 hours** total end-to-end delivery.
+2. **Compute & Offline Constraints:**
+   * GPU compute executes in an **internet-disabled** environment (Kaggle notebook running Python 3.12 with preinstalled `torch`, `numpy`, `scipy`, `pandas`, `pyarrow`, `scikit-learn`, `lightgbm`, `shapely`, `rasterio`, `pytest`), constrained to **12 GPU-hours** quota and a **~20 GB `/kaggle/working`** disk cap.
+   * **Hardware Portability Rule:** Code must inspect `torch.cuda.device_count()` dynamically and bound per-GPU memory `< 6 GB` per chunk (`batch_size = 1000`), executing seamlessly on `T4 x2` (15 GB/GPU), `1x L4` (24 GB), or `4x L4` (24 GB/GPU).
+   * **Zero Wasted GPU Quota:** All data acquisition, HDF4 extraction, schema normalization, geometry preprocessing, calibration, and CPU unit testing execute on CPU (`0` GPU-hours). GPU runtime is reserved strictly for batched state-space solving, Monte Carlo sampling, conformal ablation runs, and validation checks.
 
-1. `Makefile` — Single-command entrypoints: `make stage`, `make cpu-prep`, `make gpu-solve`, `make validate`, `make test`, `make serve`.
-2. `src/__init__.py`
-3. `src/config/settings.py` — `TARGET_COUNTRIES` boxes, `PLATFORM_TIMELINE`, physical constants (`F_REF_MW = 0.5`, `EPS0_FLUX = 0.05`, `FRE_MJ_PER_MW_DAY = 86.4`, `SAMA_BOX`, `CALIB_START = "2012-01-20"`, `CALIB_END = "2021-12-31"`), exact parameter bounds.
-4. `src/config/paths.py` — Unified path resolver auto-detecting `/kaggle/input/...` + `/kaggle/working/...` vs. local `./data/...` so every script runs identically locally and on Kaggle offline `L4x4`.
-5. `src/ingest/build_wheels.sh` — Packages Environment 2 offline wheels.
-6. `src/ingest/download_umd_firms.py` — Environment 1 unified acquisition (`sftp://fuoco.geog.umd.edu` active fires + `Mx14CMQ` -> `cloud_visibility_025deg.parquet` + `MCD64A1/SHP` -> `burned_area_val_h3.parquet` + FIRMS `/api/area/csv/.../5/...` trailing NRT backfill).
-7. `src/ingest/normalize_dedup.py` — Schema normalization, Science > NRT deduplication, partitioned `active_fires/` writer, coverage audit.
-8. `src/geometry/h3_utils.py` — Version-safe H3 v3/v4 integer index wrapper (`latlon_to_h3`, `h3_neighbors`, `h3_area_km2`, greedy **3-coloring** of the active H3 hexagon graph).
-9. `src/geometry/preprocess_geometry.py` — Local solar time $\tau_i$, Day/Night flag, pixel area $A_i$, VZA inversion spline $\theta_i$, SAMA filter, H3-Res10 static industrial gas-flare mask, intra-pass bow-tie overlap weights $\omega^{\text{bt}}_i$, single-pass spatial cluster connected components, and **Product 1** intermediate export + `pass_observations.parquet`.
-10. `src/calibration/pyromes.py` — Coordinate-free behavioral feature extraction & `K=7` Gaussian Mixture Model pyrome discovery.
-11. `src/calibration/operators.py` — Pre-drift (2012–2021) estimation of:
-    * Empirical confidence reliability curve $w_i$
-    * Pixel-area detection threshold $F_{\min, p}(\bar{A}, \text{DN})$ & Log-Normal MLE survival fractions $\psi^{\text{CNT}}, \psi^{\text{FRP}}$
-    * Monotonic LightGBM + Empirical Quantile Mapping VZA bias $\gamma_{p,b}(\bar{\theta}_p, q)$
-    * 2-harmonic Fourier diurnal & orbital-drift operator $D_{b,m}(\tau)$ + analytical 24h Day/Night weights $(w_{\text{day}}, w_{\text{night}})$
-    * Heteroscedastic observation variance $\sigma^2_{p,g,d,\text{DN}}$
-    * Regional area-footprint transfer function $g_{\text{area}, b}(\Phi, \text{night/day})$
-12. `src/engine/likelihoods.py` — Pure PyTorch (`float64`) vectorized negative log-likelihoods, exact analytical 1st derivatives, and convexity-guarded 2nd derivatives for Unsaturated Observation, Right-Censored Saturation Tobit, and Hurdle Zero-Observation.
-13. `src/engine/thomas_takahashi.py` — Pure PyTorch (`float64`) batched $O(T)$ Cholesky Tridiagonal Thomas Solver, Takahashi exact marginal variance & lag-1 covariance recursion, and AR(1) correlated Monte Carlo sampler.
-14. `src/engine/priors.py` — Deterministic estimation of $(\mu_{g,m,\text{DN}}, \rho_b, \sigma_{\text{proc},b}, \lambda_{0,b}, \beta_{\text{dn},b}, \eta_{\text{dn},b})$ from 2012–2021 VIIRS data + sparse active-cell 3-color graph assembly.
-15. `src/engine/solver.py` — Multi-GPU (`torch.multiprocessing` over `cuda:0..3`) chunked (`batch_size = 4000` active cells) 3-color Gauss-Seidel x Day/Night alternating Damped Newton-Raphson solver with Armijo backtracking + `run_fixed_lag_update(window_days=14)`.
-16. `src/engine/conformal.py` — Held-out 2018–2020 MODIS-only ablation split-conformal calibration ($\hat{q}_{0.90, b}$), attribution classification, low-evidence abstention flags, and monthly/daily calendar aggregation.
-17. `src/products/export_duckdb.py` — Builds `fire_harmonized.duckdb` + indexed **Product 1, Product 2, Product 3** Zstd Parquet files.
-18. `src/validation/diagnostics.py` — Runs Chow & Pettitt structural-break tests (2002, 2012, 2018, 2023, Nov 2026), 2019–2021 VIIRS-masked ablation (CRPS, coverage, Spearman $\rho$, peak-month match), `MCD64A1` burned-area correlation comparison, VZA/solar-time residual bias tests, and spotlight reports (Chilecito ARG 2026, Kabylie & Hassi Messaoud DZA).
-19. `src/webapp/server.py` — FastAPI + DuckDB API (`/api/calendar`, `/api/timeseries`, `/api/map_hex`, `/api/diagnostics`, `/api/export.csv` with CSV injection sanitization) + static HTML mount.
-20. `src/webapp/static/` (`index.html`, `app.js`, `styles.css`) — Single-bundle vanilla ES module UI using MapLibre GL JS + Apache ECharts (zero npm build step).
-21. `scripts/run_env1_stage.py`, `scripts/run_env2_cpu_prep.py`, `scripts/run_env2_gpu_solve.py`, `scripts/run_env2_validate.py` — Thin deterministic CLI orchestrators calling `src/`.
-22. `tests/test_01_ingestion_schema.py` through `tests/test_10_webapp_api_scale.py` — Complete 166+ test verification suite.
+### 2.2 Three-Environment Separation
+1. **Environment 1 (Data & Wheel Stager — Internet ON, CPU only):**
+   * Streams historical NASA/UMD active fires, `Mx14C8Q`/`Mx14CMQ` HDF4 cloud grids (using `libhdf4-dev` + `pyhdf` compiled strictly in Env 1), `MCD64CMQ` burned-area validation grids, and Natural Earth `50m` admin-0 country polygons cloud-to-cloud.
+   * Clips strictly to the 6 target country polygons, normalizes schemas, deduplicates `ML > SP > NRT`, and outputs compressed Zstd Parquet datasets (`<= 2.5 GB`).
+   * Downloads Python 3.12 `manylinux2014_x86_64` prebuilt wheels strictly for `duckdb`, `polars`, and `h3` (`<= 80 MB`) for offline installation in Environment 2.
+2. **Environment 2 (Offline Harmonization Engine — Internet OFF, GPU batch):**
+   * Installs `duckdb`, `polars`, `h3` via `--no-index`.
+   * Executes CPU geometry/clustering and 2012–2021 operator calibration, runs multi-GPU `float64` Bayesian reconstruction + conformal calibration + validation suite, and exports `fire_harmonized.duckdb` + 3 Parquet products (`<= 4 GB` total).
+3. **Environment 3 (Web Application Server):**
+   * Runs `FastAPI + DuckDB` serving the static vanilla ES6 `MapLibre GL JS + Apache ECharts` frontend directly against `fire_harmonized.duckdb`.
 
 ---
 
-## 5. Exact Mathematical & Algorithmic Specifications
+## 3. Selected Technical Approach & Ten Non-Negotiable Invariants
 
-### 5.1 Module 1 (`src/geometry/`): Geometry, Masking & Event Clustering
-1. **Local Solar Time & Day/Night Regime:**
-   $$\tau_i = \left(\text{utc\_hour}_i + \frac{\text{lon}_i}{15.0}\right) \bmod 24.0$$
-   Compute exact `solar_date` (handling midnight UTC rollovers at $\pm 180^\circ$ and $\tau$ wraparound). Regime $\text{DN}_i = \text{Day}$ if `daynight == 'D'` else $\text{Night}$.
-2. **Pixel Area & Viewing Zenith Angle ($\theta_i \in [0^\circ, 65^\circ]$):**
-   $$A_i = \text{scan}_i \times \text{track}_i \quad (\text{km}^2)$$
-   * MODIS monotone spline mapping $A_i \in [1.0, 9.6]\,\text{km}^2 \mapsto \theta_i \in [0^\circ, 65^\circ]$.
-   * VIIRS piecewise monotone curve across `3:1` / `2:1` / `1:1` aggregation zones mapping $A_i \in [0.14, 0.62]\,\text{km}^2 \mapsto \theta_i \in [0^\circ, 65^\circ]$.
-3. **Static & False-Alarm Hygiene:**
-   * Drop `type_raw IN (1, 3)` and VIIRS `Night` low-confidence (`conf_raw == 'l'` or `conf_num < 30`) inside SAMA (`-110 <= lon <= 11` and `-55 <= lat <= 7`).
-   * Assign every remaining point to an `H3 Resolution 10` micro-cell $m$ ($\sim 0.015\,\text{km}^2$). Compute active years $Y_m$, mean active days/year $\bar{D}_m$, and day-night symmetry $R^{\text{DN}}_m = \frac{\min(n_{\text{day}}, n_{\text{night}})}{\max(n_{\text{day}}, n_{\text{night}}) + 1}$. Flag `is_static_industrial = True` if `type_raw == 2` OR ($Y_m \ge 3$ AND $\bar{D}_m \ge 15$ AND $R^{\text{DN}}_m > 0.30$). Keep flagged records in Product 1; exclude from Product 2 biomass fusion.
-4. **Intra-Pass Bow-Tie Correction & Connected Components:**
-   * Partition detections by `(platform, acq_date)` and split passes whenever sorted consecutive gaps exceed `5 minutes` -> `pass_id`.
-   * Within each `(platform, pass_id)`:
-     * **MODIS bow-tie overlap ($A_i > 1.5\,\text{km}^2$):** Connect pixels $i, j$ across adjacent scans if great-circle distance $d_{ij} < 0.7 \cdot \frac{\text{track}_i + \text{track}_j}{2}$. Weight $\omega^{\text{bt}}_i = \frac{1}{1 + \text{deg}(i)}$. (For VIIRS or MODIS $A_i \le 1.5\,\text{km}^2$, $\omega^{\text{bt}}_i = 1.0$).
-     * **Spatial Event Clustering:** Connect pixels $i, j$ within the same `(platform, pass_id)` if $d_{ij} \le 1.4 \cdot \max(\sqrt{A_i}, \sqrt{A_j})$. Connected component ID becomes `event_cluster_id`.
-   * **Saturation Flag:** `sat_flag = 1` if (`sensor_family == 'VIIRS'` and `t_mir_k >= 366.0` and `frp_mw` indicates clipped retrieval—or conservatively flagged when `t_mir_k >= 366.0` and `frp_mw == 0` / null or extreme `t_mir_k >= 366.9` without M13 range) OR (`sensor_family == 'MODIS'` and `t_mir_k >= 498.0`). *(Note: NASA Collection-2 VIIRS normally falls back on unsaturated M13 for `frp_mw` even when `bright_ti4` clips at 367 K; therefore distinguish `i4_saturated_m13_ok` [inflate $\sigma_{\text{obs}}$ by $1.35\times$] vs. true clipped/corrupted saturation `sat_flag = 1` [apply Tobit right-censored likelihood].)*
-   * **Pass Aggregation:** Aggregate valid biomass rows into `pass_observations.parquet` keyed by `(h3_index, solar_date, platform, dn_flag)` storing `y_frp_mw`, `raw_event_count`, `det_footprint_km2`, `mean_area_km2`, `mean_vza_deg`, `mean_solar_hour`, `mean_conf_raw`, `sat_flag`. **Never sum across different platforms.**
+### 3.1 Core Methodology: Physics-Informed Forward-Operator Bayesian State-Space Fusion
+Rather than training regression models to map one sensor onto another, the engine separates the **Physical World** from the **Measurement World**:
+* **Latent Physical State:** Every active equal-area hexagon $g$ (`Uber H3 Resolution 6`, $\bar{A} \approx 36.13\,\text{km}^2$) on local solar date $d \in \{0, \dots, T-1\}$ possesses two continuous latent states representing true cloud-free mean Daytime (`06:00–18:00`) and Nighttime (`18:00–06:00`) radiative flux in log-space:
+  $$z_{g,d,\text{Day}} = \ln \Phi_{g,d,\text{Day}}, \qquad z_{g,d,\text{Night}} = \ln \Phi_{g,d,\text{Night}} \qquad (\text{MW})$$
+* **Forward Sensor Operators:** Each operational platform $p \in \{\text{Terra}, \text{Aqua}, \text{SNPP}, \text{NOAA-20}, \text{NOAA-21}\}$ observes $z_{g,d,\text{DN}}$ through a sensor-specific physical forward operator accounting for sub-threshold detection survival $\psi$, viewing-angle/quantile calibration $\gamma$, intra-window diurnal solar time $D(\tau)$, heteroscedastic observation precision $\sigma^2$, detector saturation censoring (Tobit likelihood), and cloud-gated detection probability $P(D=1 \mid z, v, \psi^{\text{CNT}})$ (Hurdle likelihood).
+* **Joint Inference & Uncertainty:** A Space × Time × Day-Night Gaussian Markov Random Field (GMRF) MAP-Laplace solver fuses all operational witnesses in `torch.float64` via H3 3-Coloring Gauss-Seidel sweeps, a fused `float64` Thomas $LDL^\top$ solver, Takahashi variance recursion, exact joint Cholesky posterior sampling ($M = 200$ trajectories), and Split Conformal Quantile Rescaling (`CQR`).
 
-### 5.2 Module 2 (`src/calibration/`): Pre-Drift Observation Operators (2012–2021)
-Strictly filter calibration inputs to `2012-01-20 <= solar_date <= 2021-12-31`:
-1. **Behavioral Pyromes ($K=7$ GMM):** For every hexagon with $\ge 20$ active pass-days, compute `[median(night_frp / (day_frp + 1)), circular_month_variance, interannual_cv, log_median_cluster_frp, mean_cluster_pixels]`. Standardize and fit a 7-component GMM (`GaussianMixture(n_components=7, covariance_type='full', random_state=42)`). Assign every hexagon (including low-activity cells via nearest behavioral prototype or nearest same-country pyrome centroid) to `pyrome_id in 0..6`.
-2. **Confidence Reliability ($w_i \in [0.15, 1.0]$):** Using 2012–2021 data, bin `(sensor_family, conf_num, dn_flag)` and compute empirical corroboration rate (detected by another pass/platform within $\pm 1$ day and 2 km). Fit isotonic regression per sensor/DN so every raw detection gets $w_i \in [0.15, 1.0]$.
-3. **Detection Thresholds & Survival Integrals ($\psi^{\text{CNT}}, \psi^{\text{FRP}}$):**
-   * Linear physical detection limit: $F_{\min, p}(\bar{A}, \text{DN}) = \alpha_{p, \text{DN}} + \beta_{p, \text{DN}}\,\bar{A}$ initialized from Sofiev & Kouznetsov (2026) physical curves (MODIS: $\sim 3.7\,\text{MW}$ nadir night up to $\sim 40\,\text{MW}$ daytime edge; VIIRS: $\sim 0.5\,\text{MW}$ nadir night up to $\sim 2.5\,\text{MW}$ daytime edge) and fine-tuned per pyrome against empirical Aqua–SNPP co-detection probability curves.
-   * Fit per-pyrome Log-Normal cluster FRP distribution $\ln F \sim \mathcal{N}(\mu_{F,b}, \sigma^2_{F,b})$ via censored MLE on clear-sky nadir (`VZA < 20°`) VIIRS clusters above $F_{\text{ref}} = 0.5\,\text{MW}$.
-   * Compute closed-form Log-Normal survival integrals (`scipy.special.ndtr`):
-     $$\psi^{\text{CNT}}_{p,b}(\bar{A}, \text{DN}) = 1 - \Phi_{\mathcal{N}}\!\left(\frac{\ln F_{\min, p} - \mu_{F,b}}{\sigma_{F,b}}\right)$$
-     $$\psi^{\text{FRP}}_{p,b}(\bar{A}, \text{DN}) = \frac{1 - \Phi_{\mathcal{N}}\!\left(\frac{\ln F_{\min, p} - \mu_{F,b} - \sigma^2_{F,b}}{\sigma_{F,b}}\right)}{1 - \Phi_{\mathcal{N}}\!\left(\frac{\ln F_{\text{ref}} - \mu_{F,b} - \sigma^2_{F,b}}{\sigma_{F,b}}\right)}$$
-     *(Note the exact closed-form first-moment Log-Normal shift $-\sigma^2_{F,b}$—zero numerical integration error!)*
-4. **VZA & Intensity Quantile Calibration ($\gamma_{p,b}$):**
-   * Pair synchronous Aqua MODIS and S-NPP VIIRS observations ($\Delta t \le 45\,\text{min}$, same `h3_index`, same `DN`, both $> 0$).
-   * Fit **Monotonic LightGBM (`monotone_constraints=[1, 0, ...]`)** + **Empirical Quantile Mapping (EQM)** predicting residual log-gain adjustment $\ln \gamma_{\text{MODIS}, b}(\bar{\theta}_p, q)$ as a monotonic function of $\bar{\theta}_p$ and intensity quantile $q$, with $\ln \gamma_{\text{VIIRS}} \equiv 0$ (nadir VIIRS reference).
-5. **2-Harmonic Diurnal & Orbital-Drift Curve ($D_{b,m}(\tau)$):**
-   $$\ln D_{b,m}(\tau) = a_{b,m,1}\cos\!\left(\frac{2\pi\tau}{24}\right) + b_{b,m,1}\sin\!\left(\frac{2\pi\tau}{24}\right) + a_{b,m,2}\cos\!\left(\frac{4\pi\tau}{24}\right) + b_{b,m,2}\sin\!\left(\frac{4\pi\tau}{24}\right) + c_{0,b,m}$$
-   * Fit via Ridge-regularized weighted least squares on log-FRP ratios across: (i) Terra (10:30/22:30) vs. Aqua/SNPP (13:30/01:30) 2003–2021 pairs, and (ii) Aqua 2022–2025 drifting solar hours (13:30 -> 15:50) vs. stable NOAA-20 (13:30) **strictly on the diurnal curve parameters**, holding cross-sensor $\psi$ and $\gamma$ frozen!
-   * Enforce exact 24h unit mean $\frac{1}{24}\int_0^{24} D_{b,m}(\tau)\,d\tau = 1.0$ via trapezoidal 240-point shift $c_{0,b,m} = -\ln\big(\frac{1}{24}\sum D_{\text{unnorm}}(\tau_k)\,\Delta\tau\big)$.
-   * Compute normalized Day (`06:00–18:00`) and Night (`18:00–06:00`) integration weights:
-     $$w_{\text{day}, b, m} = \frac{\int_6^{18} D_{b,m}(\tau)\,d\tau}{24}, \qquad w_{\text{night}, b, m} = 1 - w_{\text{day}, b, m}$$
-6. **Cloud Visibility ($v_{p,g,d}$) & Heteroscedastic Noise ($\sigma^2_{p,g,d,\text{DN}}$):**
-   * Join `cloud_visibility_025deg.parquet` by `(0.25deg cell, year, month)`: $v = \text{clip}(1 - \text{cloud\_frac} - \text{missing\_frac},\; 0.10,\; 1.0)$.
-   * Regress squared calibration residuals $\ln \hat{\epsilon}^2$ onto `[sensor_is_modis, mean_vza_deg, (1 - w_mean), (1 - v), i4_m13_fallback]` to obtain smooth predicted observation variance $\sigma^2_{p,g,d,\text{DN}} \in [0.02, 2.50]$.
-7. **Combined Forward Log-Gain:**
-   $$\mu^{\text{gain}}_{p,g,d,\text{DN}} = \ln v_{p,g,d} + \ln D_{b(g), m(d)}(\bar{\tau}_{p,g,d}) + \ln \psi^{\text{FRP}}_{p,b}(\bar{A}_p, \text{DN}) + \ln \gamma_{p,b}(\bar{\theta}_p, q)$$
+### 3.2 Ten Non-Negotiable System Invariants
+1. **INV-01:** Never train `VIIRS -> MODIS` or `MODIS -> VIIRS` imitation mappings; fuse both into the shared physical latent state.
+2. **INV-02:** Never sum detections or FRP across same-orbit platforms (`SNPP`, `NOAA-20`, `NOAA-21`) in the same half-day window; treat them as independent conditional likelihood terms.
+3. **INV-03:** Freeze cross-sensor calibration strictly to the pre-drift overlap window **`2012-01-20` through `2021-12-31`**. Handle post-2022 Terra/Aqua clock drift strictly through the diurnal solar-time operator $D(\tau)$.
+4. **INV-04:** Encode explicit platform operational calendars (`is_operational[p, d]`), closing `SNPP` after `2026-11-02` and masking multi-day spacecraft safe-mode outages empirically.
+5. **INV-05:** Strictly separate forward observation models from state estimation; never bake cloud multipliers into detected FRP values.
+6. **INV-06:** Never average raw MODIS and VIIRS brightness temperatures (`T21`/`T31` vs. `T_I4`/`T_I5`).
+7. **INV-07:** Model MODIS zero-detection days via the area-dependent Hurdle survival probability so pre-2012 uncertainty widens honestly.
+8. **INV-08:** Isolate volcanoes (`type=1`), offshore (`type=3`), SAMA nighttime artifacts, and `H3-Res8` persistent industrial flares prior to biomass fusion while preserving raw records in Product 1.
+9. **INV-09:** Emit 3 distinct output products preserving untouched provenance, reconstructed physical states, and uncertainty diagnostics.
+10. **INV-10:** Exclude `latitude` and `longitude` from unsupervised behavioral pyrome clustering.
 
-### 5.3 Module 3 (`src/engine/`): State-Space Parameter Estimation & GPU Solver (`torch.float64`)
-1. **Active-Cell Sparsification & H3 3-Coloring:**
-   * Extract `active_cells`: all H3-Res6 hexagons inside target countries with $\ge 1$ valid non-static pass detection across 2000–2026. Store completely empty cells separately (`0.0` with zero-history flag).
-   * Build 1-ring H3 adjacency graph among `active_cells` and run greedy **3-coloring** (`color in {0, 1, 2}` — mathematically exact for planar hexagonal grids, NOT 2-coloring!).
-2. **Deterministic Prior Parameter Estimators (2012–2021 VIIRS Data):**
-   * $\bar{F}_{\text{event}, b}$: Median clear-sky nadir VIIRS cluster FRP per pyrome $b$.
-   * $\mu_{g,m,\text{DN}}$ (Empirical Bayes shrinkage):
-     $$\mu_{g,m,\text{DN}} = \frac{n_{g,m}\,\bar{y}_{g,m,\text{DN}} + 5.0\,\bar{\mu}_{b,m,\text{DN}}}{n_{g,m} + 5.0}$$
-     with $\bar{\mu}_{b,m,\text{DN}}$ equal to pyrome-month mean log-flux (incorporating inactive clear days floored at $z_{\min} = \ln 0.05$).
-   * $\rho_b, \sigma_{\text{proc}, b}$: Lag-1 Yule-Walker OLS on consecutive active VIIRS cell-days in 2012–2021, clipped to $\rho_b \in [0.25, 0.90]$, $\sigma_{\text{proc}, b} \in [0.25, 1.50]$.
-   * $\lambda_{0,b}$: Scalar MLE/moment fit via `scipy.optimize.minimize_scalar` over $[0.1, 5.0]$ matching empirical VIIRS non-detection rate on active pyrome months.
-   * Day–Night coupling $(\beta_{\text{dn},b}, \eta_{\text{dn},b})$: OLS slope and variance ratio between standardized Day & Night anomalies on 2012–2021 active pairs ($\eta_{\text{dn},b} \in [0.05, 0.35]$).
-3. **Exact Objective, Analytical Gradient, and Guarded SPD Hessian (`likelihoods.py`):**
-   For each active cell $g$, day $d \in \{1,\dots,T\}$, regime $\text{DN} \in \{\text{Day}, \text{Night}\}$, and operational platform $p$ (`is_operational[p, d] == 1`):
-   * **Detected Unsaturated ($Y > 0, \text{sat}=0$):**
-     $$\ell = \frac{(z + \mu_{\text{gain}} - \ln Y)^2}{2\sigma^2}, \qquad g = \frac{z + \mu_{\text{gain}} - \ln Y}{\sigma^2}, \qquad h = \frac{1}{\sigma^2}$$
-   * **Detected Saturated Tobit ($Y > 0, \text{sat}=1$):** Let $w = \frac{z + \mu_{\text{gain}} - \ln Y}{\sigma}$ and $\lambda(w) = \exp(\text{log\_pdf}(w) - \text{log\_ndtr}(w))$:
-     $$\ell = -\text{log\_ndtr}(w), \qquad g = -\frac{\lambda(w)}{\sigma}, \qquad h = \frac{\lambda(w)(w + \lambda(w))}{\sigma^2} > 0$$
-   * **Zero Detection ($Y = 0$ while operational):** Let $k = \frac{\lambda_{0,b}\,\psi^{\text{CNT}}_{p,b}(\bar{A}_p, \text{DN})}{\bar{F}_{\text{event}, b}}$, $\Lambda = k\,e^z$, $q = (1 - v) + v\,e^{-\Lambda}$, $r = \frac{v\,e^{-\Lambda}}{q}$:
-     $$\ell = -\ln q, \qquad g = r\,\Lambda, \qquad h = \max\!\Big(0.0,\; r\,\Lambda\,\big[1 - \Lambda(1 - r)\big]\Big)$$
-     *(Exact `max(0.0, ...)` Gauss-Newton convexity guard guarantees global SPD Hessian while preserving exact MAP gradient!)*
-   * **Space x Time x Day-Night Prior Terms:**
-     * Temporal AR(1) along $d = 1\dots T$ adds exact tridiagonal main-diagonal & off-diagonal $-\rho_b / \sigma^2_{\text{proc}, b}$ terms.
-     * Spatial 1-ring neighbors $g' \in \mathcal{N}(g)$ (with fixed $z_{g',d}$ from the other 2 colors) add scalar diagonal penalty $\frac{\alpha_{s,b}|\mathcal{N}(g)|}{\sigma^2_{\text{proc},b}}$ ($\alpha_{s,b} = 0.10$) and linear pull toward $\bar{z}_{\mathcal{N}(g),d}$.
-     * Opposite Day/Night coupling adds scalar diagonal penalty $\frac{\eta_{\text{dn},b}}{\sigma^2_{\text{proc},b}}$ toward $\mu_{g,m,\text{DN}} + \beta_{\text{dn},b}(z_{g,d,\text{opp}} - \mu_{g,m,\text{opp}})$.
-4. **GPU Execution (`solver.py` + `thomas_takahashi.py`):**
-   * Shard active cells across 4 GPUs (`cuda:0..3`) in chunks of `batch_size = 4,000` cells per GPU (`float64` tensors).
-   * Execute `6` outer sweeps: inside each sweep, iterate `color in (0, 1, 2)`, and inside each color alternate `dn in ('Day', 'Night')`.
-   * Inside each `(color, dn)` block: run `15` Damped Newton iterations using the **`float64` Batched Thomas Tridiagonal Cholesky Solver** ($H = L D L^\top$) with Armijo backtracking (`step in [1.0, 0.5, 0.25, 0.125, 0.0625]`, stopping early if $\|\Delta z\|_\infty < 10^{-5}$).
-   * Run **Takahashi's Recursion** in `float64` to recover exact daily posterior variance $\Sigma_{d,d}$ and lag-1 covariance $\Sigma_{d,d-1}$, then generate $M = 200$ correlated AR(1) trajectories on GPU, integrate Day + Night into $\Phi^{(m)}_{g,d}, \text{FRE}^{(m)}_{g,d}, E^{(m)}_{g,d}, A^{\text{burn}, (m)}_{g,d}$, and aggregate to monthly & daily `q05, q50, q95, mean`.
-5. **Fixed-Lag 14-Day Rolling Update Mode:**
-   * Implement `run_fixed_lag_update(window_days=14)` anchoring $z_{g, t_{\text{start}}-1}$ to the stored historical trajectory so new trailing NRT/Science revisions update only the last 14 days cleanly.
-
-### 5.4 Module 4 (`src/engine/conformal.py` & `src/products/`): Conformal Calibration & Outputs
-* **Split Conformal Coverage Calibration:** Using held-out `2018-01-01 .. 2020-12-31` test tiles (masking VIIRS to run MODIS-only inference), compute nonconformity scores $r_j = \frac{|\Phi_{\text{ref}, j} - \widehat{\Phi}_{\text{MODIS-only}, j}|}{\max(\hat{\sigma}_{\text{raw}, j},\; 0.1)}$ where $\hat{\sigma}_{\text{raw}} = (q_{95} - q_{05}) / 3.29$. Take $\hat{q}_{0.90, b} = \text{Quantile}_{0.90}(\{r_j\})$ per pyrome and rescale final interval half-widths by $\hat{q}_{0.90, b}$ (clamping `q05 >= 0`).
-* **Abstention & Attribution:**
-  * `quality_flag = ABSTAIN_LOW_EVIDENCE` if $\ge 5$ consecutive days have `mean_cloud_frac > 0.85` AND zero detections across cell + 1-ring neighbors.
-  * `attribution_flag`: compares raw step change vs. harmonized step change relative to conformal CI overlap (`REAL_FIRE_CHANGE`, `SENSOR_ARTIFACT_CORRECTED`, `AMBIGUOUS_OVERLAPPING_CI`).
-* **Export Strictly the 3 Complementary Products** into `fire_harmonized.duckdb` + Parquet (`obs_harmonized_provenance`, `state_reconstructed_monthly` & `daily`, `uncertainty_diagnostics`) matching Section 5 of the previous specification.
+### 3.3 Selected Target Scope (Six Multi-Biome Countries)
+The mathematical engine is 100% coordinate-agnostic and operates uniformly at **H3 Resolution 6** across six polygon-clipped benchmark countries capturing all global fire regimes:
+1. **Argentina (`ARG`):** CONAE July–Aug 2026 Chilecito spotlight (`lat ~ -29.16, lon ~ -67.50`), Pampas crop burns, SAMA zone.
+2. **Algeria (`DZA`):** Kabylie Mediterranean crown fires (`2021`, `2023`) vs. Saharan Hassi Messaoud static gas flares.
+3. **Brazil (`BRA`):** High-density 2012–2021 Amazon deforestation + Cerrado savanna calibration backbone, wet-season clouds, SAMA.
+4. **Indonesia (`IDN`):** Severe equatorial cloud persistence, nighttime peat smoldering, low-evidence abstention regime.
+5. **Australia (`AUS`):** Low-FRP northern savanna fires + 2019–2020 Black Summer VIIRS I4 saturation megafires.
+6. **United States (`USA` — `CONUS` + `Alaska`):** Western crown megafires, SE prescribed small burns, and Alaska boreal cluster discrepancy benchmark.
 
 ---
 
-## 6. Web Application Specification (Environment 3)
+## 4. Complete Codebase Architecture & Module Contracts
 
-Build **one single clean web application** with zero npm/Node build tooling:
-* **Backend (`src/webapp/server.py`):** `FastAPI` + `DuckDB` (read-only connection pool) serving static files from `src/webapp/static/` and 5 REST endpoints:
-  * `GET /api/calendar` — Year (2000–2026) x Month (1–12) matrix for any bounding box or country, returning harmonized flux/events, conformal `[q05, q95]`, historical median anomaly ratio, and provenance flags.
-  * `GET /api/timeseries` — Monthly harmonized curve + raw broken NASA baseline + shaded conformal uncertainty band + constellation event markers (`2002 Aqua`, `2012 SNPP`, `2018 N20`, `2022 Drift`, `2023 N21`, `2026-11-02 SNPP End`).
-  * `GET /api/map_hex` — H3 GeoJSON polygons for selected region/date colored by harmonized flux, anomaly ratio, or uncertainty width.
-  * `GET /api/diagnostics` — Precomputed validation metrics (structural break p-values, 2019–2021 ablation CRPS/coverage, burned-area correlation).
-  * `GET /api/export.csv` — Streaming CSV export sanitized against spreadsheet formula injection (`=`, `+`, `-`, `@` prefixed with `'`).
-* **Frontend (`src/webapp/static/`):** Vanilla HTML5 + ES6 JS + **MapLibre GL JS** + **Apache ECharts** (via clean CDN/vendored files):
-  * Interactive ROI bounding-box drawer + 6 spotlight preset buttons (`Chilecito ARG Jul–Aug 2026`, `Kabylie DZA 2021/2023`, `Hassi Messaoud Gas Flare Check`, `Alaska Boreal`, `Black Summer AUS`, `Kalimantan Peat IDN`).
-  * Accessible colorblind-safe `viridis`/`cividis` calendar heatmap with diagonal hatching/opacity indicator for high-uncertainty periods (`pre-2012 censoring` or `ABSTAIN_LOW_EVIDENCE`).
+Implement strictly the repository layout below. Every file has a clear single responsibility, explicit inputs/outputs, and zero duplicate pipelines.
 
----
+```text
+fire-harmonizer/
+├── Makefile
+├── pyproject.toml
+├── src/
+│   ├── __init__.py
+│   ├── config/
+│   │   ├── __init__.py
+│   │   ├── settings.py
+│   │   └── paths.py
+│   ├── ingest/
+│   │   ├── __init__.py
+│   │   ├── build_wheels.sh
+│   │   ├── download_data.py
+│   │   └── normalize_dedup.py
+│   ├── geometry/
+│   │   ├── __init__.py
+│   │   ├── h3_utils.py
+│   │   ├── solar_geometry.py
+│   │   └── preprocess_geometry.py
+│   ├── calibration/
+│   │   ├── __init__.py
+│   │   ├── pyromes.py
+│   │   └── operators.py
+│   ├── engine/
+│   │   ├── __init__.py
+│   │   ├── likelihoods.py
+│   │   ├── priors.py
+│   │   ├── thomas_takahashi.py
+│   │   ├── cuda_kernels.py
+│   │   ├── solver.py
+│   │   └── conformal.py
+│   ├── products/
+│   │   ├── __init__.py
+│   │   └── export_duckdb.py
+│   ├── validation/
+│   │   ├── __init__.py
+│   │   ├── synthetic_twin.py
+│   │   └── diagnostics.py
+│   └── webapp/
+│       ├── __init__.py
+│       ├── server.py
+│       └── static/
+│           ├── index.html
+│           ├── app.js
+│           └── styles.css
+├── scripts/
+│   ├── run_env1_stage.py
+│   ├── run_env2_cpu_prep.py
+│   ├── run_env2_gpu_solve.py
+│   └── run_env2_validate.py
+└── tests/
+    ├── conftest.py
+    ├── test_01_ingestion_schema.py
+    ├── test_02_geometry_masking.py
+    ├── test_03_event_clustering.py
+    ├── test_04_observation_operators.py
+    ├── test_05_likelihood_derivatives.py
+    ├── test_06_gpu_solver_math.py
+    ├── test_07_synthetic_twin_truth.py
+    ├── test_08_conformal_uncertainty.py
+    ├── test_09_validation_diagnostics.py
+    └── test_10_webapp_api_scale.py
+```
 
-## 7. Mandatory 166+ Test Verification Matrix (`pytest`)
+### File-by-File Module Contracts
 
-Implement all 10 `pytest` files under `tests/`. Every test must assert concrete mathematical tolerances or schema invariants (zero placeholder `assert True` tests):
-
-1. `tests/test_01_ingestion_schema.py` (**18 tests**): Satellite alias mapping (`T/A/N/1/2` -> canonical), mixed confidence parsing (`l/n/h` vs `0..100` vs null), missing `type` in NRT -> `-1`, Science `ML > SP > NRT` dedup priority, USA CONUS+Alaska split without Pacific wrap, local solar time & date wrap at `00:05`/`23:55` and $\pm 180^\circ$.
-2. `tests/test_02_geometry_masking.py` (**18 tests**): Pixel area `scan*track`, monotone VZA inversion `[0, 65]`, MODIS bow-tie overlap conservation (2 overlapping 40 MW edge pixels sum to 40 MW, not 80 MW), SAMA nighttime low-conf filter, Algerian gas flare vs. seasonal wildfire discrimination, H3 v3/v4 compatibility + 3-coloring validity (`color[u] != color[v]` for ALL adjacent H3 edges!).
-3. `tests/test_03_event_clustering.py` (**14 tests**): 3x3 contiguous VIIRS pixels -> 1 cluster, separated fires -> 2 clusters, `SNPP + N20 + N21` within 50 min kept as 3 separate rows (never summed!), 5-minute pass separation boundary.
-4. `tests/test_04_observation_operators.py` (**20 tests**): Linear $F_{\min}$ ordering (`MODIS_day > MODIS_night > VIIRS_night`), Log-Normal survival integrals $\psi \in (0, 1]$ monotonicity, 2-harmonic Fourier periodicity $D(0) == D(24)$ & unit 24h integral $1.0 \pm 10^{-4}$, $w_{\text{day}} + w_{\text{night}} == 1.0$, monotonic LightGBM/EQM $\gamma$, heteroscedastic $\sigma^2$ ordering, coordinate-shift invariance of GMM pyromes.
-5. `tests/test_05_likelihood_derivatives.py` (**22 tests**): Finite-difference gradient & Hessian agreement (`< 1e-6`) across Obs, Tobit Saturation (over $w \in [-5, 5]$ without `NaN`/`Inf`), and Hurdle Zero; Tobit asymmetry; exact convexity guard ($h_{\text{miss}} \ge 0$ verified inside partial-cloud $v=0.7, \Lambda=2.5$ zone); 2005 MODIS zero preserves small-fire flat curvature.
-6. `tests/test_06_gpu_solver_math.py` (**20 tests**): `float64` batched Thomas solver vs. `torch.linalg.solve` (`< 1e-10`); Takahashi diagonal & lag-1 covariance vs. `torch.linalg.inv(H)` (`< 1e-10`); Armijo backtracking strict descent; 3-color spatial GMRF cloud-gap recovery; Day/Night alternating sweep convergence; CPU vs. CUDA parity (`< 1e-8`); extreme dynamic range $10^{-4}\text{–}10^6\,\text{MW}$ stability.
-7. `tests/test_07_synthetic_twin_truth.py` (**18 tests**): Complete 26-year synthetic forward simulator with known ground truth $X_{\text{true}}$ (2002 Aqua, 2012 SNPP, 2018 N20, 2022 drift, 2023 N21, Nov 2026 SNPP cutoff, 30% clouds, bow-tie, gas flares) verifying: 2012 raw jump `> +150%` reduced to `< +/- 10%`; 3-satellite inflation eliminated; Nov 2026 cutoff unbiased; post-2022 drift corrected; true flux correlation `r > 0.90`; real 5x spike preserved `< +/- 15%`.
-8. `tests/test_08_conformal_uncertainty.py` (**12 tests**): Split conformal coverage in `[1 - alpha - 0.03, 1 - alpha + 0.05]` across $\alpha \in \{0.05, 0.10, 0.20\}$; 2005 uncertainty strictly wider than 2024; cloudy months wider than clear months; `ABSTAIN_LOW_EVIDENCE` triggers on 5+ blind cloudy days; 14-day fixed-lag update matches full batch (`< 1e-3`).
-9. `tests/test_09_validation_diagnostics.py` (**12 tests**): Chow & Pettitt structural-break detector flags raw 2012 break (`p < 0.001`) and passes harmonized (`p > 0.05`); 2019–2021 VIIRS-masked ablation beats raw MODIS on CRPS & Spearman $\rho$; Product 1/2/3 schema invariants (`q05 <= q50 <= q95`, `fre_tj == 0.0864 * phi`, `measured_fraction in [0, 1]`).
-10. `tests/test_10_webapp_api_scale.py` (**12 tests**): All 5 FastAPI endpoints return HTTP 200 and valid payloads; CSV formula-injection sanitization; empty-bbox handling without 500s; DuckDB query latency `< 300 ms`; GPU chunk memory benchmark (`batch_size = 4000` in `float64` `< 18 GB` VRAM on single L4).
-
----
-
-## 8. Strict 36-Hour Execution Schedule
-
-1. **Hours 0–4 (Environment 1, 0 GPU-hrs):** Build offline Python 3.12 wheels; stream SFTP/FIRMS active fires + `Mx14CMQ` cloud parquet + `MCD64A1` burned-area validation parquet; run `normalize_dedup.py` and verify coverage audit (including Chilecito ARG Jul–Aug 2026 and Nov 2, 2026 SNPP end). Publish Input Datasets to Kaggle. **Gate 1 (Hour 4): Freeze staged data.**
-2. **Hours 4–12 (CPU Development & Suites 1–5):** Build `src/geometry/`, `src/calibration/`, and `tests/test_01`..`test_05`. Pass 100% of Suites 1–5 on CPU.
-3. **Hours 12–16 (CPU Solver Dry-Run & Suites 6–7):** Build `src/engine/` and synthetic simulator; dry-run on 2% subset (`ARG + DZA`) on CPU. **Gate 2 (Hour 16): 100% of Suites 1–7 pass with zero NaNs; push repo to Kaggle Dataset.**
-4. **Hours 16–20 (`4x L4` Batch Run #1, ~2–3 GPU-hrs billed):** Run full calibration, GPU 3-color reconstruction, conformal calibration, and export `fire_harmonized.duckdb` + 3 Parquet products (`<= 3 GB`). Pass Suite 8.
-5. **Hours 20–24 (`4x L4` Batch Run #2, ~1–2 GPU-hrs billed):** Run 2019–2021 VIIRS ablation, Chow/Pettitt structural breaks, `MCD64A1` validation, and spotlight reports. Pass Suite 9. (Leaves ~7 GPU-hrs reserve.)
-6. **Hours 24–32 (Environment 3 Web App & Suite 10):** Implement FastAPI + DuckDB backend and MapLibre + ECharts frontend. Pass Suite 10.
-7. **Hours 32–36 (Final Verification & Packaging):** Execute full `pytest` across all 166+ tests, inspect spotlight visualizations in live UI, finalize documentation and reproducible validation report.
-
----
-
-### Exact Instruction for Your Agent
-Pass this exact prompt alongside `AGENT_MASTER_SPEC.md`:
-> *"Read `AGENT_MASTER_SPEC.md` in full. Implement this exact single-system architecture without adding alternative pipelines, fallback UIs, or unrequested dead code. Enforce all 10 Scientific Invariants, the 3-environment offline Kaggle separation, the exact H3 3-coloring + `float64` Thomas/Takahashi + guarded Hurdle/Tobit equations, and the exact FIRMS `/api/area/csv/.../5/...` and UMD SFTP contracts. Build module by module in exact schedule order, running and passing every corresponding `pytest` suite from Section 7 (166+ tests total) before advancing to the next module. Begin with the complete repository skeleton, `Makefile`, `src/config/`, and Phase 1 ingestion + Suites 1–2."*
-
-
-
-Below is a **complete, unambiguous Mathematical & Implementation Addendum** written directly for your coding agent. Give this to the agent alongside `AGENT_MASTER_SPEC.md` (or replace Section 5–7 with this expanded specification). Every tensor shape, numerical guard, parameter estimator, derivative, solver loop, validation test formula, and SQL query is locked down so the agent never has to guess, invent, or leave dead branches.
-
----
-
-# ENGINE_MATH_AND_IMPLEMENTATION_CONTRACT.md
-# Deep Mathematical, Numerical & Systems Specification for the Coding Agent
-
-## 0. Absolute Execution Rules for the Agent
-1. **Zero Dead Code & Zero Competing Paths:** Build ONE unified production system. Every parameter, tensor dimension, loop count, and fallback behavior is explicitly defined below. Do not introduce unused configuration switches, duplicate solver implementations, or placeholder stubs.
-2. **Exact Verified Environment Facts:**
-   * Kaggle GPU Docker runs **Python 3.12** with `torch`, `numpy`, `scipy`, `pandas`, `pyarrow`, `scikit-learn`, `lightgbm`, `rasterio`, and `shapely` preinstalled [1.2.6, 2.1.1].
-   * `pyhdf` has no prebuilt Python 3.12 `manylinux` wheel and requires `libhdf4-dev` compilation [1.1.1]. Run ALL HDF4 parsing (`Mx14CMQ`) exclusively inside **Environment 1** (`apt-get install -y libhdf4-dev && pip install pyhdf`) to emit `cloud_visibility_025deg.parquet`. **Environment 2 (offline `4x L4`) NEVER imports `pyhdf`.**
-   * NASA FIRMS `/api/country` and `/api/countries` endpoints are currently **unavailable** [1.3.6]. For FIRMS REST API downloads, use ONLY `/api/data_availability/csv/{MAP_KEY}/ALL` and `/api/area/csv/{MAP_KEY}/{SOURCE}/{west,south,east,north}/{DAY_RANGE}/{YYYY-MM-DD}` with `DAY_RANGE <= 5` [1.3.9].
-   * Independent burned-area validation comes from UMD `MCD64A1` Esri Shapefiles (`SHP/`) on `fuoco.geog.umd.edu` [2.2.4], pre-aggregated in Environment 1 via `shapely`/`rasterio` into `burned_area_val_h3.parquet`.
-
----
-
-## 1. Exact Time Grid, Tensor Shapes & Memory Budget on `4x NVIDIA L4`
-
-### 1.1 Exact Temporal Axis
-* Anchor date: $d_0 = \text{2000-11-01}$.
-* End date: $d_{\text{end}} = \text{2026-11-14}$.
-* Total days: $T = (d_{\text{end}} - d_0).\text{days} + 1 = \mathbf{9{,}510}$ days (`t_idx in 0..9509`).
-* Month index lookup arrays precomputed on CPU and pinned to GPU:
-  * `day_to_year[T]` (`int16`, values `2000..2026`)
-  * `day_to_month[T]` (`int8`, values `1..12`)
-  * `day_to_ym_idx[T]` (`int16`, sequential month index `0..312` for `2000-11`..`2026-11`)
-* Satellite Operational Mask `is_operational[P, T]` (`bool`, $P = 5$):
-  * `0 = Terra`: `2000-11-01` .. `2026-11-14`
-  * `1 = Aqua`: `2002-07-04` .. `2026-11-14`
-  * `2 = SNPP`: `2012-01-20` .. `2026-11-02` (`False` after `2026-11-02`!)
-  * `3 = NOAA-20`: `2018-04-01` .. `2026-11-14`
-  * `4 = NOAA-21`: `2023-03-01` .. `2026-11-14`
-
-### 1.2 Exact Active-Cell Sparsification & GPU Shard Budget
-* Never allocate tensors for barren ocean/desert hexagons that had zero detections across all 26 years.
-* Define `active_cells`: all `H3 Resolution 6` cells inside the 6 target country polygons/boxes that have `>= 1` valid non-static biomass fire detection between `2000-11-01` and `2026-11-14` (plus any immediate 1-ring H3 neighbors inside target boxes that had `>= 1` neighbor active, or restrict strictly to cells with `>= 1` detection and couple only across active neighbors—restricting strictly to cells with `>= 1` historical fire keeps `N_active` tight at `~35,000–65,000` cells across all 6 countries!).
-* **Per-GPU Chunk Budget (`batch_size = 2,000` cells per forward/Newton solve, `mc_chunk_cells = 500` cells for Monte Carlo):**
-  * Observation input tensors `(B=2000, T=9510, P=5)` in `float32`:
-    * `obs_y_frp` (`float32`, `380 MB`): raw pass FRP (`0.0` if non-detection)
-    * `obs_sat_flag` (`int8`, `95 MB`): `0=normal`, `1=right-censored saturated`
-    * `obs_mu_gain` (`float32`, `380 MB`): forward log-gain $\mu^{\text{gain}}_{p,g,d,\text{DN}}$ (computed for BOTH detected passes AND zero-detection operational passes!)
-    * `obs_inv_sig2` (`float32`, `380 MB`): $1/\sigma^2$ (`0.0` on non-detection days)
-    * `obs_inv_sig` (`float32`, `380 MB`): $1/\sigma$ (for Tobit saturation)
-    * `obs_k_miss` (`float32`, `380 MB`): Poisson rate coefficient $k = \lambda_{0,b}\psi^{\text{CNT}}_{p,b}/\bar{F}_{\text{event}, b}$
-    * `obs_vis` (`float32`, `380 MB`): clear-sky visibility $v_{p,g,d}$
-  * Solver state & tridiagonal buffers `(B=2000, T=9510)` in **`torch.float64`** (mandatory to prevent Thomas/Takahashi floating-point cancellation across $T=9510$!):
-    * `z_curr`, `z_prop`, `grad`, `diag`, `chol_d`, `chol_l`, `tak_var`, `tak_cov`, `mu_prior` (`9 x 152 MB = 1.37 GB`)
-  * Peak VRAM per L4 GPU (24 GB): **~4.2 GB** during Newton solve and **~6.0 GB** during 200-sample MC generation (`mc_chunk_cells = 500` $\times$ `9510` $\times$ `200` $\times$ `4 B` = `3.8 GB`). Zero risk of CUDA OOM.
+* **`Makefile`:** Exposes `stage`, `cpu-prep`, `gpu-solve`, `validate`, `test`, `serve`.
+* **`src/config/settings.py`:** Pure constants & dataclasses (`TARGET_COUNTRIES`, `PLATFORM_TIMELINE`, `DATE_START = "2000-11-01"`, `DATE_END = "2026-11-14"`, `T_DAYS = 9510`, `CALIB_START = "2012-01-20"`, `CALIB_END = "2021-12-31"`, `Z_MIN = ln(0.01)`, `Z_MAX = 14.0`, `F_REF_MW = 0.5`, `SAMA_BOX`, `H3_MAIN_RES = 6`, `H3_FLARE_RES = 8`, `MC_SAMPLES = 200`, `SOLVER_SWEEPS = 6`, `NEWTON_STEPS = 15`). Must contain zero I/O logic.
+* **`src/config/paths.py`:** `DataPaths` dataclass auto-resolving `/kaggle/input/...` and `/kaggle/working/...` when running in Kaggle vs. `./data/...` locally via environment variables or directory detection. Single source of truth for every file path.
+* **`src/ingest/build_wheels.sh`:** Runs in Env 1 to verify Python 3.12 (`sys.version_info`) and run `pip download --only-binary=:all: --platform manylinux2014_x86_64` strictly for `duckdb`, `polars`, `h3`. Must not bundle PyTorch, CUDA, or `pyhdf`.
+* **`src/ingest/download_data.py`:** Env 1 downloader. Supports: (1) UMD `fuoco.geog.umd.edu` (SFTP + FTP fallback) for `MCD14ML` (`.txt.gz` space-delimited), `VNP14IMGML`/`VJ114IMGML`/`VJ214IMGML` (`.csv.gz`), `MOD14C8Q`/`MYD14C8Q`/`Mx14CMQ` HDF4 cloud grids (parsed via `pyhdf`), and `MCD64CMQ` burned area HDF4 grids; (2) Source Cooperative Portolan NASA FIRMS GeoParquet 2.0 mirror via DuckDB `httpfs` if UMD is unreachable; (3) NASA FIRMS REST API (`/api/data_availability/csv/{MAP_KEY}/ALL` + `/api/area/csv/{MAP_KEY}/{SOURCE}/{bbox}/5/{DATE}`) strictly for trailing 2026 NRT backfill; and (4) Natural Earth `50m` Admin-0 GeoJSON download (`ne_50m_admin_0_countries.geojson`). Emits `staged_raw/`, `cloud_visibility_025deg.parquet`, `burned_area_val_025deg.parquet`, and `country_polygons.parquet`.
+* **`src/ingest/normalize_dedup.py`:** Parses heterogeneous schemas (`MCD14ML` space format, `Vxx14IMGML` CSV format, FIRMS API/Portolan format), clips points strictly inside the 6 Natural Earth country polygons (`shapely.contains_xy`), enforces `(platform, acq_date)` Science-tier dominance (`ML_SCIENCE > SP_SCIENCE > NRT`, dropping NRT on any `(platform, acq_date)` covered by Science data), computes empirical `platform_active_day[P, T]`, writes Zstd Parquet partitioned by `(country_iso, year)` into `active_fires/`, and prints the coverage audit.
+* **`src/geometry/h3_utils.py`:** Version-safe H3 wrapper (`h3 v3` & `v4`) storing 64-bit `int64` H3 IDs internally while converting cleanly to hex strings for `h3 v4` API calls (`latlng_to_cell`, `grid_disk`, `cell_to_boundary`, `cell_to_latlng`, `average_hexagon_area`). Implements deterministic greedy **3-coloring** of the active H3 hexagon graph (`color in {0, 1, 2}`) verified to have zero adjacent same-color neighbors.
+* **`src/geometry/solar_geometry.py`:** Vectorized astronomical calculation of Solar Declination, Equation of Time, Solar Zenith Angle (`SZA` in degrees), local solar time $\tau_i \in [0, 24)$, local `solar_date`, and physical `dn_flag` (`'D'` if `SZA < 85.0` else `'N'`). Also implements exact spherical Earth pixel geometry (`Sample -> scan_km, track_km, vza_deg`) for MODIS (`1354` samples, $H=705\,\text{km}$) and VIIRS I-band (`6400` samples, $H=824\,\text{km}$, `3:1/2:1/1:1` aggregation zones), plus `scan*track -> vza_deg` lookup splines when `Sample` is absent.
+* **`src/geometry/preprocess_geometry.py`:** Applies `type_raw IN (1, 3)` drop, SAMA nighttime low-confidence filter, `H3-Res8` persistent industrial/gas-flare mask (`is_static_industrial`), single-platform overpass segmentation ($\Delta t \le 5\,\text{min}$), ECEF `cKDTree` + `csgraph.connected_components` intra-pass bow-tie weighting ($\omega^{\text{bt}}_i$) and physical fire-event clustering (`event_cluster_id`), `i4_m13_fallback` vs Tobit `sat_flag` classification, and outputs **Product 1 base (`obs_provenance_base.parquet`)** and **`pass_observations.parquet`** keyed strictly by `(h3_index, solar_date, platform, dn_flag)` (never summing platforms).
+* **`src/calibration/pyromes.py`:** Extracts strictly coordinate-free behavioral features per `H3-Res6` hexagon over `2012–2021`, fits `K=7` `GaussianMixture`, assigns all active hexagons `pyrome_id in 0..6`, and exports `hex_pyromes.parquet`.
+* **`src/calibration/operators.py`:** Calibrates on `2012-01-20 .. 2021-12-31`: isotonic confidence reliability $w_i$, pixel-area detection limits $F_{\min,p}(A, \text{DN})$, truncated Log-Normal cluster MLE + exact closed-form survival integrals $\psi^{\text{CNT}}, \psi^{\text{FRP}}$, monotonic-quantile EQM + LightGBM residual calibration $\gamma_{\text{MODIS}, b}$ using near-nadir VIIRS reference (`VZA_VIIRS < 25°`), separate Daytime (`06–18`) and Nighttime (`18–06`) 2-harmonic Fourier diurnal curves $D_{b,s,\text{DN}}(\tau)$ (including post-2022 Aqua vs NOAA-20 drift *only* on diurnal harmonics), heteroscedastic observation variance $\sigma^2$, and active-area transfer model $g_{\text{area}, b}$. Joins `cloud_visibility_025deg.parquet` and emits `calibration_artifacts.pkl` + `pass_observations_calibrated.parquet`.
+* **`src/engine/likelihoods.py`:** Pure PyTorch (`torch.float64`) vectorized negative log-likelihoods, exact 1st derivatives, and convexity-guarded Hessians (`Obs`, `Tobit Saturation`, `Hurdle Zero-Detection`).
+* **`src/engine/priors.py`:** Deterministic Empirical Bayes estimators from `2012–2021` VIIRS data for $(\mu_{g,m,\text{DN}}, \rho_b, \sigma_{\text{proc}, b}, \lambda_{0, b}, \beta_{\text{dn}, b}, \eta_{\text{dn}, b}, \bar{F}_{\text{event}, b})$ and sparse 3-color neighbor graph tensor builder.
+* **`src/engine/thomas_takahashi.py` & `src/engine/cuda_kernels.py`:** `thomas_takahashi.py` implements the exact `float64` reference Thomas $LDL^\top$, Takahashi variance/lag-1 recursion, and exact joint Cholesky sampler `L^T u = D^{-1/2} eps` in PyTorch. `cuda_kernels.py` compiles a clean single-launch CUDA C++ `float64` thread-per-cell Thomas/Takahashi/Cholesky kernel via `torch.utils.cpp_extension.load_inline` when CUDA & `nvcc` are present (automatically verified bit-for-bit against `thomas_takahashi.py` in `test_06`), eliminating the 9,510-kernel launch bottleneck.
+* **`src/engine/solver.py`:** Multi-GPU worker orchestrator (`torch.multiprocessing` over `0..device_count()-1`, `batch_size = 1000`). Builds dense `(B, T=9510, P=5)` observation + non-detection tensors per chunk, executes `6` 3-color × Day/Night sweeps of `15` Damped Newton-Raphson iterations with Armijo backtracking, computes exact Takahashi variances, generates $M=200$ joint posterior trajectories, aggregates daily & monthly quantiles (`q05, q50, q95, mean`), and exposes `run_fixed_lag_update(window_days=14)`.
+* **`src/engine/conformal.py`:** Computes Split Conformal Quantile Rescaling (`CQR`) multipliers from held-out `2018–2020` VIIRS-masked folds (`MODIS-only` multiplier) and `2018–2021` leave-one-VIIRS-platform-out folds (`multi-sensor` multiplier), rescales monthly/daily intervals, assigns `ABSTAIN_LOW_EVIDENCE` and `attribution_flag`, and computes 2003–2020 historical medians, anomaly ratios, z-scores, and percentiles.
+* **`src/products/export_duckdb.py`:** Writes indexed Zstd Parquet for **Product 1 (`obs_harmonized_provenance`)**, **Product 2 (`state_reconstructed_monthly` dense + `state_reconstructed_daily` sparse episode filter)**, and **Product 3 (`uncertainty_diagnostics`)**, loading all views/tables into `fire_harmonized.duckdb`.
+* **`src/validation/synthetic_twin.py` & `src/validation/diagnostics.py`:** Synthetic 26-year digital twin forward simulator with known ground truth $X_{\text{true}}$ (`synthetic_twin.py`), plus real-data Chow & Pettitt structural-break suite, 2019–2021 VIIRS-masked ablation, `MCD64CMQ` burned-area correlation comparison, residual VZA/solar-time slope tests, and spotlight reports (`Chilecito ARG 2026`, `Kabylie & Hassi Messaoud DZA`, `Nov 2, 2026 S-NPP end`).
+* **`src/webapp/server.py` & `src/webapp/static/`:** FastAPI + read-only DuckDB backend with `/api/calendar`, `/api/timeseries`, `/api/map_hex`, `/api/diagnostics`, `/api/export.csv` (sanitized against formula injection), and MapLibre GL JS + Apache ECharts frontend.
 
 ---
 
-## 2. Exact Geometry & Non-Detection Observation Parameters (Module 1)
+## 5. Complete Mathematical & Computational Engine (Exact Derivations)
 
-### 2.1 Pixel Area, View Zenith Angle ($\theta_{\text{VZA}}$), and Swath Visibility
-For every detection $i$:
-1. **Pixel Area:** $A_i = \text{clip}(\text{scan}_i \times \text{track}_i,\; 0.12,\; 12.0)\,\text{km}^2$.
-2. **Viewing Zenith Angle Lookup Spline (`deg` in `[0.0, 65.0]`):**
-   * MODIS: interpolate `A_i` monotonically over anchor knots `[(1.00, 0.0), (1.35, 20.0), (2.25, 35.0), (4.20, 50.0), (9.60, 65.0)]` (`np.interp` clamped to `[0, 65]`).
-   * VIIRS I-band: interpolate `A_i` monotonically over anchor knots `[(0.141, 0.0), (0.180, 20.0), (0.280, 35.0), (0.430, 50.0), (0.620, 65.0)]`.
-3. **SAMA & Static Gas-Flare Masking:**
-   * Drop `type_raw IN (1, 3)`.
-   * Drop rows where `sensor_family == 'VIIRS'` AND `daynight == 'N'` AND `conf_raw == 'l'` AND `-110.0 <= longitude <= 11.0` AND `-55.0 <= latitude <= 7.0`.
-   * Group remaining points by `H3 Resolution 10` micro-cell $m$: compute active years $Y_m$, active days/year $\bar{D}_m = \text{total\_active\_days}_m / \max(1, Y_m)$, and day/night symmetry $R^{\text{DN}}_m = \frac{\min(n_{\text{day}}, n_{\text{night}})}{\max(n_{\text{day}}, n_{\text{night}}) + 1}$.
-   * Set `is_static_industrial = True` if `type_raw == 2` OR ($Y_m \ge 3$ AND $\bar{D}_m \ge 15.0$ AND $R^{\text{DN}}_m > 0.30$). Save all rows with this boolean into **Product 1**; filter `is_static_industrial == False` into biomass fusion.
-4. **Intra-Pass Bow-Tie Weighting & Event Clustering:**
-   * Sort detections by `(platform, acq_date, acq_hhmm)` and increment `pass_id` whenever gap between consecutive detections of the same platform exceeds `5 minutes` (accounting for midnight UTC wrap via `utc_minutes` across sequential days).
-   * Within each `(platform, pass_id)`:
-     * Compute pairwise Haversine distances only within candidate spatial grid buckets (`H3-Res6 + 1-ring`) using a `scipy.spatial.cKDTree` on ECEF 3D `(x, y, z)` coordinates (`R_earth = 6371.0 km`)—`O(N log N)`, zero quadratic blowup!
-     * **MODIS bow-tie overlap ($A_i > 1.5\,\text{km}^2$):** Edges between pixels $i, j$ where $d_{ij} < 0.7 \cdot \frac{\text{track}_i + \text{track}_j}{2}$ and $|\text{scan\_line\_proxy}|$ or adjacent detections within same pass; weight $\omega^{\text{bt}}_i = \frac{1.0}{1.0 + \text{deg}_{\text{bt}}(i)}$. (VIIRS or $A_i \le 1.5$: $\omega^{\text{bt}}_i = 1.0$).
-     * **Spatial Event Clustering:** Edges where $d_{ij} \le 1.4 \cdot \max(\sqrt{A_i}, \sqrt{A_j})$. Run `scipy.sparse.csgraph.connected_components` to assign `event_cluster_id`.
-5. **Saturation Classification Rule:**
-   * `i4_m13_fallback = 1` if `sensor_family == 'VIIRS'` and `t_mir_k >= 366.0` and `frp_mw > 0.0` (M13 retrieved unsaturated FRP, inflate $\sigma_{\text{obs}}$ by `1.35x`).
-   * `sat_flag = 1` (Right-Censored Tobit) if (`sensor_family == 'MODIS'` and `t_mir_k >= 498.0` and `frp_mw > 0.0`) OR (`sensor_family == 'VIIRS'` and `t_mir_k >= 366.9` and `frp_mw >= 300.0` with flat ceiling clip).
+### 5.1 Coordinate Support, Solar Geometry, and Pixel Geometry
 
-### 2.2 Exact Observation Parameters for Non-Detection Operational Passes (`Y == 0`)
-Crucial rule: On any day $d$ where `is_operational[p, d] == 1` and platform $p$ reported **zero detections** in cell $g$, regime $\text{DN}$, the Hurdle likelihood STILL requires well-defined $(v_{p,g,d}, \bar{A}_{p, \text{avg}}, \bar{\tau}_{p, d}, \bar{\theta}_{p, \text{avg}})$:
-1. **Cloud & Overpass Visibility $v_{p,g,d}$:**
-   $$v_{p,g,d} = p_{\text{swath}, p}(|\phi_g|, d) \cdot \text{clip}\!\Big(1.0 - f_{\text{cloud}}(g, y, m) - f_{\text{missing}}(g, y, m),\;\; 0.10,\;\; 0.98\Big)$$
-   where `f_cloud`, `f_missing` come from `cloud_visibility_025deg.parquet` (0.25-deg `Mx14CMQ`), and $p_{\text{swath}, p}(|\phi_g|, d)$ is the analytic orbital daily swath coverage factor:
-   * VIIRS ($3040\,\text{km}$ swath): $1.0$ globally (`0.99` near equator).
-   * MODIS ($2330\,\text{km}$ swath): $\text{clip}(0.85 + 0.15 \cdot \frac{|\phi_g|}{30.0},\; 0.85,\; 1.00)$ (multiplied by `0.96` after `2022-01-01` due to orbital altitude decay).
-2. **Swath-Averaged Pixel Area & VZA for Unseen Passes:**
-   * MODIS: $\bar{A}_{\text{avg}} = 2.35\,\text{km}^2$, $\bar{\theta}_{\text{avg}} = 35.0^\circ$.
-   * VIIRS: $\bar{A}_{\text{avg}} = 0.23\,\text{km}^2$, $\bar{\theta}_{\text{avg}} = 28.0^\circ$.
-3. **Expected Overpass Local Solar Hour $\bar{\tau}_{p, d, \text{DN}}$:**
-   * `Terra`: `10.5` before `2022-01-01`, linearly interpolating `10.5 -> 8.75` across `2022-01-01 .. 2026-11-14` (`+12.0` mod 24 for Night).
-   * `Aqua`: `13.5` before `2022-01-01`, linearly interpolating `13.5 -> 15.60` across `2022-01-01 .. 2026-11-14` (`+12.0` mod 24 for Night).
-   * `SNPP`, `NOAA-20`, `NOAA-21`: `13.5` Day / `1.5` Night.
+#### 5.1.1 Solar Zenith Angle & Local Solar Time
+For UTC timestamp $t_{\text{UTC}}$ (Julian day $J$ and fractional UTC hours $h_{\text{UTC}} = \text{hh} + \text{mm}/60.0$) at $(\phi, \lambda)$:
+1. Local solar time in $[0, 24)$:
+   $$\tau_i = \left(h_{\text{UTC}, i} + \frac{\lambda_i}{15.0}\right) \bmod 24.0$$
+   And local solar date shifts by $-1$ day if $h_{\text{UTC}, i} + \lambda_i / 15.0 < 0$ or $+1$ day if $\ge 24.0$.
+2. Compute solar declination $\delta_\odot$ and equation of time $E_t$ using Spencer's standard astronomical Fourier approximation:
+   Let day angle $\Gamma = \frac{2\pi(\text{doy} - 1)}{365}$:
+   $$\delta_\odot = 0.006918 - 0.399912\cos\Gamma + 0.070257\sin\Gamma - 0.006758\cos 2\Gamma + 0.000907\sin 2\Gamma$$
+   $$E_t = 229.18(0.000075 + 0.001868\cos\Gamma - 0.032077\sin\Gamma - 0.014615\cos 2\Gamma - 0.040849\sin 2\Gamma) \;\;(\text{min})$$
+   True solar time $\tau_{\text{true}} = \tau_i + E_t / 60.0$, hour angle $\omega = 15^\circ(\tau_{\text{true}} - 12.0)$:
+   $$\cos(\text{SZA}) = \sin\phi\sin\delta_\odot + \cos\phi\cos\delta_\odot\cos\omega$$
+   Assign canonical regime `dn_flag = 'D'` if $\text{SZA} < 85.0^\circ$ else `'N'`. This guarantees identical physical Day/Night labeling across `ML`, `SP`, and `NRT` regardless of polar seasons or `NRT` ascending/descending node artifacts.
+
+#### 5.1.2 Pixel Area, Scan/Track, and VZA Recovery
+* **MODIS from `sample` ($s \in [0, 1353]$, $R_E = 6371.0\,\text{km}$, $H = 705.0\,\text{km}$, $\alpha_{\max} = 55.0^\circ$, $\Delta\alpha_0 = 1.0/705.0$):**
+  $$\alpha(s) = (s - 676.5)\,\frac{2\alpha_{\max}}{1353}, \qquad \theta_{\text{VZA}}(s) = \arcsin\!\left(\frac{R_E + H}{R_E}\sin|\alpha(s)|\right)$$
+  $$D(\alpha) = (R_E + H)\cos\alpha - \sqrt{R_E^2 - (R_E + H)^2\sin^2\alpha}$$
+  $$\text{track}(s) = D(\alpha)\,\Delta\alpha_0, \qquad \text{scan}(s) = \frac{D(\alpha)\,\Delta\alpha_0}{\cos\theta_{\text{VZA}}(s)}, \qquad A_i = \text{scan}(s)\,\text{track}(s)$$
+  *(Yields $1.00 \times 1.00 = 1.00\,\text{km}^2$ at nadir and $4.84 \times 2.01 = 9.72\,\text{km}^2$ at swath edge.)*
+* **VIIRS I-band from `sample` ($s \in [0, 6399]$, $H = 824.0\,\text{km}$):**
+  Map `sample` monotonically to scan angle $|\alpha| \in [0^\circ, 56.06^\circ]$ across the onboard `3:1` ($|\alpha| \le 31.59^\circ$), `2:1` ($31.59^\circ\text{–}44.68^\circ$), and `1:1` ($44.68^\circ\text{–}56.06^\circ$) aggregation zones, yielding $\theta_{\text{VZA}} = \arcsin\big(\frac{R_E+H}{R_E}\sin|\alpha|\big)$ and pixel area $A_i \in [0.141, 0.620]\,\text{km}^2$ (using `Pixarea` directly when supplied by `Vxx14IMGML`).
+* **From `scan_km, track_km` (when `sample` is absent in Portolan/FIRMS API):**
+  $A_i = \text{clip}(\text{scan}_i \times \text{track}_i,\; 0.12,\; 12.0)$ and recover $\theta_{\text{VZA}}$ via piecewise-linear monotone interpolation (`np.interp`): MODIS knots `[(1.00, 0.0), (1.35, 20.0), (2.25, 35.0), (4.20, 50.0), (9.65, 65.0)]`; VIIRS knots `[(0.141, 0.0), (0.180, 20.0), (0.280, 35.0), (0.430, 50.0), (0.620, 65.0)]`.
+
+#### 5.1.3 Intra-Pass Bow-Tie Overlap & Connected-Component Clustering
+Partition detections by `(platform, pass_id)` where sorted consecutive detections > `5 minutes` apart start a new pass. Convert `(lat, lon)` to 3D ECEF chords (`R_E = 6371.0 km`) and query neighbor pairs within radius via `scipy.spatial.cKDTree`:
+1. **MODIS Bow-Tie Weight ($A_i > 1.5\,\text{km}^2$):** Connect pixels $i, j$ in the same pass if chord distance $d_{ij} < 0.7 \cdot \frac{\text{track}_i + \text{track}_j}{2}$. Set $\omega^{\text{bt}}_i = \frac{1.0}{1.0 + \text{deg}_{\text{bt}}(i)}$ (if two $40\,\text{MW}$ off-nadir edge pixels overlap, each gets weight $0.5$, conserving $40\,\text{MW}$). For VIIRS or MODIS $A_i \le 1.5\,\text{km}^2$, $\omega^{\text{bt}}_i = 1.0$.
+2. **Physical Cluster Components:** Connect pixels $i, j$ in the same pass if $d_{ij} \le 1.4 \cdot \max(\sqrt{A_i}, \sqrt{A_j})$. Run `csgraph.connected_components` to assign `event_cluster_id`.
+3. **SAMA & Static Gas-Flare Hygiene:**
+   * Drop `type_raw IN (1, 3)` and VIIRS `dn_flag == 'N'` low-confidence (`conf_raw == 'l'` or `conf_num < 30`) inside SAMA (`-110 <= lon <= 11` and `-55 <= lat <= 7`).
+   * Group detections into **`H3 Resolution 8`** micro-cells $m$ ($\sim 0.74\,\text{km}^2$, large enough to absorb MODIS off-nadir geolocation jitter). Compute distinct active years $Y_m$, mean active days/year $\bar{D}_m$, and day/night symmetry $R^{\text{DN}}_m = \frac{\min(n_{\text{D}}, n_{\text{N}})}{\max(n_{\text{D}}, n_{\text{N}}) + 1}$. Set `is_static_industrial = True` if `type_raw == 2` OR ($Y_m \ge 3$ AND $\bar{D}_m \ge 15.0$ AND $R^{\text{DN}}_m > 0.30$).
+4. **Saturation Classification:**
+   * `i4_m13_fallback = 1` when `sensor_family == 'VIIRS'` and `t_mir_k >= 366.0` and `frp_mw > 0.0` (M13 retrieved FRP; multiplies observation noise $\sigma$ by `1.35`).
+   * `sat_flag = 1` (Tobit right-censored) when (`sensor_family == 'MODIS'` and `t_mir_k >= 498.0` and `frp_mw > 0.0`) OR (`sensor_family == 'VIIRS'` and `t_mir_k >= 366.9` and `frp_mw >= 300.0`).
+
+#### 5.1.4 Non-Detection (`Y == 0`) Swath & Cloud Parameters
+On any day $d$ where platform $p$ is operational (`is_operational[p, d] == 1` AND `platform_active_day[p, d] == 1`) with zero biomass detections in cell $g$, regime $\text{DN}$:
+1. **Cloud & Swath Visibility $v_{p,g,d}$:**
+   Join 8-day `Mx14C8Q` (or monthly `Mx14CMQ` fallback) cloud grid on `(0.25deg bin, year, period)`:
+   $$v_{p,g,d} = p_{\text{swath}, p}(|\phi_g|, d) \cdot \text{clip}\!\Big(1.0 - f_{\text{cloud}} - f_{\text{missing}},\;\; 0.10,\;\; 0.98\Big)$$
+   with $p_{\text{swath}, \text{VIIRS}} = 0.99$ and $p_{\text{swath}, \text{MODIS}} = \text{clip}(0.85 + 0.15\frac{|\phi_g|}{30.0}, 0.85, 1.00) \times (0.96 \text{ if } d \ge \text{2022-01-01})$.
+2. **Expected Pass Geometry & Drift Solar Hour:**
+   * MODIS: $\bar{A}_{\text{avg}} = 2.35\,\text{km}^2$, $\bar{\theta}_{\text{avg}} = 35.0^\circ$. VIIRS: $\bar{A}_{\text{avg}} = 0.23\,\text{km}^2$, $\bar{\theta}_{\text{avg}} = 28.0^\circ$.
+   * Expected solar hour $\bar{\tau}_{p,d,\text{DN}}$: Terra drifts linearly from `10.5 -> 8.75` (`2022-01-01 .. 2026-11-14`), Aqua from `13.5 -> 15.60` (`+12.0 mod 24` for Night); VIIRS platforms fixed at `13.5` Day / `1.5` Night.
 
 ---
 
-## 3. Exact Calibration Estimators (`2012-01-20` to `2021-12-31`, Module 2)
+### 5.2 Pre-Drift Observation Operators (`2012-01-20` to `2021-12-31`)
 
-### 3.1 Behavioral Pyromes (`K = 7` GMM, Coordinate-Free)
-For each hexagon with $\ge 20$ active pass-days during `2012–2021`, compute strictly non-coordinate behavioral features:
-1. `log_med_cluster_frp`: $\ln(\text{median}(\text{cluster\_frp\_mw}) + 1.0)$
-2. `night_day_share`: $\frac{\sum \text{FRP}_{\text{night}}}{\sum \text{FRP}_{\text{day}} + \sum \text{FRP}_{\text{night}} + 1.0}$
-3. `seasonal_concentration`: circular resultant length $R = \sqrt{(\frac{1}{W}\sum w_k \cos\theta_k)^2 + (\frac{1}{W}\sum w_k \sin\theta_k)^2}$ over month angle $\theta_k = \frac{2\pi(m_k - 1)}{12}$ weighted by FRP
-4. `interannual_cv`: std/mean of annual active-day counts across `2012–2021`
-5. `mean_cluster_pixels`: mean pixels per VIIRS cluster
-
-Standardize via `StandardScaler`, fit `GaussianMixture(n_components=7, covariance_type='full', reg_covar=1e-4, random_state=42)`. Assign hexagons with `< 20` active days to the nearest pyrome centroid in feature space (or modal pyrome of their `country_iso` if `< 3` active days).
-
-### 3.2 Detection Limits $F_{\min}$ & Exact Log-Normal Survival ($\psi^{\text{CNT}}, \psi^{\text{FRP}}$)
-1. **Detection Threshold Function:**
-   $$F_{\min, \text{MODIS}}(A, \text{DN}) = (\alpha_{M,\text{DN}} + \beta_{M,\text{DN}}\,A), \qquad F_{\min, \text{VIIRS}}(A, \text{DN}) = (\alpha_{V,\text{DN}} + \beta_{V,\text{DN}}\,A)$$
-   Physical anchors from Sofiev & Kouznetsov (2026):
-   * MODIS Night: $\alpha = 1.5,\,\beta = 2.2$ ($3.7\,\text{MW}$ at $A=1.0\,\text{km}^2$, $\sim 22.6\,\text{MW}$ at $A=9.6\,\text{km}^2$)
-   * MODIS Day: $\alpha = 2.5,\,\beta = 3.9$ ($\sim 6.4\,\text{MW}$ nadir to $\sim 40\,\text{MW}$ edge)
-   * VIIRS Night: $\alpha = 0.25,\,\beta = 1.8$ ($\sim 0.50\,\text{MW}$ nadir to $\sim 1.37\,\text{MW}$ edge)
-   * VIIRS Day: $\alpha = 0.40,\,\beta = 3.4$ ($\sim 0.88\,\text{MW}$ nadir to $\sim 2.5\,\text{MW}$ edge)
-2. **Per-Pyrome Cluster Intensity MLE:**
-   Collect clear-sky near-nadir (`VZA < 20 deg`, `cloud_frac < 0.30`) VIIRS cluster FRPs $F \ge F_{\text{ref}} = 0.5\,\text{MW}$ in pyrome $b$. Fit left-truncated Log-Normal parameters $(\mu_{F,b}, \sigma_{F,b})$ via L-BFGS-B maximizing truncated log-likelihood:
-   $$\sum_{j} \left[\ln \phi_{\mathcal{N}}\!\left(\frac{\ln F_j - \mu_{F,b}}{\sigma_{F,b}}\right) - \ln(\sigma_{F,b} F_j) - \ln\!\left(1 - \Phi_{\mathcal{N}}\!\left(\frac{\ln F_{\text{ref}} - \mu_{F,b}}{\sigma_{F,b}}\right)\right)\right]$$
-3. **Closed-Form Survival Fractions:**
+1. **Coordinate-Free Behavioral Pyromes (`K=7` GMM):**
+   For each hexagon with $\ge 20$ active pass-days in `2012–2021`, compute strictly non-coordinate behavioral features: `[log(median_cluster_frp + 1), night_frp_share, seasonal_circular_concentration, interannual_cv, mean_cluster_pixels]`. Fit `GaussianMixture(n_components=7, covariance_type='full', reg_covar=1e-4, random_state=42)` over standardized features and assign every active cell to `pyrome_id in 0..6`.
+2. **Calibrated Confidence Reliability ($w_i \in [0.15, 1.0]$):**
+   Bin 2012–2021 detections by `(sensor_family, dn_flag, conf_num)` and compute empirical corroboration rate (another overpass/day within $\pm 1$ day and 2 km). Fit `IsotonicRegression(y_min=0.15, y_max=1.0)` mapping raw confidence to calibrated reliability $w_i$.
+3. **Physical Detection Limits & Analytical Survival Integrals ($\psi^{\text{CNT}}, \psi^{\text{FRP}}$):**
+   $$F_{\min, \text{MODIS}}(A, \text{DN}) = \alpha_{M,\text{DN}} + \beta_{M,\text{DN}}\,A, \qquad F_{\min, \text{VIIRS}}(A, \text{DN}) = \alpha_{V,\text{DN}} + \beta_{V,\text{DN}}\,A$$
+   using physical anchors: MODIS Night $(\alpha=1.5, \beta=2.2)$, MODIS Day $(\alpha=2.5, \beta=3.9)$, VIIRS Night $(\alpha=0.25, \beta=1.8)$, VIIRS Day $(\alpha=0.40, \beta=3.4)$.
+   Fit left-truncated Log-Normal cluster FRP distribution $\ln F \sim \mathcal{N}(\mu_{F,b}, \sigma^2_{F,b})$ on clear-sky near-nadir (`VZA < 20°`, `cloud_frac < 0.30`) VIIRS clusters above $F_{\text{ref}} = 0.5\,\text{MW}$ per pyrome $b$.
+   Compute closed-form survival integrals (`scipy.special.ndtr`):
    $$\psi^{\text{CNT}}_{p,b}(A, \text{DN}) = \text{clip}\!\left(1 - \Phi_{\mathcal{N}}\!\left(\frac{\ln F_{\min, p}(A,\text{DN}) - \mu_{F,b}}{\sigma_{F,b}}\right),\;\; 0.02,\;\; 1.0\right)$$
    $$\psi^{\text{FRP}}_{p,b}(A, \text{DN}) = \text{clip}\!\left(\frac{1 - \Phi_{\mathcal{N}}\!\left(\frac{\ln F_{\min, p}(A,\text{DN}) - \mu_{F,b} - \sigma^2_{F,b}}{\sigma_{F,b}}\right)}{1 - \Phi_{\mathcal{N}}\!\left(\frac{\ln F_{\text{ref}} - \mu_{F,b} - \sigma^2_{F,b}}{\sigma_{F,b}}\right)},\;\; 0.05,\;\; 1.0\right)$$
-
-### 3.3 VZA & Quantile Residual Transfer ($\gamma_{\text{MODIS}, b}$)
-On synchronous `2012–2021` pairs ($\Delta t \le 45\,\text{min}$, same `h3_index`, same `DN`, `Aqua > 0` and `SNPP > 0`):
-1. Compute residual log-ratio after removing survival fraction $\psi^{\text{FRP}}$:
-   $$r_k = \ln Y_{\text{SNPP}, k} - \Big(\ln Y_{\text{Aqua}, k} - \ln \psi^{\text{FRP}}_{\text{Aqua}, b}(A_{\text{Aqua},k}, \text{DN}_k) + \ln \psi^{\text{FRP}}_{\text{SNPP}, b}(A_{\text{SNPP},k}, \text{DN}_k)\Big)$$
-   Notice that if $\psi^{\text{FRP}}$ already explained everything perfectly, $r_k \approx 0$. Any systematic residual radiometric/VZA/cluster distortion (such as the boreal +47% cluster difference vs. -20% global offset!) sits cleanly inside $r_k$.
-2. Fit a **Monotonic LightGBM Regressor** (`monotone_constraints=[-1, 0, 0]`, `max_depth=4`, `n_estimators=100`, `min_child_samples=50`) predicting $-\ln \gamma_{\text{MODIS}, b} \approx \mathbb{E}[r \mid \bar{\theta}_{\text{MODIS}}, \text{pyrome\_id}, \text{DN}, \ln Y_{\text{adj}}]$ (and refine per-quantile via 20-knot monotonic Empirical Quantile Mapping per `(pyrome, DN)`). Clip $\ln \gamma_{\text{MODIS}, b} \in [-1.5, +1.5]$, and fix $\ln \gamma_{\text{VIIRS}} \equiv 0.0$.
-
-### 3.4 2-Harmonic Diurnal Curve ($D_{b,m}(\tau)$)
-Fit per pyrome $b$ and season $s \in \{\text{DJF, MAM, JJA, SON}\}$ (pooling adjacent months keeps sample counts high!):
-$$\ln D_{b,s}(\tau) = a_1\cos\!\left(\frac{2\pi\tau}{24}\right) + b_1\sin\!\left(\frac{2\pi\tau}{24}\right) + a_2\cos\!\left(\frac{4\pi\tau}{24}\right) + b_2\sin\!\left(\frac{4\pi\tau}{24}\right) + c_0$$
-Fit `(a1, b1, a2, b2)` by Ridge linear regression (`alpha=10.0`) on paired differences $\ln Y_{\text{sat1}}(\tau_1) - \ln Y_{\text{sat2}}(\tau_2) - \text{sensor\_gain\_diff}$ using:
-* `Terra` (10:30/22:30) vs `Aqua/SNPP` (13:30/01:30) (`2003–2021`)
-* `Aqua` post-2022 drifting hours (`13:30 -> 15:50`) vs stationary `NOAA-20` (`13:30`), keeping cross-sensor $\psi, \gamma$ strictly frozen!
-Compute $c_0$ via 240-point trapezoidal integration so $\frac{1}{24}\int_0^{24} D_{b,s}(\tau)\,d\tau = 1.0000$, and compute $w_{\text{day}, b,s} = \frac{1}{24}\int_6^{18} D_{b,s}(\tau)\,d\tau$, $w_{\text{night}, b,s} = 1 - w_{\text{day}, b,s}$.
-
-### 3.5 Heteroscedastic Observation Variance ($\sigma^2_{p,g,d,\text{DN}}$)
-On `2012–2021` residuals $\hat{\epsilon}_k$ from synchronous pairs (comparing `SNPP` vs `NOAA-20` for VIIRS variance, and `Aqua` vs `SNPP` minus VIIRS variance for MODIS variance), fit OLS predicting $\ln(\hat{\epsilon}^2 + 10^{-3})$ from `[is_modis, vza_deg / 65.0, 1.0 - rel_weight, 1.0 - v_cloud, i4_m13_fallback]`. Clip $\sigma^2 \in [0.025, 2.50]$.
+4. **VZA & Intensity Quantile Calibration ($\gamma_{p,b}$):**
+   Pair synchronous 2012–2021 `Aqua` and near-nadir `SNPP` (`VZA_SNPP < 25°`, $\Delta t \le 45\,\text{min}$, same `h3_index`, same `dn_flag`, both $> 0$). Fit LightGBM regressor (`max_depth=4, n_estimators=100, min_child_samples=50`) on features `[pyrome_id, dn_is_day, mean_vza_modis, mean_area_modis, log_y_modis]` without forcing an artificial VZA sign constraint, followed by a 20-knot **strictly monotonic Empirical Quantile Mapping (EQM)** curve per `(pyrome, dn_flag)` so output quantile curves never cross. Set $\ln \gamma_{\text{VIIRS}} \equiv 0.0$, and clip $\ln \gamma_{\text{MODIS}} \in [-1.5, +1.5]$.
+   Crucial Hurdle conditioning for detected observations ($Y > 0$):
+   Because small isolated fires (`raw_event_count == 1`) already cleared $F_{\min}$ to be detected, model the detected completeness bias factor cleanly via conditional multi-fire adjustment:
+   $$\mu^{\text{gain, det}}_{p,g,d,\text{DN}} = \ln D_{b,s,\text{DN}}(\bar{\tau}_{p,g,d}) + \ln \gamma_{p,b}(\bar{\theta}_p, q) + \ln \psi^{\text{FRP, eff}}_{p,b}(\bar{A}_p, \text{DN}, E_{\text{raw}})$$
+   where $\psi^{\text{FRP, eff}} = \psi^{\text{FRP}}$ when multiple fire clusters coexist (`E_raw >= 2` or broad multi-pixel fronts) and smoothly blends toward $\max(\psi^{\text{FRP}}, 0.65)$ for isolated single-cluster detections—and **NEVER include $\ln v_{p,g,d}$ inside $\mu^{\text{gain, det}}$** (cloud visibility enters strictly inside the zero-detection Hurdle likelihood).
+5. **Intra-Window Diurnal & Orbital-Drift Operator ($D_{b,s,\text{DN}}(\tau)$):**
+   Fit a 2-harmonic Fourier curve per pyrome $b$ and season $s \in \{\text{DJF, MAM, JJA, SON}\}$:
+   $$\ln D_{\text{raw}, b,s}(\tau) = a_1\cos\!\left(\frac{2\pi\tau}{24}\right) + b_1\sin\!\left(\frac{2\pi\tau}{24}\right) + a_2\cos\!\left(\frac{4\pi\tau}{24}\right) + b_2\sin\!\left(\frac{4\pi\tau}{24}\right)$$
+   Fit $(a_1, b_1, a_2, b_2)$ via Ridge regression (`alpha=10.0`) on log-FRP differences between `Terra` vs `Aqua/SNPP` (`2003–2021`) plus `Aqua` post-2022 drifting hours vs stationary `NOAA-20` (updating *only* diurnal coefficients while keeping cross-sensor $\psi, \gamma$ frozen).
+   Normalize **independently within each 12-hour half-day window** so $\Phi_{\text{Day}}$ and $\Phi_{\text{Night}}$ represent true mean Daytime (`06:00–18:00`) and Nighttime (`18:00–06:00`) MW flux:
+   $$c_{0,\text{Day}} = -\ln\!\left(\frac{1}{12}\int_6^{18} D_{\text{raw}, b,s}(\tau)\,d\tau\right), \qquad c_{0,\text{Night}} = -\ln\!\left(\frac{1}{12}\int_{18}^{30} D_{\text{raw}, b,s}(\tau \bmod 24)\,d\tau\right)$$
+   Then $D_{b,s,\text{DN}}(\tau) = \exp(\ln D_{\text{raw}, b,s}(\tau) + c_{0,\text{DN}})$ has exact unit mean over its 12-hour window, preserving physical `night_day_ratio = Phi_Night / Phi_Day` and making exact 24-hour mean flux $\Phi_{24\text{h}} = 0.5(\Phi_{\text{Day}} + \Phi_{\text{Night}})$.
+6. **Heteroscedastic Observation Variance ($\sigma^2_{p,g,d,\text{DN}}$):**
+   Fit OLS on `2012–2021` squared calibration pair residuals predicting $\ln(\hat{\epsilon}^2 + 10^{-3})$ from `[is_modis, vza_deg / 65.0, 1.0 - w_mean, 1.0 - v_cloud, i4_m13_fallback]`, clipped to $[0.025, 2.50]$.
+7. **Active Burning Footprint Transfer ($g_{\text{area}, b}$):**
+   Fit a quantile gradient-boosted/ridge curve on `2012–2021` VIIRS clusters mapping $(\ln \Phi, \text{night\_day\_ratio}, b) \mapsto \widehat{A}^{\text{burn}}_{g,d}$ (`km²`, bounded cleanly by `A_g`).
 
 ---
 
-## 4. Exact Prior Estimators, Derivatives & GPU Solvers (Module 3)
+### 5.3 Space × Time × Day-Night State-Space Model & Exact Derivatives (`torch.float64`)
 
-### 4.1 Deterministic Prior Estimators (Zero Hardcoded Magic Numbers)
-Compute from `2012–2021` VIIRS data per pyrome $b$ and active cell $g$:
-1. $\bar{F}_{\text{event}, b}$: Median clear-sky nadir VIIRS cluster FRP in pyrome $b$ (`clip >= 1.0 MW`).
-2. $\mu_{g,m,\text{DN}}$ (Empirical Bayes cell-month baseline):
-   * Compute full-day mean log-flux across `2012–2021` VIIRS in `(g, m, DN)`, treating non-detection clear days as $z_{\min} = \ln(0.05) = -2.995732$:
-     $$\bar{y}_{g,m,\text{DN}} = \frac{\sum_{\text{active}} \ln(\Phi_{\text{viirs}} + 0.05) + n_{\text{clear\_zero}} \cdot z_{\min}}{n_{\text{active}} + n_{\text{clear\_zero}}}$$
-   * Shrink toward pyrome-month mean $\bar{\mu}_{b,m,\text{DN}}$:
-     $$\mu_{g,m,\text{DN}} = \frac{n_{\text{obs}, g,m}\,\bar{y}_{g,m,\text{DN}} + 5.0\,\bar{\mu}_{b,m,\text{DN}}}{n_{\text{obs}, g,m} + 5.0}$$
-3. $\rho_b, \sigma_{\text{proc}, b}$: Regress $(y_{g,d,\text{DN}} - \mu_{g,m,\text{DN}})$ on $(y_{g,d-1,\text{DN}} - \mu_{g,m,\text{DN}})$ across consecutive active VIIRS cell-days (`2012–2021`) via OLS $\implies \hat{\rho}_b = \text{clip}(\text{slope},\; 0.25,\; 0.90)$, $\hat{\sigma}_{\text{proc}, b} = \text{clip}(\text{residual\_std},\; 0.25,\; 1.50)$.
-4. $\lambda_{0, b}$: Estimate scalar in `[0.1, 5.0]` minimizing discrepancy between empirical zero-detection probability on active pyrome cell-months and mean predicted $P(D=0 \mid \bar{\Phi}_{b,m})$ via `scipy.optimize.minimize_scalar`.
-5. Day–Night Coupling $(\beta_{\text{dn},b}, \eta_{\text{dn},b})$: OLS slope of Night anomaly vs Day anomaly on active `2012–2021` pairs; $\eta_{\text{dn},b} = \text{clip}(R^2_{\text{dn}} \cdot 0.30,\; 0.05,\; 0.30)$.
+Let $z_t \in [-8.0, 14.0]$ denote $z_{g, t, \text{DN}} = \ln \Phi_{g, t, \text{DN}}$ (with $\Phi = e^z$ uniformly across all likelihoods and post-processing, and dormant baseline $z_{\min} = \ln(0.01) = -4.605170$).
 
-### 4.2 Exact Likelihood Equations & Positive-Definite Hessian Guards
-Let $z \in \mathbb{R}$ (`float64`), $\mu = \mu^{\text{gain}}_{p,g,d,\text{DN}}$, $\tau_2 = 1/\sigma^2$, $\tau_1 = 1/\sigma$:
-1. **Case A (`Y > 0` and `sat_flag == 0`):**
+#### 5.3.1 Prior Parameter Estimators (Deterministic from 2012–2021 VIIRS)
+* $\bar{F}_{\text{event}, b}$: Median clear-sky nadir VIIRS cluster FRP in pyrome $b$ (`>= 1.0 MW`).
+* $\mu_{g,m,\text{DN}}$: Empirical Bayes shrinkage of cell-month log-flux (treating clear non-detection days as $z_{\min}$) toward pyrome-month mean $\bar{\mu}_{b,m,\text{DN}}$ with shrinkage weight $5.0$:
+  $$\mu_{g,m,\text{DN}} = \frac{n_{g,m}\,\bar{y}_{g,m,\text{DN}} + 5.0\,\bar{\mu}_{b,m,\text{DN}}}{n_{g,m} + 5.0}$$
+* $\rho_b, \sigma_{\text{proc}, b}$: Lag-1 AR(1) OLS slope and residual std on consecutive active VIIRS cell-days (`rho_b in [0.25, 0.90]`, `sigma_proc_b in [0.25, 1.50]`).
+* $\lambda_{0, b}$: Scalar intensity rate in $[0.1, 5.0]$ minimizing zero-detection rate discrepancy via `scipy.optimize.minimize_scalar`.
+* $(\beta_{\text{dn},b}, \eta_{\text{dn},b})$: OLS slope and variance ratio between Day and Night anomalies ($\eta_{\text{dn},b} \in [0.05, 0.30]$).
+
+#### 5.3.2 Exact Likelihood Terms, Analytical Gradients & Convexity-Guarded Hessians
+For each operational platform pass $(p, g, t, \text{DN})$ with `is_operational[p, t] == 1` and `platform_active_day[p, t] == 1`:
+Let $\mu = \mu^{\text{gain, det}}_{p,g,t,\text{DN}}$, $\tau_2 = 1/\sigma^2$, $\tau_1 = 1/\sigma$.
+
+1. **Case A — Valid Unsaturated Detection ($Y > 0$, `sat_flag == 0`):**
+   $$r = (z + \mu) - \ln Y, \qquad \ell_{\text{obs}} = \frac{1}{2}\tau_2 r^2, \qquad g_{\text{obs}} = \tau_2 r, \qquad h_{\text{obs}} = \tau_2$$
+2. **Case B — Right-Censored Saturation Detection ($Y > 0$, `sat_flag == 1`, Tobit):**
+   Let $w = \tau_1\big((z + \mu) - \ln Y\big)$. For $w \ge -30$:
+   $$\ln\Phi(w) = \text{log\_ndtr}(w), \qquad \lambda(w) = \exp\!\left(-0.5 w^2 - 0.5\ln(2\pi) - \ln\Phi(w)\right)$$
+   For $w < -30$ (exact asymptotic expansion avoiding $\log 0$):
+   $$-\ln\Phi(w) \approx 0.5 w^2 + \ln(-w) + 0.5\ln(2\pi), \qquad \lambda(w) \approx -w - \frac{1}{w}$$
+   $$\ell_{\text{sat}} = -\ln\Phi(w), \qquad g_{\text{sat}} = -\tau_1\,\lambda(w), \qquad h_{\text{sat}} = \tau_2\,\lambda(w)\big(w + \lambda(w)\big) > 0$$
+3. **Case C — Non-Detection ($Y == 0$, Hurdle Poisson-Cloud Mixture):**
+   Let $k = \frac{\lambda_{0,b}\,\psi^{\text{CNT}}_{p,b}(\bar{A}_{\text{avg}}, \text{DN})}{\bar{F}_{\text{event}, b}} > 0$, $\Lambda = \text{clip}(k\,e^z,\; 10^{-12},\; 80.0)$, $e^{-\Lambda} = \exp(-\Lambda)$, $q = (1 - v) + v e^{-\Lambda}$, and posterior fire-presence weight $r = \frac{v e^{-\Lambda}}{q} \in (0, 1]$:
+   $$\ell_{\text{miss}} = -\ln q, \qquad g_{\text{miss}} = \frac{\partial \ell_{\text{miss}}}{\partial z} = r\,\Lambda$$
+   Differentiating $r\,\Lambda$ once more with $\frac{\partial r}{\partial z} = -r(1 - r)\Lambda$:
+   $$\ell''_{\text{miss}} = r\,\Lambda\,\big[1 - \Lambda(1 - r)\big]$$
+   **Convexity Guard (SPD Guarantee):** Because $(1 - v) + v e^{-\Lambda}$ exhibits minor negative curvature when $v < 1$ and $\Lambda \in (1, 4)$, evaluate the exact gradient $g_{\text{miss}} = r\,\Lambda$ while applying the positive Gauss-Newton projection:
+   $$h_{\text{miss}} = \max\!\Big(0.0,\; r\,\Lambda\,\big[1.0 - \Lambda(1.0 - r)\big]\Big)$$
+   This preserves the exact stationary point $\nabla J(z^*) = 0$ while guaranteeing a Symmetric Positive Definite Hessian ($H \succ 0$) on every Newton iteration.
+
+#### 5.3.3 Tridiagonal Temporal, Spatial, and Day-Night Coupling Prior
+Let $\delta_t = z_t - \mu_t$, $\omega_p = 1/\sigma^2_{\text{proc}, b}$, $\alpha_s = 0.10$:
+* **Temporal AR(1):**
+  $$\ell_{\text{time}} = \frac{\omega_p}{2}\left[(1 - \rho^2)\delta_0^2 + \sum_{t=1}^{T-1}(\delta_t - \rho\,\delta_{t-1})^2\right]$$
+  yielding tridiagonal main diagonal $a_0 = a_{T-1} = \omega_p$, $a_t = (1 + \rho^2)\omega_p$ ($1 \le t \le T-2$), and sub/super-diagonal $b_t = -\rho\,\omega_p$.
+* **Spatial 1-Ring Coupling (Held Constant Per Color Sweep):**
+  $$\Delta \ell_{\text{sp}} = \frac{\alpha_s\,\omega_p}{2}\sum_{g' \in \mathcal{N}(g)} (z_t - z_{g', t})^2 \implies \Delta g_t = \alpha_s\omega_p\big(|\mathcal{N}(g)|z_t - \sum z_{g', t}\big), \quad \Delta a_t = \alpha_s\omega_p|\mathcal{N}(g)|$$
+* **Day–Night Coupling (Held Constant Per Half-Day Sweep):**
+  $$\Delta \ell_{\text{dn}} = \frac{\eta_{\text{dn}}\omega_p}{2}\big(\delta_t - \beta_{\text{dn}}\delta_{\text{opp}, t}\big)^2 \implies \Delta g_t = \eta_{\text{dn}}\omega_p(\delta_t - \beta_{\text{dn}}\delta_{\text{opp}, t}), \quad \Delta a_t = \eta_{\text{dn}}\omega_p$$
+Floor final main diagonal safely with $a_t = \max(a_t, 10^{-6})$.
+
+#### 5.3.4 Fused `float64` Thomas $LDL^\top$, Armijo Line Search, Takahashi & Exact Joint Sampling
+For each active chunk of size $B = 1000$ across $T = 9510$ days:
+1. Run `6` outer sweeps over `color in (0, 1, 2)` and `dn in ('D', 'N')`.
+2. Inside each `(color, dn)` block, run up to `15` Newton iterations:
+   * Factorize $H = L D L^\top$: $d_0 = a_0$; for $t = 0\dots T-2$: $l_t = b_t / d_t$, $d_{t+1} = \max(a_{t+1} - l_t b_t,\; 10^{-7})$.
+   * Solve $L D L^\top \Delta z = g$ by forward & backward substitution.
+   * Try Armijo backtracking steps $\alpha \in \{1.0, 0.5, 0.25, 0.125, 0.0625\}$ updating $z_{\text{new}} = \text{clip}(z - \alpha\,\Delta z, -8.0, 14.0)$ until $J(z_{\text{new}}) \le J(z) - 10^{-4}\alpha\sum g\,\Delta z$. Exit early if $\|\alpha\,\Delta z\|_\infty < 10^{-4}$.
+3. **Takahashi Exact Posterior Marginals:**
+   $\Sigma_{T-1, T-1} = 1 / d_{T-1}$; for $t = T-2\dots 0$: $\Sigma_{t, t+1} = -l_t \Sigma_{t+1, t+1}$, $\Sigma_{t, t} = (1/d_t) - l_t \Sigma_{t, t+1}$.
+4. **Exact Joint Cholesky Trajectory Sampling ($M = 200$):**
+   Draw $\varepsilon \sim \mathcal{N}(0, 1)$ of shape `(B_sub, T, 200)`. Solve $L^\top u = D^{-1/2}\varepsilon$:
+   $u_{T-1} = \varepsilon_{T-1} / \sqrt{d_{T-1}}$; for $t = T-2\dots 0$: $u_t = \varepsilon_t / \sqrt{d_t} - l_t u_{t+1}$.
+   Compute $z^{(m)} = \text{clip}(\hat{z} + u^{(m)}, -8.0, 14.0)$, transform $\Phi^{(m)}_{g,t,\text{DN}} = \exp(z^{(m)})$, integrate 24h flux $\Phi^{(m)}_{g,t} = 0.5(\Phi^{(m)}_{g,t,\text{Day}} + \Phi^{(m)}_{g,t,\text{Night}})$, $\text{FRE}^{(m)}_{g,t} = 0.0864\,\Phi^{(m)}_{g,t}$ (`TJ/day`), and aggregate across month indices to extract `q05, q50, q95, mean` across the 200 trajectories.
+5. **GPU Execution Kernel (`cuda_kernels.py`):** Implement the exact Thomas, Takahashi, and Cholesky loops inside a single-launch `torch.float64` CUDA C++ kernel (`load_inline`, one thread per hexagon) whenever CUDA is available, verified bit-for-bit (`< 1e-10`) against the pure PyTorch `thomas_takahashi.py` CPU reference.
+6. **Fixed-Lag Rolling Assimilation (`run_fixed_lag_update(window_days=14)`):** Solves exclusively over `[t_start, T-1]` while anchoring `t_start - 1` via the AR(1) prior to the saved state.
+
+### 5.4 Split Conformal Calibration (`CQR`), Attribution & Products
+
+1. **Multiplicative Log-Space Split Conformal Calibration (`conformal.py`):**
+   * Compute **MODIS-only** nonconformity scores on held-out `2018–2020` VIIRS-masked monthly tiles comparing `(q05_raw, q50_raw, q95_raw)` against full multi-sensor reference $\Phi_{\text{ref}}$:
+     $$s_j = \max\!\left(\frac{\ln(q_{95,\text{raw}, j}+1) - \ln(q_{05,\text{raw}, j}+1)}{2},\; 0.05\right), \qquad r_j = \frac{|\ln(\Phi_{\text{ref}, j}+1) - \ln(q_{50,\text{raw}, j}+1)|}{s_j}$$
+     Compute $\hat{c}^{\text{modis}}_{0.90, b} = \text{Quantile}_{\lceil(n_b+1)\cdot 0.90\rceil / n_b}(\{r_j\}) \in [0.85, 3.5]$.
+   * Compute **Multi-sensor** conformal multipliers $\hat{c}^{\text{multi}}_{0.90, b}$ identically using leave-one-VIIRS-platform-out (`SNPP` vs `NOAA-20`) runs on `2018–2021`.
+   * Rescale outputs:
+     $$q_{05,\text{cal}} = \max\!\Big(0,\; \exp(\ln(q_{50}+1) - \hat{c}\,s) - 1\Big), \qquad q_{95,\text{cal}} = \exp(\ln(q_{50}+1) + \hat{c}\,s) - 1$$
+2. **Diagnostic Flags:**
+   * `quality_flag = 'ABSTAIN_LOW_EVIDENCE'` if $\ge 5$ consecutive days in the month have `mean_cloud_frac > 0.85` AND zero detections across the cell and its 1-ring neighbors.
+   * `attribution_flag`: `'REAL_FIRE_CHANGE'` (raw & harmonized changes agree beyond conformal intervals), `'SENSOR_ARTIFACT_CORRECTED'` (raw changed artificially across sensor transition while harmonized CI spans zero step change), or `'AMBIGUOUS_OVERLAPPING_CI'`.
+   * Monthly calendar indices relative to `2003–2020` climatology: `hist_median_2003_2020`, `anomaly_ratio = phi_q50 / max(hist_median_2003_2020, 0.5)`, `anomaly_zscore`, `climatology_pctile`.
+3. **Three Final Complementary Products (`export_duckdb.py`):**
+   * **Product 1 (`obs_harmonized_provenance.parquet`):** Untouched raw sensor fields (`platform`, `data_tier`, `acq_date`, `acq_hhmm`, `frp_mw`, `t_mir_k`, `t_tir_k`, `scan_km`, `track_km`, `conf_raw`, `type_raw`, `ingest_ts`) + derived diagnostics (`h3_index`, `sza_deg`, `solar_hour`, `dn_flag`, `pixel_area_km2`, `vza_deg`, `is_static_industrial`, `is_sama_filtered`, `bowtie_weight`, `reliability_prob`, `event_cluster_id`, `forward_gain_c`, `obs_sigma`).
+   * **Product 2 (`state_reconstructed_monthly.parquet` dense + `state_reconstructed_daily.parquet` sparse where `phi_q50_mw > 0.25` OR within $\pm 3$ days of detection OR spotlight ROI):** `h3_index`, `country_iso`, `pyrome_id`, `year`, `month`, raw unharmonized baselines (`raw_count_sum`, `raw_frp_sum_mw`, `raw_clustered_events`), reconstructed states (`phi_day_mw`, `phi_night_mw`, `phi_q05_mw`, `phi_q50_mw`, `phi_q95_mw`, `phi_mean_mw`, `phi_flux_mw_km2`, `fre_tj_q50`, `energy_equiv_events_q50`, `hurdle_adj_events`, `est_active_area_km2`, `night_day_ratio`), and calendar indices.
+   * **Product 3 (`uncertainty_diagnostics.parquet`, 1-to-1 with Product 2):** `conformal_c_factor`, `rel_uncertainty_width`, `measured_fraction`, `inferred_fraction`, `active_platforms_bitmask`, `mean_cloud_frac`, `has_nrt_gapfill`, `attribution_flag`, `quality_flag`, `revision_count`.
+
+---
+
+## 6. Complete Data Acquisition and Processing Pipeline (Environment 1 -> Environment 2)
+
+1. **Primary Historical Active Fire Ingestion (`download_data.py`):**
+   * Connect to `fuoco.geog.umd.edu` (`fire` / `burnt`, attempting SFTP first, FTP fallback) to stream monthly `MCD14ML` (`.txt.gz` space-delimited) and `VNP14IMGML`, `VJ114IMGML`, `VJ214IMGML` (`.csv.gz`) one month at a time into `/tmp`, deleting temp files immediately.
+   * If `fuoco.geog.umd.edu` is unreachable, execute DuckDB `httpfs` spatial-pruned extraction directly from the **Source Cooperative NASA FIRMS Portolan GeoParquet 2.0 mirror** (`https://data.source.coop/portolan-mirrors/firms-catalog/detections/year=<YYYY>/detections.parquet`, partitioned 2000–present with Hilbert spatial row-group ordering).
+   * Fetch trailing 2026 `*_NRT` detections (`MODIS_NRT`, `VIIRS_SNPP_NRT`, `VIIRS_NOAA20_NRT`, `VIIRS_NOAA21_NRT`) from the latest Science date through `2026-11-14` via NASA FIRMS `/api/data_availability/csv/{MAP_KEY}/ALL` + `/api/area/csv/{MAP_KEY}/{SOURCE}/{bbox}/5/{DATE}` (`DAY_RANGE <= 5` strictly).
+2. **Ancillary Cloud, Burned Area, and Country Boundary Ingestion:**
+   * Fetch Natural Earth `50m` Admin-0 GeoJSON (`https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_50m_admin_0_countries.geojson`) and store geometries for `ARG`, `DZA`, `BRA`, `IDN`, `AUS`, `USA`.
+   * Stream UMD `MOD14C8Q`/`MYD14C8Q` (8-day `0.25°`, falling back to monthly `Mx14CMQ` where absent) and `MCD64CMQ` (`0.25°` monthly burned area) HDF4 files inside Env 1, extract `CloudPix`, `MissingPix`, `LandPix`, `BurnedArea` via `pyhdf`, emit `cloud_visibility_025deg.parquet` (`< 25 MB`) and `burned_area_val_025deg.parquet` (`< 20 MB`), and delete raw HDF files.
+3. **Normalization, Polygon Clipping & Verification (`normalize_dedup.py`):**
+   * Parse heterogeneous source schemas cleanly into canonical types (`country_iso, sensor_family, platform, data_tier, latitude, longitude, acq_date, acq_hhmm, t_mir_k, t_tir_k, scan_km, track_km, sample_idx, pixarea_km2, frp_mw, conf_raw, conf_num, type_raw, version_raw, ingest_ts`).
+   * Clip strictly with Natural Earth Admin-0 polygons (`shapely.contains_xy`).
+   * **Tier Dominance Deduplication:** Drop `NRT` entirely for any `(platform, acq_date)` present in `ML_SCIENCE` or `SP_SCIENCE` (preventing LUT geolocation shift duplicates); resolve any intra-tier exact duplicates on `(platform, acq_date, acq_hhmm, ROUND(latitude, 3), ROUND(longitude, 3))` keeping `tier_rank ASC, ingest_ts DESC`.
+   * Compute `platform_active_day[P, T]` (`>= 5` total detections/day across the 6 countries) and verify continuity: `ARG` Jul–Aug 2026 Chilecito detections present, `SNPP` ends `2026-11-02`, `NOAA-20/21` continue through `2026-11-14`, `DZA` preserves `type=2` static flares.
+
+---
+
+## 7. Complete Testing & Validation Framework (`pytest` — 166+ Required Tests)
+
+All 10 test suites under `tests/` MUST pass 100% with concrete numerical/scientific assertions:
+
+1. **`tests/test_01_ingestion_schema.py` (18 tests):** Multi-schema parsing (`MCD14ML` space `.txt`, `Vxx14IMGML` CSV, FIRMS API/Portolan), satellite alias normalization, mixed confidence parsing, missing `type -> -1`, `(platform, acq_date)` Science-tier dominance removing shifted NRT duplicates, polygon clipping excluding Bolivia/Tunisia/Chile neighbors, `(hhmm // 100) + (hhmm % 100)/60` base-60 time parsing, and SZA Day/Night assignment replacing orbit-node NRT errors at high latitudes.
+2. **`tests/test_02_geometry_masking.py` (18 tests):** Exact spherical `Sample -> scan, track, VZA` geometry (checking nadir `1.00 km²` and edge `~9.7 km²` MODIS), monotone spline VZA inversion, MODIS bow-tie weight conservation (`2 × 40 MW` overlap -> `40 MW`), SAMA nighttime low-conf filter, `H3-Res8` gas-flare separation absorbing 200 m geolocation jitter while keeping seasonal wildfires, `h3 v3/v4` `int64 <-> str` conversion, and exact H3 **3-coloring validity** (`color[u] != color[v]` across every adjacent edge).
+3. **`tests/test_03_event_clustering.py` (14 tests):** 3×3 contiguous VIIRS cluster -> 1 event, separated fires -> 2 events, same-afternoon `SNPP + N20 + N21` kept as 3 distinct pass rows (never summed), 5-minute pass boundary split, `i4_m13_fallback` vs Tobit `sat_flag` separation.
+4. **`tests/test_04_observation_operators.py` (20 tests):** Detection threshold ordering (`MODIS_day > MODIS_night > VIIRS_night`), analytical survival integrals $\psi \in (0, 1]$ monotonicity, separate 12-hour `Day` (`06–18`) and `Night` (`18–06`) Fourier integral unit-mean checks (`1.0 ± 1e-4`), `ln(v)` strictly absent from detected gain $\mu^{\text{gain, det}}$, monotonic EQM quantile order, heteroscedastic $\sigma^2$ ordering, and coordinate-shift invariance of GMM pyromes.
+5. **`tests/test_05_likelihood_derivatives.py` (22 tests):** Finite-difference gradient & Hessian parity (`< 1e-6`) across Obs, Tobit Saturation (over `w in [-35, +5]` testing asymptotic tail without `NaN`/`Inf`), and Hurdle Zero; Tobit asymmetry; convexity guard (`h_miss >= 0`) inside partial-cloud transition `(v=0.7, Lambda=2.5)`; uniform $\Phi = e^z$ consistency across Case A/B/C; and empirical `platform_active_day` masking out simulated spacecraft safe-mode outages.
+6. **`tests/test_06_gpu_solver_math.py` (20 tests):** `float64` Thomas solver vs. `torch.linalg.solve` (`< 1e-10`); Takahashi diagonal & lag-1 vs. `torch.linalg.inv(H)` (`< 1e-10`); empirical covariance of $10{,}000$ joint Cholesky draws $L^\top u = D^{-1/2}\varepsilon$ matching $H^{-1}$; Armijo strict objective descent; 3-color spatial cloud-gap recovery; CUDA `load_inline` kernel bit-parity (`< 1e-10`) vs PyTorch CPU reference; extreme range `10^-4 .. 10^6 MW` stability.
+7. **`tests/test_07_synthetic_twin_truth.py` (18 tests):** Full 26-year digital twin simulator with known $X_{\text{true}}$ (`Day/Night` contrast, 2002 Aqua, 2012 SNPP, 2018 N20, 2022 drift, 2023 N21, Nov 2026 SNPP end, 50% clouds, bow-tie, gas flares) asserting: 2012 raw jump `> +150%` eliminated (`< ±10%`); 3-satellite inflation eliminated; `night_day_ratio` accurately preserved (`error < 15%`, never collapsing to `1.0`); Nov 2026 cutoff unbiased; post-2022 drift corrected; monthly correlation `r > 0.90`; 5× drought fire spike preserved within `±15%`.
+8. **`tests/test_08_conformal_uncertainty.py` (12 tests):** Split-conformal coverage inside `[1 - alpha - 0.03, 1 - alpha + 0.05]` across $\alpha \in \{0.05, 0.10, 0.20\}$; `q05 <= q50 <= q95` non-negativity; 2005 uncertainty strictly wider than 2024; cloudy uncertainty wider than clear months; `ABSTAIN_LOW_EVIDENCE` trigger; 14-day fixed-lag update matching full batch (`< 1e-3`) across an active fire transition.
+9. **`tests/test_09_validation_diagnostics.py` (12 tests):** Chow & Pettitt break tests catching raw 2012 break (`p < 0.001`) and passing harmonized control (`p > 0.05`); 2019–2021 VIIRS-masked ablation outperforming raw MODIS on CRPS & Spearman $\rho$; `MCD64CMQ` burned-area correlation check; Product 1/2/3 schema & sparse daily export invariants.
+10. **`tests/test_10_webapp_api_scale.py` (12 tests):** FastAPI endpoints return 200 & valid JSON; CSV injection sanitization (`=`, `+`, `-`, `@` prefixed with `'`); empty-bbox safety; DuckDB query latency `< 300 ms`; GPU chunk VRAM (`batch_size = 1000`, `T = 9510`) stays `< 6 GB` per GPU.
+
+---
+
+## 8. Sequential Implementation Plan & Verification Gates
+
+1. **Phase 1 (Hours 0–4 — Env 1 Stager & Ingestion Tests):** Build repo skeleton, `settings.py`, `paths.py`, `build_wheels.sh`, `download_data.py`, `normalize_dedup.py`, and `test_01`. Verify connectivity to `fuoco.geog.umd.edu` / Source Coop Portolan + FIRMS API at Minute 15. Stage clean Parquet (`<= 2.5 GB`) and `.whl` bundle (`<= 80 MB`). **Gate 1: `test_01` passes 100% + coverage audit confirms Chilecito 2026, Nov 2 SNPP cutoff, DZA flares.**
+2. **Phase 2 (Hours 4–10 — Geometry & Clustering):** Implement `h3_utils.py`, `solar_geometry.py`, `preprocess_geometry.py`, `test_02`, `test_03`. **Gate 2: `test_01..test_03` pass 100% on CPU.**
+3. **Phase 3 (Hours 10–14 — Calibration & Derivatives):** Implement `pyromes.py`, `operators.py`, `likelihoods.py`, `priors.py`, `test_04`, `test_05`. **Gate 3: `test_04..test_05` pass 100% on CPU.**
+4. **Phase 4 (Hours 14–17 — Solver, CUDA Kernel, Synthetic Twin & Timing Gate):** Implement `thomas_takahashi.py`, `cuda_kernels.py`, `solver.py`, `synthetic_twin.py`, `test_06`, `test_07`. **Gate 4: `test_01..test_07` pass 100%; single-chunk GPU timing benchmark verified `< 6 GB` VRAM and fast enough to complete all active cells inside `< 1.5` GPU-hours.**
+5. **Phase 5 (Hours 17–21 — Full GPU Execution & Conformal Export):** Run `run_env2_cpu_prep.py` and `run_env2_gpu_solve.py` in Env 2; implement `conformal.py`, `export_duckdb.py`, `test_08`. **Gate 5: `fire_harmonized.duckdb` + 3 Parquet tables (`<= 4 GB`) exported cleanly and `test_08` passes.**
+6. **Phase 6 (Hours 21–24 — Scientific Validation):** Implement `diagnostics.py`, run `run_env2_validate.py` (`test_09`). **Gate 6: All structural break, ablation, `MCD64CMQ`, and spotlight validations pass.**
+7. **Phase 7 (Hours 24–34 — Web Application & Final Audit):** Implement `server.py` + `static/` (`MapLibre GL JS` + `Apache ECharts` interactive ROI map, calendar heatmap with `viridis`/`cividis` ramps and high-uncertainty hatching, historical median anomaly plots, provenance timeline, 6 spotlight presets, CSV export) and `test_10`. **Gate 7: Full `pytest` across all 166+ tests passes 100%, and UI spotlight views verified.**
+
+---
+
+## 9. Agent Behavioral Boundaries
+
+### Must Do
+* Maintain 100% adherence to the 10 Scientific Invariants and the exact equations in Section 5.
+* Maintain strict Environment 1 / 2 / 3 separation (`pyhdf` strictly isolated in Env 1).
+* Perform all tridiagonal/Takahashi/Cholesky algebra in `torch.float64`.
+* Verify every mathematical module with analytical/finite-difference/dense-reference tests before proceeding to the next phase.
+* Report exact empirical test metrics and wall-clock benchmarks honestly.
+
+### Must Not Do
+* Never introduce competing pipelines, alternative fallback UIs, or unrequested side branches.
+* Never put cloud visibility $\ln v$ into detected observation likelihoods (`Case A/B`).
+* Never normalize $D(\tau)$ over 24 hours across `z_Day` and `z_Night` (must normalize independently within 12-hour Day/Night windows).
+* Never write dense `N_active × 9,510` daily rows to disk (always emit sparse episode rows).
+* Never hardcode `/kaggle/...` paths outside `paths.py`, leave placeholder tests, or report unverified code as complete.
+
+---
+
+## 10. Final Deliverables & Acceptance Checklist
+
+The completed repository and execution artifacts must provide:
+1. Reproducible ingestion and wheel scripts (`src/ingest/`, `scripts/run_env1_stage.py`).
+2. Complete offline harmonization engine (`src/geometry/`, `src/calibration/`, `src/engine/`, `scripts/run_env2_*.py`).
+3. `fire_harmonized.duckdb` + 3 indexed Zstd Parquet products (`obs_harmonized_provenance`, `state_reconstructed_monthly` dense & `daily` sparse, `uncertainty_diagnostics`) within `<= 4 GB`.
+4. Validation report (`diagnostics.json` + summary figures) confirming structural continuity, 2019–2021 VIIRS-masked ablation gains, `MCD64CMQ` burned-area correlation, and Chilecito 2026 / Algeria gas flare / Nov 2026 SNPP continuity.
+5. Complete interactive FastAPI + MapLibre + ECharts Burning Activity Calendar Web App (`src/webapp/`).
+6. **100% passing `pytest` run (`>= 166` tests across `test_01..test_10`)**.
+
+
+## Brutally Honest Audit: Was the Previous Specification Truly Everything the AI Needed?
+
+**No.** If you handed the previous specification straight to an autonomous coding agent, it would still hit **8 concrete failure points or missing contracts** where it would either crash on real NASA data or be forced to guess:
+
+1. **Wrong HDF4 Layer Names in `MOD14CMQ` / `MOD14C8Q` (Guaranteed Env 1 Crash):**
+   The previous spec told the agent to read `CloudPix`, `MissingPix`, and `LandPix` from `Mx14CMQ`. Verified directly against the official MODIS Collection 6 Active Fire User's Guide (Table 8), the actual CMG SDS layer names are **`MeanCloudFraction`**, **`CorrFirePix`**, **`CloudCorrFirePix`**, and **`RawFirePix`**. Similarly, `MCD64CMQ` contains **`BurnedArea`**, **`QA`**, **`UnmappedFraction`**, and optionally **`LandCoverDist`** (absent in recent trailing months due to the 1-year `MCD12Q1` lag) on a `720 × 1440` grid centered at `(-179.875°, +89.875°)`. Without these exact layer names and dynamic HDF4 `scale_factor` / `_FillValue` reading, `pyhdf` crashes immediately.
+2. **Missing Trailing-2026 Cloud Data Fallback (`NaN` Propagation in Jul–Nov 2026):**
+   `MOD14CMQ`/`MOD14C8Q` science grids lag real time by ~1–3 months, meaning **August–November 2026** (including the end of CONAE's Chilecito spotlight and the Nov 2, 2026 S-NPP cutoff) will not yet exist in CMG files. Without an explicit climatology fallback (`2012–2025` multi-year mean cloud fraction per `(0.25° cell, month)` tagged with `cloud_source = 'CLIMATOLOGY_FALLBACK'`), joining the cloud table drops or produces `NaN`s for late 2026.
+3. **No Autonomous Link / Directory Discovery Protocol:**
+   You specifically asked for instructions telling the agent how to find data elsewhere if any URL or folder path fails. The previous spec listed paths without instructing the agent how to recursively scan `fuoco.geog.umd.edu` via SFTP/FTP, read the Source Cooperative Portolan STAC `catalog.json`, query NASA Earthdata CMR (`cmr.earthdata.nasa.gov/search/granules.json`) or GeoBoundaries (`geoboundaries.org/api/current/gbOpen/{ISO3}/ADM0/`) as automated mirrors, or validate discovered schemas before ingesting.
+4. **High-Latitude `SZA < 85°` vs. `[06:00, 18:00]` Normalization Mismatch (`Alaska` Bug):**
+   Assigning `dn_flag` by `SZA < 85°` while normalizing `D_Day` over `[06:00, 18:00]` breaks in June/December Alaska (where `SZA < 85°` lasts ~20 hours in summer and ~4 hours in winter). Defining the two latent states strictly by **Local Solar Time Half-Day Windows** (`Day = [06:00, 18:00)`, `Night = [18:00, 06:00)`) while preserving `sza_deg` and raw `dn` in Product 1 keeps the 12-hour diurnal unit-mean integrals and `0.5 * (Phi_Day + Phi_Night)` mathematically exact at all latitudes.
+5. **Five Equations Left in Prose Instead of Formulas:**
+   The previous spec described (a) `psi^{FRP, eff}` blending, (b) `g_{area, b}` training target/features, (c) `hurdle_adj_events` aggregation across same-orbit sensors, (d) exact boolean rules for `attribution_flag`, and (e) `active_platforms_bitmask` bit positions in words instead of exact equations.
+6. **Missing Exact Data-Source Schemas (`Portolan` GeoParquet & `Vxx14IMGML`):**
+   `VNP14IMGML` already includes `Pixarea` (`km²`) directly alongside `YYYYMMDD, HHMM, Sat, Lat, Lon, T_I4, T_I5, Sample, FRP, Conf, Type`. Meanwhile, Source Cooperative's `portolan-mirrors/firms-catalog` stores GeoParquet 2.0 with `geometry` (`ST_Point`), `acq_datetime`, `sensor`, `satellite`, `quality`, `brightness`/`bright_t31`/`bright_ti4`/`bright_ti5`, `scan`, `track`, `frp`, `daynight`, `confidence`, `confidence_pct`, `type`, `_month`, `_hilbert`. Giving the agent all three exact schemas removes all guesswork.
+7. **Missing Backend JSON Contracts, Spotlight Coordinates & UI Specification:**
+   `server.py` and `app.js` require explicit JSON payload keys, error codes, bounding-box limits, and exact coordinates for the 6 spotlight presets so frontend and backend match on the first run.
+8. **Missing `pyproject.toml` Dependency Split & `cuda_kernels.py` CPU/GPU Fallback Contract:**
+   The agent needs explicit `[project.optional-dependencies]` separating Environment 1, Environment 2, and Environment 3, plus a clean `cuda_kernels.py` dispatch rule so CPU tests pass cleanly when `nvcc` is unavailable.
+
+---
+
+## Complete, Self-Contained AI Agent Prompt & Implementation Specification
+
+Copy everything inside the horizontal rules below directly as your prompt / `AGENT_MASTER_SPEC.md` for your coding agent. It transfers 100% of the context, mathematical derivations, exact file schemas, autonomous data-discovery failover protocol, testing framework, and implementation rules cleanly from scratch.
+
+---
+
+# MASTER ENGINEERING HANDOFF SPECIFICATION
+# MODIS–VIIRS Physics-Informed Bayesian Harmonization Engine & Burning Activity Calendar
+
+## 0. Agent Execution Mandate
+You are the lead scientific software engineer implementing a complete, end-to-end Earth Observation active-fire harmonization engine and interactive web application. You have **zero prior context**; every scientific principle, mathematical derivation, file schema, architectural boundary, data source, failover discovery protocol, and acceptance test you need is contained strictly inside this specification.
+
+**Strict Rules:**
+* Implement **one single unified system** obeying this exact specification. Do **not** invent alternative pipelines, fallback UIs, competing models, stub implementations, or unverified assumptions.
+* **Reference Date:** November 14, 2026.
+
+---
+
+## 1. Complete Problem Statement
+
+### 1.1 Origin, Goal, and Core Challenge
+This system solves the **2026 NASA Space Apps Challenge: *"Harmonization of MODIS and VIIRS Hot Spots"*** (authored by Marina Compagnucci, CONAE — The Argentinian Space Agency). Satellite thermal anomaly ("active fire hotspot") observations span over 26 years (November 2000 – November 14, 2026), yet are fractured across sensors whose raw detections cannot be directly compared or combined.
+
+Your mission has two tightly coupled deliverables:
+1. **Scientific Harmonization Engine:** Reconstruct a sensor-independent, uncertainty-quantified, physically consistent 2000–2026 record of terrestrial burning activity combining MODIS and VIIRS observations so that instrument switches no longer induce artificial steps, trends, or duplicate fire counts.
+2. **Interactive Burning Activity Calendar Web Application:** Expose the harmonized dataset in a fast, interactive web application allowing emergency managers, scientists, and land managers to select any Area of Interest (AOI) on a map, view a Year × Month burning activity calendar heatmap, compare current burning against historical medians (`2003–2020`), examine trends, anomalies, and uncertainty bands, inspect spotlight wildfire case studies (notably CONAE's **July–August 2026 wildfire activation in Chilecito, La Rioja, Argentina**, `lat ~ -29.16, lon ~ -67.50`), and download sanitized CSV analytics.
+
+### 1.2 Why Existing Implementations and Naive Merging Fail
+Raw hotspot records come from two fundamentally different instrument families aboard five polar-orbiting spacecraft:
+* **MODIS (`1 km` nadir resolution, `3.96 μm` Ch 21/22 & `11 μm` Ch 31):** **Terra** (`2000-11-01` to present) and **Aqua** (`2002-07-04` to present).
+* **VIIRS (`375 m` I-band nadir resolution, `3.74 μm` I4 & `11.45 μm` I5):** **Suomi-NPP / S-NPP** (`2012-01-20` to **`2026-11-02`**, when FIRMS ceased S-NPP delivery), **NOAA-20** (`2018-04-01` to present), and **NOAA-21** (`2023-03-01` / `2024-01-17` to present).
+
+Naive concatenation, raw averaging, or global linear scaling fails for seven physical and engineering reasons:
+1. **Resolution & Sensitivity Step-Jump:** At nadir, a MODIS pixel covers $\sim 1.0\,\text{km}^2$ with a minimum detectable Fire Radiative Power ($F_{\min}$) of `~3.7–6.4 MW`, whereas a VIIRS 375 m pixel covers $\sim 0.141\,\text{km}^2$ (`~7×` finer) and detects fires down to `~0.5–0.9 MW`. Switching from MODIS to VIIRS in 2012 multiplies raw hotspot counts by `3×–10×` even under identical burning.
+2. **Off-Nadir Stretching & Bow-Tie Distortion:** MODIS pixels grow to `~4.84 × 2.01 km ≈ 9.72 km²` at `65°` View Zenith Angle (VZA), where $F_{\min}$ rises to `~22–40 MW` and adjacent 10-line scans overlap up to ~50% ("bow-tie effect"), double-counting edge fire pixels. VIIRS instead uses onboard `3:1 / 2:1 / 1:1` pixel aggregation and deletes redundant bow-tie fill pixels, reaching only `~0.62 km²` at swath edge.
+3. **Spectral Bandpass & Saturation Asymmetry:** Raw brightness temperatures (`brightness`/`T21` vs `bright_ti4`/`T_I4`) measure different wavelengths over different footprint dilutions and cannot be averaged. VIIRS `I4` saturates at `367 K` and relies on co-located `750 m` `M13` (`4.05 μm`) pixels for FRP—splitting single `M13` retrievals across multiple `375 m` pixels or occasionally failing/clipping under extreme fire conditions.
+4. **Same-Orbit Constellation Multiplicity:** `S-NPP`, `NOAA-20`, and `NOAA-21` share the ~13:30 / 01:30 orbital plane ~50 minutes apart. Summing their detections between 2018 and 2026 triples apparent fire counts/FRP compared to 2012–2017 (`S-NPP` alone), and `S-NPP`'s termination on `2026-11-02` induces a sharp drop unless modeled via conditional sensor likelihoods.
+5. **Post-2022 Orbital Drift:** Beginning in 2022, `Terra` (~10:30 AM nominal) and `Aqua` (~1:30 PM nominal) exited controlled station-keeping, drifting progressively toward ~8:45 AM and ~3:30–3:50 PM respectively by late 2026. Diurnal fire-cycle variation across drifting overpass hours masquerades as climate trends unless modeled explicitly in continuous local solar time.
+6. **Clouds, Artifacts, Gas Flares & Processing Tiers:** Tropical clouds obscure >60–70% of passes; nighttime low-confidence VIIRS detections inside the South Atlantic Magnetic Anomaly (SAMA) create false radiation spikes; static oil/gas flares (e.g., Saharan Algeria) and volcanoes contaminate biomass fire counts—complicated because Near Real-Time (`NRT`) data omits the `type` column and determines `daynight` purely by ascending/descending orbit node rather than consistent solar geometry; and NRT geolocation offsets (40–300 m relative to Science `ML` lookup tables) cause duplicate leaks under naive lat/lon deduplication.
+7. **Physical Identifiability Limit:** Orbital mid/thermal infrared FRP alone cannot uniquely invert sub-pixel flame temperature ($T_f$), exact flame area ($A_f$), fuel load, or combustion efficiency. The engine must output strictly identifiable physical quantities ($\Phi$, $\text{FRE}$, estimated burning area, and calibrated event indices) and explicitly quantify uncertainty and low-evidence abstention.
+
+### 1.3 Success and Verification Criteria
+The solution is complete and verified if and only if:
+1. All sensor step jumps (`2002`, `2012`, `2018`, `2023`, `2026-11`) and `2022–2026` drift biases are eliminated on stationary control benchmarks (`p > 0.05` on Chow/Pettitt structural-break tests after harmonization, vs `p < 0.001` raw).
+2. True extreme wildfire episodes (**Chilecito, Argentina Jul–Aug 2026**; **Kabylie, Algeria 2021/2023**; **Black Summer Australia 2019–2020**) are accurately reconstructed while static Saharan flares (**Hassi Messaoud, Algeria**) and SAMA artifacts are isolated.
+3. Uncertainty is empirically valid: 2000–2011 MODIS-only intervals are strictly wider than 2012–2026 multi-sensor intervals; heavy cloud blindness widens bounds and triggers `ABSTAIN_LOW_EVIDENCE`; Split Conformal Calibration achieves $\ge 90\%$ empirical coverage on held-out `2018–2020` VIIRS-masked folds and beats unharmonized MODIS on CRPS and Spearman rank correlation.
+4. Harmonized monthly $\text{FRE}$ correlates more strongly with independent `MCD64CMQ` burned area (`2001–2025`) than unharmonized FIRMS hotspot counts.
+5. All `166+` automated `pytest` tests across `test_01..test_10` pass 100%, output DuckDB + Parquet artifacts fit within `<= 4 GB`, and the FastAPI + DuckDB web app responds in `< 300 ms`.
+
+---
+
+## 2. Selected Technical Approach & Core Scientific Invariants
+
+### 2.1 Theoretical Foundation: Forward-Operator State-Space Bayesian Data Assimilation
+Instead of training one sensor to imitate another, the system separates the **Physical World** from the **Measurement World**:
+* **Spatial & Temporal Support:** Space is partitioned globally into equal-area **Uber H3 Resolution 6** hexagons ($\bar{A} \approx 36.13\,\text{km}^2$). Time runs daily over $T = 9{,}510$ local solar days from `2000-11-01` (`t = 0`) to `2026-11-14` (`t = 9509`), split cleanly into two 12-hour Local Solar Time half-day regimes: **Day (`[06:00, 18:00)`)** and **Night (`[18:00, 06:00)`)**.
+* **Latent Physical State:** Every active hexagon $g$ on solar day $t$ holds two continuous log-flux states representing true cloud-free mean radiative power (MW) during Day and Night:
+  $$z_{g, t, \text{Day}} = \ln \Phi_{g, t, \text{Day}}, \qquad z_{g, t, \text{Night}} = \ln \Phi_{g, t, \text{Night}}$$
+  with uniform forward mapping $\Phi = \exp(z)$ everywhere in likelihoods and trajectory sampling, and dormant background floor $z_{\min} = \ln(0.01) = -4.605170$.
+* **Forward Sensor Observation Operators:** For every operational platform $p$, an actual detection $Y_{p,g,t,\text{DN}} > 0$ satisfies:
+  $$\ln Y_{p,g,t,\text{DN}} = z_{g,t,\text{DN}} + \ln D_{b(g), s(t), \text{DN}}(\bar{\tau}) + \ln \gamma_{p, b}(\bar{\theta}, q) + \ln \psi^{\text{FRP, eff}}_{p,b}(\bar{A}, \text{DN}, E_{\text{raw}}) + \epsilon_{p,g,t,\text{DN}}$$
+  while non-detection (`Y == 0`) on an operational, healthy satellite pass follows a **Cloud-Gated Poisson Hurdle Model**:
+  $$P(D_{p,g,t,\text{DN}} = 0 \mid z_{g,t,\text{DN}}) = (1 - v_{p,g,t}) + v_{p,g,t}\exp\!\left(-\lambda_{0,b}\,\psi^{\text{CNT}}_{p,b}(\bar{A}_{\text{avg}}, \text{DN})\,\frac{\exp(z_{g,t,\text{DN}})}{\bar{F}_{\text{event}, b}}\right)$$
+  Crucially, cloud visibility $v_{p,g,t}$ governs **only** detection probability (`D = 0` vs `D = 1`) and **never** scales detected FRP magnitude (`Y > 0`).
+* **Joint Reconstruction & Uncertainty:** A **Space × Time × Day-Night Gaussian Markov Random Field (GMRF)** MAP-Laplace solver fuses all platforms jointly in `torch.float64` across H3 3-Coloring Gauss-Seidel sweeps using a fused Thomas $LDL^\top$ solver, Takahashi variance recursion, $M=200$ exact joint Cholesky posterior trajectories, and multiplicative log-space **Split Conformal Quantile Rescaling (`CQR`)**.
+
+### 2.2 Ten Non-Negotiable Scientific Invariants
+1. **INV-01 (No Imitation Learning):** Never train `VIIRS -> MODIS` or `MODIS -> VIIRS`.
+2. **INV-02 (Never Sum Same-Orbit Satellites):** `SNPP`, `NOAA-20`, and `NOAA-21` enter as separate conditional likelihood terms within the same half-day window, never summed counts or FRP.
+3. **INV-03 (Pre-Drift Calibration Freeze):** Calibrate all cross-sensor operators strictly on **`2012-01-20` to `2021-12-31`**. Handle 2022–2026 Terra/Aqua drift strictly through diurnal solar-time operator $D(\tau)$.
+4. **INV-04 (Explicit Operational & Outage Masking):** Encode launch/retirement windows (closing `SNPP` on `2026-11-02`) AND automatically mask multi-day spacecraft safe-mode outages (`platform_active_day[p, t]`).
+5. **INV-05 (Separate Physical State from Observation Model):** Never inject cloud multipliers into detected FRP magnitudes.
+6. **INV-06 (No Raw Brightness Averaging):** Never average MODIS `T21`/`T31` with VIIRS `T_I4`/`T_I5`.
+7. **INV-07 (Honest Censoring):** Account for MODIS pixel-area detection threshold $F_{\min}$ on zero-detection days via the Hurdle model so pre-2012 uncertainty widens naturally.
+8. **INV-08 (Static Thermal Anomaly Isolation):** Exclude volcanoes (`type=1`), offshore (`type=3`), SAMA nighttime low-confidence artifacts, and `H3-Res8` persistent industrial flares from biomass fusion while retaining raw records in Product 1.
+9. **INV-09 (Zero Data Destruction):** Export 3 distinct output products separating raw provenance, latent states, and diagnostic uncertainty.
+10. **INV-10 (No Coordinate Leakage):** Pyrome clustering uses strictly behavioral fire features, never latitude or longitude.
+
+### 2.3 Target Benchmark Scope
+While all mathematical equations are 100% coordinate-agnostic, the system executes at **H3 Resolution 6** across **six polygon-clipped countries** covering every major fire regime on Earth while remaining under tight compute/disk limits:
+* `ARG` (Argentina): CONAE Jul–Aug 2026 Chilecito spotlight (`lat ~ -29.16, lon ~ -67.50`), Pampas crop burns, SAMA.
+* `DZA` (Algeria): Kabylie Mediterranean crown fires (`2021`, `2023`) vs. Saharan Hassi Messaoud static gas flares.
+* `BRA` (Brazil): Amazon deforestation + Cerrado savanna 2012–2021 calibration backbone, heavy wet-season clouds, SAMA.
+* `IDN` (Indonesia): Extreme equatorial cloud cover, nighttime peat smoldering, low-evidence abstention stress test.
+* `AUS` (Australia): Northern low-FRP savannas + 2019–2020 Black Summer VIIRS `I4` saturation megafires.
+* `USA` (United States — `CONUS` + `Alaska`): Western megafires, SE prescribed small burns, Alaska boreal clusters.
+
+### 2.4 Limitations and Assumptions (Explicitly Documented)
+* Polar-orbiting satellites sample ~10:30, ~13:30, and drifting ~08:45–15:50 local times; therefore, 24-hour diurnal curve curvature during late afternoon (`16:00–20:00`) relies on 2-harmonic smoothness.
+* Applying `2012–2021` within-pyrome fire cluster intensity shapes backward to `2000–2011` assumes stationarity of the underlying sub-threshold fire-size distribution shape within each behavioral pyrome.
+* Active-fire FRP cannot distinguish fuel consumption or combustion efficiency without auxiliary biomass/fuel models; outputs strictly avoid unidentifiable claims.
+* `run_fixed_lag_update(window_days=14)` provides incremental sliding-window NRT/Science revision capability via callable Python API rather than an always-on 24/7 ingestion daemon.
+
+---
+
+## 3. Project Context, Execution Environments, and Deliverables
+
+### 3.1 Three-Environment Architecture
+1. **Environment 1 (Data & Wheel Stager — Internet ON, CPU, Python 3.12):**
+   * Performs cloud-to-cloud ingestion, HDF4 extraction (`apt-get install -y libhdf4-dev && pip install pyhdf`), Natural Earth 50m Admin-0 polygon clipping, schema normalization, Science-over-NRT deduplication, and packages Python 3.12 `manylinux2014_x86_64` wheels strictly for `duckdb`, `polars`, and `h3`.
+   * Emits staged Input Datasets (`staged_data/` <= `2.5 GB`, `offline_wheels/` <= `80 MB`).
+2. **Environment 2 (Offline Harmonization Compute — Internet OFF, GPU, Python 3.12):**
+   * Kaggle GPU Docker preinstalls `torch`, `numpy`, `scipy`, `pandas`, `pyarrow`, `scikit-learn`, `lightgbm`, `shapely`, `rasterio`, `pytest`. Never imports `pyhdf`.
+   * Installs `duckdb`, `polars`, `h3` via `pip install --no-index --find-links=...`.
+   * Detects GPUs dynamically (`torch.cuda.device_count()`), bounding per-GPU VRAM `< 6 GB` (`batch_size = 1000` active cells) so execution runs cleanly on `T4 x2` (15 GB/GPU), `1x L4` (24 GB), or `4x L4` (24 GB/GPU).
+   * Exports `fire_harmonized.duckdb` + 3 Zstd Parquet products (`<= 4 GB` total under 20 GB working disk limit) + validation diagnostics.
+3. **Environment 3 (Web Application Server):**
+   * Runs `FastAPI + DuckDB` serving the static vanilla ES6 `MapLibre GL JS + Apache ECharts` application directly from `fire_harmonized.duckdb`.
+
+---
+
+## 4. Complete Codebase Architecture & Module Contracts
+
+Implement **strictly** this directory layout and module contract:
+
+```text
+fire-harmonizer/
+├── Makefile
+├── pyproject.toml
+├── src/
+│   ├── __init__.py
+│   ├── config/
+│   │   ├── __init__.py
+│   │   ├── settings.py
+│   │   └── paths.py
+│   ├── ingest/
+│   │   ├── __init__.py
+│   │   ├── build_wheels.sh
+│   │   ├── download_data.py
+│   │   └── normalize_dedup.py
+│   ├── geometry/
+│   │   ├── __init__.py
+│   │   ├── h3_utils.py
+│   │   ├── solar_geometry.py
+│   │   └── preprocess_geometry.py
+│   ├── calibration/
+│   │   ├── __init__.py
+│   │   ├── pyromes.py
+│   │   └── operators.py
+│   ├── engine/
+│   │   ├── __init__.py
+│   │   ├── likelihoods.py
+│   │   ├── priors.py
+│   │   ├── thomas_takahashi.py
+│   │   ├── cuda_kernels.py
+│   │   ├── solver.py
+│   │   └── conformal.py
+│   ├── products/
+│   │   ├── __init__.py
+│   │   └── export_duckdb.py
+│   ├── validation/
+│   │   ├── __init__.py
+│   │   ├── synthetic_twin.py
+│   │   └── diagnostics.py
+│   └── webapp/
+│       ├── __init__.py
+│       ├── server.py
+│       └── static/
+│           ├── index.html
+│           ├── app.js
+│           └── styles.css
+├── scripts/
+│   ├── run_env1_stage.py
+│   ├── run_env2_cpu_prep.py
+│   ├── run_env2_gpu_solve.py
+│   └── run_env2_validate.py
+└── tests/
+    ├── conftest.py
+    ├── test_01_ingestion_schema.py
+    ├── test_02_geometry_masking.py
+    ├── test_03_event_clustering.py
+    ├── test_04_observation_operators.py
+    ├── test_05_likelihood_derivatives.py
+    ├── test_06_gpu_solver_math.py
+    ├── test_07_synthetic_twin_truth.py
+    ├── test_08_conformal_uncertainty.py
+    ├── test_09_validation_diagnostics.py
+    └── test_10_webapp_api_scale.py
+```
+
+### Exact Module Responsibilities & Interfaces
+
+1. **`pyproject.toml` & `Makefile`:**
+   * `pyproject.toml` defines package `fire_harmonizer` (`requires-python = ">=3.10,<3.13"`) with extras: `ingest = ["requests", "paramiko", "beautifulsoup4", "lxml", "pyhdf", "duckdb", "polars", "shapely", "pyarrow"]`, `engine = ["torch", "numpy", "scipy", "pandas", "pyarrow", "duckdb", "polars", "h3", "scikit-learn", "lightgbm", "shapely"]`, `webapp = ["fastapi", "uvicorn", "duckdb", "h3", "pydantic"]`, `dev = ["pytest", "httpx"]`.
+   * `Makefile` exposes `stage`, `cpu-prep`, `gpu-solve`, `validate`, `test`, `serve`.
+
+2. **`src/config/settings.py`:**
+   * **Contains:** Frozen dataclasses & global constants: `TARGET_COUNTRIES` (`ARG`, `DZA`, `BRA`, `IDN`, `AUS`, `USA` with prefilter boxes `[(-73.8, -55.5, -53.5, -21.5)]`, etc., and ISO_A3 codes), `PLATFORM_INDEX = {"Terra": 0, "Aqua": 1, "SNPP": 2, "NOAA-20": 3, "NOAA-21": 4}`, `PLATFORM_BITMASK = {0: 1, 1: 2, 2: 4, 3: 8, 4: 16}`, `PLATFORM_TIMELINE`, `DATE_START = "2000-11-01"`, `DATE_END = "2026-11-14"`, `T_DAYS = 9510`, `CALIB_START = "2012-01-20"`, `CALIB_END = "2021-12-31"`, `CLIM_START_YEAR = 2003`, `CLIM_END_YEAR = 2020`, `Z_MIN = math.log(0.01)`, `Z_MAX = 14.0`, `F_REF_MW = 0.5`, `SAMA_BOX = (-110.0, -55.0, 11.0, 7.0)`, `H3_MAIN_RES = 6`, `H3_FLARE_RES = 8`, `MC_SAMPLES = 200`, `SOLVER_SWEEPS = 6`, `NEWTON_STEPS = 15`, `SPOTLIGHT_PRESETS` (exact coordinates for the 6 case studies).
+   * **Excludes:** Zero I/O, zero path hardcoding, zero imports of heavy ML/GPU libraries.
+
+3. **`src/config/paths.py`:**
+   * **Responsibility:** Single path resolver class `DataPaths.from_env(base_dir=None)` auto-detecting `/kaggle/input` datasets (`staged-data`, `offline-wheels`) and `/kaggle/working/output` vs local `./data` and `./output`.
+   * **Exposed Paths:** `raw_stage_dir`, `active_fires_dir`, `cloud_parquet`, `burned_area_parquet`, `country_polygons_parquet`, `provenance_base_parquet`, `pass_obs_parquet`, `pyromes_parquet`, `calibration_pkl`, `pass_calibrated_parquet`, `priors_pkl`, `state_checkpoint_pt`, `duckdb_path`, `product1_parquet`, `product2_monthly_parquet`, `product2_daily_parquet`, `product3_parquet`, `diagnostics_json`.
+
+4. **`src/ingest/build_wheels.sh`:**
+   * Detects active Python minor version (`3.12`) and executes `pip download --only-binary=:all: --platform manylinux2014_x86_64 --python-version ${PY_VER}` strictly for `duckdb`, `polars`, and `h3`.
+
+5. **`src/ingest/download_data.py` & `src/ingest/normalize_dedup.py`:**
+   * **Responsibility (`download_data.py`):** Env 1 cloud-to-cloud downloader implementing the **Autonomous Discovery & Failover Protocol** (Section 6). Downloads active fires, `MOD14C8Q`/`MYD14C8Q`/`Mx14CMQ` HDF4 cloud grids, `MCD64CMQ` burned area HDF4 grids, and Natural Earth `50m` Admin-0 polygons. Saves `cloud_visibility_025deg.parquet`, `burned_area_val_025deg.parquet`, `country_polygons.parquet`, and raw Parquet chunks under `staged_raw/`.
+   * **Responsibility (`normalize_dedup.py`):** Parses all source formats into canonical schema, clips points strictly inside Natural Earth country polygons via `shapely.contains_xy`, enforces `(platform, acq_date)` Science-tier dominance (`ML_SCIENCE > SP_SCIENCE > NRT`), computes `platform_active_day[P, T]`, writes `(country_iso, year)` partitioned `active_fires/`, and emits a structured ingestion audit report.
+
+6. **`src/geometry/h3_utils.py`, `solar_geometry.py`, `preprocess_geometry.py`:**
+   * **`h3_utils.py`:** `latlon_to_h3_int(lats, lons, res) -> np.ndarray[int64]`, `h3_int_to_str(cell_int) -> str`, `h3_neighbors(cell_int) -> list[int]`, `h3_boundary_geojson(cell_int) -> list[list[float]]`, `h3_area_km2(cell_int) -> float`, `three_color_hex_graph(active_cells: np.ndarray) -> tuple[np.ndarray, dict]`. Works uniformly across `h3 v3` and `h3 v4`.
+   * **`solar_geometry.py`:** Vectorized `compute_solar_time_and_sza(acq_date, acq_hhmm, lons, lats)` returning `(solar_hour, solar_date, dn_window_flag, sza_deg)`, plus `modis_sample_to_geometry(sample)` and `area_to_vza_deg(areas, sensor_family)`.
+   * **`preprocess_geometry.py`:** Applies static/SAMA/`H3-Res8` gas-flare hygiene, single-pass ECEF `cKDTree` bow-tie weights ($\omega^{\text{bt}}_i$) and connected-component clustering (`event_cluster_id`), saturation flagging (`i4_m13_fallback` vs Tobit `sat_flag`), emits `obs_provenance_base.parquet` and `pass_observations.parquet` keyed strictly by `(h3_index, solar_date, platform, dn_flag)`.
+
+7. **`src/calibration/pyromes.py` & `src/calibration/operators.py`:**
+   * **`pyromes.py`:** Extracts coordinate-free behavioral features (`2012–2021`), fits `K=7` `GaussianMixture`, assigns all active hexagons `pyrome_id in 0..6`, saves `hex_pyromes.parquet` + `pyrome_gmm.pkl`.
+   * **`operators.py`:** Fits all `2012-01-20 .. 2021-12-31` forward observation operators (isotonic confidence $w_i$, detection limits $F_{\min}$ & Log-Normal MLE survival $\psi^{\text{CNT}}, \psi^{\text{FRP}}, \psi^{\text{FRP, eff}}$, near-nadir VIIRS EQM + LightGBM residual $\gamma_{\text{MODIS}, b}$, 12-hour intra-window diurnal harmonics $D_{b,s,\text{DN}}(\tau)$ including post-2022 Aqua-vs-N20 drift strictly on diurnal coefficients, heteroscedastic $\sigma^2$, active-area model $g_{\text{area}, b}$, plus `2012–2025` cloud climatology table for trailing 2026 lag). Saves `calibration_artifacts.pkl` (exact dictionary schema in Section 5.2) and `pass_observations_calibrated.parquet`.
+
+8. **`src/engine/likelihoods.py`, `priors.py`, `thomas_takahashi.py`, `cuda_kernels.py`, `solver.py`, `conformal.py`:**
+   * **`likelihoods.py`:** Pure PyTorch `float64` functions `eval_pointwise_nll_grad_hess(z, obs_y, obs_sat, obs_mu_gain, obs_inv_sig2, obs_inv_sig, obs_k_miss, obs_vis, is_op_pass)` returning `(nll, grad, hess_spd)` with asymptotic Tobit tail and convexity-guarded Hurdle Hessian.
+   * **`priors.py`:** Estimates `(\mu_{g,m,DN}, \rho_b, \sigma_{proc, b}, \lambda_{0,b}, \beta_{dn,b}, \eta_{dn,b}, \bar{F}_{event, b})` from `2012–2021` VIIRS data and packs sparse 3-color neighbor CSR indices.
+   * **`thomas_takahashi.py`:** Pure PyTorch `float64` reference implementations of `thomas_factor_and_solve`, `takahashi_marginals`, and `joint_cholesky_sample`.
+   * **`cuda_kernels.py`:** Lazy-compiled `torch.utils.cpp_extension.load_inline` single-launch CUDA C++ `float64` kernels (`thomas_solve_cuda`, `takahashi_cuda`, `cholesky_sample_cuda`), automatically falling back to `thomas_takahashi.py` on CPU.
+   * **`solver.py`:** `solve_all_chunks(...)` distributing active cells across `0..device_count()-1` (`batch_size = 1000`), running `6` 3-color × Day/Night sweeps, saving MAP state checkpoint (`state_checkpoint_pt`) and raw monthly/daily trajectory statistics, plus `run_fixed_lag_update(window_days=14)`.
+   * **`conformal.py`:** Runs held-out `2018–2020` VIIRS-masked calibration and `2018–2021` leave-one-VIIRS-out calibration to fit `c_modis[b]` and `c_multi[b]`, calibrates intervals, evaluates `ABSTAIN_LOW_EVIDENCE`, `attribution_flag`, `hurdle_adj_events`, `energy_equiv_events`, and `2003–2020` climatology anomalies.
+
+9. **`src/products/export_duckdb.py`:**
+   * Emits Zstd Parquet for **Product 1 (`obs_harmonized_provenance.parquet`)**, **Product 2 (`state_reconstructed_monthly.parquet` dense + `state_reconstructed_daily.parquet` sparse)**, **Product 3 (`uncertainty_diagnostics.parquet`)**, and creates indexed DuckDB tables + materialized summary views in `fire_harmonized.duckdb`.
+
+10. **`src/validation/synthetic_twin.py` & `src/validation/diagnostics.py`:**
+    * **`synthetic_twin.py`:** Deterministic 26-year forward generator producing ground truth `(Phi_day_true, Phi_night_true)` and simulated noisy, censored, bow-tie, cloud-blocked, drifting, S-NPP-terminating sensor observations across all 5 spacecraft.
+    * **`diagnostics.py`:** Computes Chow & Pettitt structural breaks, 2019–2021 VIIRS ablation (CRPS, log-RMSE, 90% coverage, Spearman $\rho$, Top-3 Peak Month Match), `MCD64CMQ` burned-area correlations, residual VZA/solar-time slopes, and spotlight audit metrics (`Chilecito ARG 2026`, `Kabylie & Hassi Messaoud DZA`, `Nov 2, 2026 SNPP`). Saves `diagnostics.json`.
+
+11. **`src/webapp/server.py` & `src/webapp/static/`:**
+    * FastAPI read-only DuckDB API + static MapLibre GL JS + Apache ECharts web app matching exact JSON contracts in Section 5.5.
+
+---
+
+## 5. Complete Mathematical & Computational Engine
+
+### 5.1 Spatial-Temporal Geometry, SZA, Bow-Tie & Clustering
+
+#### 5.1.1 Astronomical Local Solar Time & Half-Day Window
+Given UTC date `(YYYY-MM-DD)`, `acq_hhmm` (`HHMM` integer, e.g., `51` = `00:51`), and longitude $\lambda_i \in [-180, 180]$:
+1. Convert `acq_hhmm` carefully in base-60:
+   $$h_{\text{UTC}, i} = \lfloor \text{acq\_hhmm}_i / 100 \rfloor + \frac{\text{acq\_hhmm}_i \bmod 100}{60.0}$$
+2. Local mean solar time and solar date shift:
+   $$\tau_{\text{raw}, i} = h_{\text{UTC}, i} + \frac{\lambda_i}{15.0}, \qquad \tau_i = \tau_{\text{raw}, i} \bmod 24.0$$
+   $$\text{solar\_date}_i = \text{acq\_date}_i + \lfloor \tau_{\text{raw}, i} / 24.0 \rfloor \text{ days}$$
+3. Canonical latent half-day assignment (ensuring 1-to-1 mathematical alignment with 12-hour diurnal normalization even at Arctic latitudes):
+   $$\text{dn\_flag}_i = \begin{cases} \text{'D'} & \text{if } 6.0 \le \tau_i < 18.0 \\ \text{'N'} & \text{otherwise} \end{cases}$$
+4. Also compute physical **Solar Zenith Angle ($\text{SZA}$)** using Spencer's Fourier solar declination $\delta_\odot(\text{doy})$ and Equation of Time $E_t(\text{doy})$:
+   $$\Gamma = \frac{2\pi(\text{doy} - 1)}{365}, \quad \omega = 15^\circ\left(\tau_i + \frac{E_t}{60.0} - 12.0\right)$$
+   $$\text{SZA}_i = \arccos\!\big(\text{clip}(\sin\phi_i\sin\delta_\odot + \cos\phi_i\cos\delta_\odot\cos\omega,\; -1.0,\; 1.0)\big) \cdot \frac{180^\circ}{\pi}$$
+   Store `sza_deg` and raw sensor `daynight` inside Product 1 for scientific provenance.
+
+#### 5.1.2 Spherical Pixel Geometry & VZA Recovery
+* **When MODIS `sample` ($s \in [0, 1353]$) is present (`MCD14ML`):**
+  With $R_E = 6371.0\,\text{km}$, $H = 705.0\,\text{km}$, half-swath angle $\alpha_{\max} = 55.0^\circ \cdot \frac{\pi}{180}$, nominal nadir IFOV $\Delta\alpha_0 = 1.0 / 705.0$:
+  $$\alpha(s) = (s - 676.5)\,\frac{2\alpha_{\max}}{1353}, \qquad \theta_{\text{VZA}}(s) = \arcsin\!\left(\frac{R_E + H}{R_E}\sin|\alpha(s)|\right) \cdot \frac{180^\circ}{\pi}$$
+  $$D(\alpha) = (R_E + H)\cos\alpha - \sqrt{R_E^2 - (R_E + H)^2\sin^2\alpha}$$
+  $$\text{track}(s) = D(\alpha)\,\Delta\alpha_0, \qquad \text{scan}(s) = \frac{D(\alpha)\,\Delta\alpha_0}{\cos\theta_{\text{VZA}}(s)}, \qquad A_i = \text{scan}(s)\cdot\text{track}(s)$$
+  *(Check: $s = 676.5 \implies 1.00 \times 1.00 = 1.00\,\text{km}^2$, $\theta = 0^\circ$; $s \in \{0, 1353\} \implies 4.84 \times 2.01 = 9.72\,\text{km}^2$, $\theta = 65.48^\circ$.)*
+* **When VIIRS `Pixarea` is present (`Vxx14IMGML`):** Use $A_i = \text{clip}(\text{Pixarea}_i,\; 0.12,\; 0.75)$ directly (`scan = track = sqrt(A_i)` proxy if absent) and recover $\theta_{\text{VZA}}$ from monotone spline below.
+* **When `scan_km, track_km` are present (Portolan / FIRMS API):** Compute $A_i = \text{clip}(\text{scan}_i \times \text{track}_i,\; 0.12,\; 12.0)$ and interpolate $\theta_{\text{VZA}} \in [0^\circ, 65^\circ]$ via `np.interp`:
+  * MODIS knots: `A = [1.00, 1.35, 2.25, 4.20, 9.72] -> VZA = [0.0, 20.0, 35.0, 50.0, 65.0]`
+  * VIIRS knots: `A = [0.141, 0.180, 0.280, 0.430, 0.620] -> VZA = [0.0, 20.0, 35.0, 50.0, 65.0]`
+
+#### 5.1.3 Hygiene, Bow-Tie Weighting, Event Clustering & Pass Aggregation
+1. **Static & SAMA Filtering:**
+   * Drop `type_raw IN (1, 3)` (volcanoes & offshore).
+   * Flag `is_sama_filtered = True` (and exclude from biomass fusion) when `sensor_family == 'VIIRS'` AND `dn_flag == 'N'` AND (`conf_raw == 'l'` OR `conf_num < 30`) AND `-110.0 <= longitude <= 11.0` AND `-55.0 <= latitude <= 7.0`.
+   * Group remaining detections into **`H3 Resolution 8`** micro-cells $m$ ($\sim 0.74\,\text{km}^2$, robust to 50–300 m MODIS geolocation jitter). Compute distinct active years $Y_m$, mean active days/year $\bar{D}_m = \text{active\_days}_m / \max(1, Y_m)$, and day/night symmetry $R^{\text{DN}}_m = \frac{\min(n_{\text{D}}, n_{\text{N}})}{\max(n_{\text{D}}, n_{\text{N}}) + 1}$. Set `is_static_industrial = True` if `type_raw == 2` OR ($Y_m \ge 3$ AND $\bar{D}_m \ge 15.0$ AND $R^{\text{DN}}_m > 0.30$). Keep flagged points in Product 1; exclude from biomass fusion.
+2. **Pass Segmentation & Spatial Graphs (`cKDTree` in ECEF 3D):**
+   * Sort by `(platform, utc_epoch_minutes)` and split `pass_id` wherever consecutive timestamps differ by `> 5 minutes`.
+   * Map `(lat, lon)` to 3D ECEF chords ($R_E = 6371.0\,\text{km}$). Within each `(platform, pass_id)`:
+     * **Bow-tie graph (MODIS pixels with $A_i > 1.5\,\text{km}^2$):** Connect $i, j$ if $d_{ij} < 0.7 \cdot \frac{\text{track}_i + \text{track}_j}{2}$. Weight $\omega^{\text{bt}}_i = \frac{1.0}{1.0 + \text{deg}_{\text{bt}}(i)}$ (conserving total FRP across overlapping scans). Otherwise $\omega^{\text{bt}}_i = 1.0$.
+     * **Event clustering graph:** Connect $i, j$ if $d_{ij} \le 1.4 \cdot \max(\sqrt{A_i}, \sqrt{A_j})$. Run `scipy.sparse.csgraph.connected_components` to assign `event_cluster_id`.
+3. **Saturation Flags:**
+   * `i4_m13_fallback = 1` if `sensor_family == 'VIIRS'` and `t_mir_k >= 366.0` and `frp_mw > 0.0` (inflates observation std by `1.35×`).
+   * `sat_flag = 1` (Tobit right-censored) if (`sensor_family == 'MODIS'` and `t_mir_k >= 498.0` and `frp_mw > 0.0`) OR (`sensor_family == 'VIIRS'` and `t_mir_k >= 366.9` and `frp_mw >= 300.0`).
+4. **Overpass Aggregation (`pass_observations.parquet`):**
+   Aggregate biomass rows strictly per `(h3_index, solar_date, platform, dn_flag)` (never summing platforms):
+   * `y_frp_mw = sum(omega_bt * rel_weight * frp_mw)` (note `rel_weight` enters after calibration in `operators.py`, initialized `1.0` before calibration and weighted during calibration pass)
+   * `raw_event_count = count_distinct(event_cluster_id)`
+   * `det_footprint_km2 = sum(omega_bt * A_i)`
+   * `mean_area_km2`, `mean_vza_deg`, `mean_solar_hour`, `mean_conf_num`, `has_i4_m13_fallback`, `sat_flag`.
+
+#### 5.1.4 Non-Detection (`Y == 0`) Cloud & Swath Parameters
+For every operational pass `(p, g, t, DN)` where `is_operational[p, t] == 1` AND `platform_active_day[p, t] == 1` (`>= 5` total detections across all 6 countries on UTC day `t`):
+1. Join `cloud_visibility_025deg.parquet` on `(lat_025, lon_025, year, period_8d_or_month)`—falling back to `2012–2025` multi-year mean `MeanCloudFraction` for that `(0.25° cell, month)` whenever trailing 2026 CMG files have not yet been published (flagging `cloud_source = 'CLIMATOLOGY_FALLBACK'`).
+2. Compute clear-sky observation probability:
+   $$v_{p,g,t} = p_{\text{swath}, p}(|\phi_g|, t) \cdot \text{clip}\!\Big(1.0 - f_{\text{cloud}} - f_{\text{unmapped}},\;\; 0.10,\;\; 0.98\Big)$$
+   with $p_{\text{swath}, \text{VIIRS}} = 0.99$ and $p_{\text{swath}, \text{MODIS}} = \text{clip}(0.85 + 0.15\frac{|\phi_g|}{30.0}, 0.85, 1.00) \times (0.96 \text{ if } t \ge \text{2022-01-01})$.
+3. Expected unseen-pass averages: MODIS $\bar{A}_{\text{avg}} = 2.35\,\text{km}^2, \bar{\theta}_{\text{avg}} = 35.0^\circ$; VIIRS $\bar{A}_{\text{avg}} = 0.23\,\text{km}^2, \bar{\theta}_{\text{avg}} = 28.0^\circ$.
+4. Expected solar hour $\bar{\tau}_{p,t,\text{DN}}$: Terra drifts linearly `10.5 -> 8.75` (`2022-01-01 .. 2026-11-14`), Aqua drifts `13.5 -> 15.60` (`+12.0 mod 24` for Night); VIIRS fixed at `13.5` Day / `1.5` Night.
+
+---
+
+### 5.2 Calibration of Observation Operators (`2012-01-20` to `2021-12-31`)
+
+1. **Behavioral Pyromes ($K=7$ GMM, Coordinate-Free):**
+   For every hexagon with $\ge 20$ active pass-days in `2012–2021`, compute strictly non-coordinate features: `[ln(median_cluster_frp + 1), night_frp_share, seasonal_circular_concentration, interannual_cv, mean_cluster_pixels]`. Fit `GaussianMixture(n_components=7, covariance_type='full', reg_covar=1e-4, random_state=42)` over `StandardScaler` features. Assign `< 20`-day cells to the nearest GMM centroid in standardized space (or country modal pyrome if `< 3` active days).
+2. **Confidence Reliability Mapping ($w_i \in [0.15, 1.0]$):**
+   On `2012–2021`, mark each detection as corroborated (`1`) if another detection (different pass or platform) occurs within $\pm 1$ day and $\le 2\,\text{km}$. Fit `IsotonicRegression(y_min=0.15, y_max=1.0, out_of_bounds='clip')` per `(sensor_family, dn_flag)` over `conf_num`. Recompute clean weighted pass FRP `y_frp_mw = sum(omega_bt * w_i * frp_mw)` (`w_i` defaults to `1.0` in high-confidence single-pixel checks where calibrated `w_i >= 0.90`).
+3. **Detection Limits & Analytical Survival Fractions ($\psi^{\text{CNT}}, \psi^{\text{FRP}}, \psi^{\text{FRP, eff}}$):**
+   $$F_{\min, \text{MODIS}}(A, \text{DN}) = \alpha_{M,\text{DN}} + \beta_{M,\text{DN}}\,A, \qquad F_{\min, \text{VIIRS}}(A, \text{DN}) = \alpha_{V,\text{DN}} + \beta_{V,\text{DN}}\,A$$
+   with physical anchors: MODIS Night `(1.5, 2.2)`, MODIS Day `(2.5, 3.9)`, VIIRS Night `(0.25, 1.8)`, VIIRS Day `(0.40, 3.4)`.
+   Fit per-pyrome left-truncated Log-Normal $(\mu_{F,b}, \sigma_{F,b})$ via L-BFGS-B on clear-sky near-nadir (`VZA < 20°`, `cloud_frac < 0.30`) VIIRS clusters above $F_{\text{ref}} = 0.5\,\text{MW}$:
+   $$\psi^{\text{CNT}}_{p,b}(A, \text{DN}) = \text{clip}\!\left(1 - \Phi_{\mathcal{N}}\!\left(\frac{\ln F_{\min, p}(A,\text{DN}) - \mu_{F,b}}{\sigma_{F,b}}\right),\;\; 0.02,\;\; 1.0\right)$$
+   $$\psi^{\text{FRP}}_{p,b}(A, \text{DN}) = \text{clip}\!\left(\frac{1 - \Phi_{\mathcal{N}}\!\left(\frac{\ln F_{\min, p}(A,\text{DN}) - \mu_{F,b} - \sigma^2_{F,b}}{\sigma_{F,b}}\right)}{1 - \Phi_{\mathcal{N}}\!\left(\frac{\ln F_{\text{ref}} - \mu_{F,b} - \sigma^2_{F,b}}{\sigma_{F,b}}\right)},\;\; 0.05,\;\; 1.0\right)$$
+   Smooth conditional multi-fire adjustment for detected passes ($E_{\text{raw}} \ge 1$):
+   $$w_{\text{multi}}(E_{\text{raw}}) = 1.0 - \exp\!\big(-0.7\,(E_{\text{raw}} - 1)\big)$$
+   $$\psi^{\text{FRP, eff}}_{p,b}(A, \text{DN}, E_{\text{raw}}) = (1 - w_{\text{multi}})\,\max\!\big(\psi^{\text{FRP}}_{p,b}(A, \text{DN}),\; 0.65\big) + w_{\text{multi}}\,\psi^{\text{FRP}}_{p,b}(A, \text{DN})$$
+   *(Prevents 4× artificial inflation of isolated single-cluster fires that already cleared $F_{\min}$, while applying full small-fire omission correction when multiple clusters coexist.)*
+4. **VZA & Quantile Residual Transfer ($\gamma_{p,b}$):**
+   Pair synchronous `2012–2021` `Aqua` and near-nadir `SNPP` (`VZA_SNPP < 25°`, $\Delta t \le 45\,\text{min}$, same `h3_index`, same `dn_flag`, both $> 0$). Compute target log-ratio:
+   $$r_k = \ln Y_{\text{SNPP}, k} - \Big(\ln Y_{\text{Aqua}, k} - \ln \psi^{\text{FRP, eff}}_{\text{Aqua}, b, k} + \ln \psi^{\text{FRP, eff}}_{\text{SNPP}, b, k}\Big)$$
+   Fit a LightGBM regressor (`max_depth=4, n_estimators=100, min_child_samples=50`, unconstrained VZA sign) predicting $r_k$ from `[pyrome_id, dn_is_day, mean_vza_modis, mean_area_modis, ln_y_modis]`, plus a 20-knot **strictly monotonic Empirical Quantile Mapping (EQM)** curve (`isotonic`/`PCHIP`) per `(pyrome, dn_flag)` mapping adjusted `ln Y_MODIS` quantiles onto `ln Y_SNPP` quantiles so quantile curves never cross. Clip $\ln \gamma_{\text{MODIS}} \in [-1.5, +1.5]$; set $\ln \gamma_{\text{VIIRS}} \equiv 0.0$.
+5. **12-Hour Intra-Window Diurnal & Orbital-Drift Curve ($D_{b,s,\text{DN}}(\tau)$):**
+   Per pyrome $b$ and season $s \in \{\text{DJF, MAM, JJA, SON}\}$:
+   $$\ln D_{\text{raw}, b,s}(\tau) = a_1\cos\!\left(\frac{2\pi\tau}{24}\right) + b_1\sin\!\left(\frac{2\pi\tau}{24}\right) + a_2\cos\!\left(\frac{4\pi\tau}{24}\right) + b_2\sin\!\left(\frac{4\pi\tau}{24}\right)$$
+   Fit $(a_1, b_1, a_2, b_2)$ by Ridge regression (`alpha=10.0`) on same-day paired log-FRP differences (`Terra` vs `Aqua/SNPP` `2003–2021`, plus `Aqua` `2022–2025` drifting solar hours vs stationary `NOAA-20` strictly updating diurnal parameters while keeping $\psi, \gamma$ frozen).
+   Normalize **independently within each 12-hour half-day window** via 120-point trapezoidal integration:
+   $$c_{0,\text{Day}} = -\ln\!\left(\frac{1}{12}\int_6^{18} D_{\text{raw}, b,s}(\tau)\,d\tau\right), \qquad c_{0,\text{Night}} = -\ln\!\left(\frac{1}{12}\int_{18}^{30} D_{\text{raw}, b,s}(\tau \bmod 24)\,d\tau\right)$$
+   $$D_{b,s,\text{DN}}(\tau) = \exp\!\big(\ln D_{\text{raw}, b,s}(\tau) + c_{0,\text{DN}}\big)$$
+   Because each half-day curve integrates to unit mean over its own 12 hours, $\Phi_{\text{Day}}$ and $\Phi_{\text{Night}}$ retain their exact physical meaning (mean Daytime MW vs mean Nighttime MW) and exact 24h flux is $\Phi_{24\text{h}} = 0.5(\Phi_{\text{Day}} + \Phi_{\text{Night}})$.
+6. **Detected Forward Log-Gain (Strictly Cloud-Free):**
+   $$\mu^{\text{gain, det}}_{p,g,t,\text{DN}} = \ln D_{b,s,\text{DN}}(\bar{\tau}_{p,g,t}) + \ln \gamma_{p,b}(\bar{\theta}_p, q) + \ln \psi^{\text{FRP, eff}}_{p,b}(\bar{A}_p, \text{DN}, E_{\text{raw}})$$
+7. **Heteroscedastic Variance ($\sigma^2_{p,g,t,\text{DN}}$):**
+   OLS on `2012–2021` squared calibration residuals (`SNPP` vs `NOAA-20` for VIIRS; `Aqua` vs `SNPP` minus VIIRS variance for MODIS) predicting $\ln(\hat{\epsilon}^2 + 10^{-3})$ from `[is_modis, vza_deg / 65.0, 1.0 - w_mean, 1.0 - v_cloud, i4_m13_fallback]`, clipped to $[0.025, 2.50]$.
+8. **Active Burning Footprint Model ($g_{\text{area}, b}$):**
+   Fit a Ridge regressor on `2012–2021` clear-sky near-nadir (`VZA < 25°`) VIIRS detections predicting $\ln(A^{\text{det}}_{\text{VIIRS}} + 10^{-3})$ from $[\ln(\Phi + 0.01),\, \ln(\text{night\_day\_ratio} + 0.05),\, \text{pyrome\_one\_hot}]$, outputting $\widehat{A}^{\text{burn}}_{g,t} = \text{clip}(\exp(\hat{y}) - 10^{-3},\; 0.0,\; A_g)$.
+9. **`calibration_artifacts.pkl` Exact Dictionary Schema:**
+   `{"reliability_models": dict, "fmin_params": dict, "lognorm_params": dict, "lgb_gamma": LightGBM, "eqm_knots": dict, "diurnal_coeffs": dict, "sigma_ols": LinearRegression, "area_model": Ridge, "cloud_climatology": DataFrame}`.
+
+---
+
+### 5.3 State-Space Priors, Exact Likelihoods, and `float64` GPU Solver
+
+#### 5.3.1 Deterministic Empirical Bayes Priors (`priors.py`)
+From `2012–2021` VIIRS data:
+* $\bar{F}_{\text{event}, b} = \max(1.0,\; \text{median}(\text{clear near-nadir VIIRS cluster FRP in pyrome } b))$
+* Cell-month baseline prior (treating clear zero-detection days as $z_{\min} = \ln(0.01)$):
+  $$\mu_{g,m,\text{DN}} = \frac{n_{g,m}\,\bar{y}_{g,m,\text{DN}} + 5.0\,\bar{\mu}_{b,m,\text{DN}}}{n_{g,m} + 5.0}$$
+* AR(1) temporal persistence $\rho_b \in [0.25, 0.90]$ and innovation std $\sigma_{\text{proc}, b} \in [0.25, 1.50]$ via lag-1 OLS on consecutive active VIIRS cell-days.
+* Hurdle rate constant $\lambda_{0, b} \in [0.1, 5.0]$ via `scipy.optimize.minimize_scalar` matching empirical zero-detection probability on active pyrome months.
+* Day–Night coupling $(\beta_{\text{dn},b}, \eta_{\text{dn},b})$ via OLS slope and variance ratio ($\eta_{\text{dn},b} \in [0.05, 0.30]$).
+
+#### 5.3.2 Exact Likelihood Equations & Convexity-Guarded Hessians (`likelihoods.py`)
+Let $z \in [-8.0, 14.0]$ (`float64`), $\mu = \mu^{\text{gain, det}}$, $\tau_2 = 1/\sigma^2$, $\tau_1 = 1/\sigma$:
+1. **Case A (`Y > 0, sat_flag == 0`):**
    $$r = (z + \mu) - \ln Y, \qquad \ell = \frac{1}{2}\tau_2 r^2, \qquad g = \tau_2 r, \qquad h = \tau_2$$
-2. **Case B (`Y > 0` and `sat_flag == 1`, Right-Censored Tobit):**
-   Let $w = \tau_1\big((z + \mu) - \ln Y\big)$. Use PyTorch's numerically stable `log_ndtr`:
-   $$\ln\Phi(w) = \text{torch.special.log\_ndtr}(w), \qquad \ln\phi(w) = -0.5 w^2 - 0.5\ln(2\pi)$$
-   $$\lambda(w) = \exp\big(\ln\phi(w) - \ln\Phi(w)\big) \quad (\text{clamped cleanly for } w < -30 \text{ via asymptotic } \lambda(w) \approx -w - 1/w)$$
-   $$\ell = -\ln\Phi(w), \qquad g = -\tau_1 \lambda(w), \qquad h = \tau_2\,\lambda(w)\big(w + \lambda(w)\big)$$
-   *(Check asymptotic branch at $w < -30$: $-\ln\Phi(w) \approx 0.5 w^2 + \ln(-w) + 0.5\ln(2\pi)$, avoiding $\log(0) = -\infty$ completely!)*
-3. **Case C (`Y == 0` and `is_operational == 1`, Hurdle Poisson-Cloud Mixture):**
-   Let $k = \frac{\lambda_{0,b}\,\psi^{\text{CNT}}_{p,b}}{\bar{F}_{\text{event}, b}} > 0$, $\Lambda = \text{clip}(k\,e^z,\; 10^{-12},\; 80.0)$, $e^{-\Lambda} = \exp(-\Lambda)$, $q = (1 - v) + v e^{-\Lambda}$, $r = \frac{v e^{-\Lambda}}{q}$:
+2. **Case B (`Y > 0, sat_flag == 1`, Right-Censored Tobit):**
+   Let $w = \tau_1\big((z + \mu) - \ln Y\big)$.
+   If $w \ge -30$: $\ln\Phi(w) = \text{torch.special.log\_ndtr}(w)$, $\lambda(w) = \exp(-0.5 w^2 - 0.5\ln(2\pi) - \ln\Phi(w))$.
+   If $w < -30$: $-\ln\Phi(w) = 0.5 w^2 + \ln(-w) + 0.5\ln(2\pi)$, $\lambda(w) = -w - 1/w$.
+   $$\ell = -\ln\Phi(w), \qquad g = -\tau_1 \lambda(w), \qquad h = \tau_2\,\lambda(w)\big(w + \lambda(w)\big) > 0$$
+3. **Case C (`Y == 0` on active operational pass):**
+   Let $k = \frac{\lambda_{0,b}\,\psi^{\text{CNT}}_{p,b}(\bar{A}_{\text{avg}}, \text{DN})}{\bar{F}_{\text{event}, b}} > 0$, $\Lambda = \text{clip}(k\,e^z,\; 10^{-12},\; 80.0)$, $e^{-\Lambda} = \exp(-\Lambda)$, $q = (1 - v) + v e^{-\Lambda}$, $r = \frac{v e^{-\Lambda}}{q}$:
    $$\ell = -\ln q, \qquad g = r\,\Lambda, \qquad h = \max\!\Big(0.0,\; r\,\Lambda\,\big[1.0 - \Lambda(1.0 - r)\big]\Big)$$
-   *(The `max(0.0, ...)` Gauss-Newton convexity guard ensures $H \succ 0$ everywhere while preserving the exact MAP gradient $g$!)*
 
-### 4.3 Exact Tridiagonal Temporal Prior (`float64`)
-Let $\delta_t = z_t - \mu_t$ for $t = 0, \dots, T-1$, $\omega_p = 1/\sigma^2_{\text{proc}, b}$:
-* $\ell_{\text{time}} = \frac{1}{2}\omega_p\Big((1 - \rho^2)\delta_0^2 + \sum_{t=1}^{T-1}(\delta_t - \rho\,\delta_{t-1})^2\Big)$
-* Gradients:
-  * $g_0 = \omega_p(\delta_0 - \rho\,\delta_1)$
-  * $g_t = \omega_p(-\rho\,\delta_{t-1} + (1 + \rho^2)\delta_t - \rho\,\delta_{t+1})$ for $1 \le t \le T-2$
-  * $g_{T-1} = \omega_p(\delta_{T-1} - \rho\,\delta_{T-2})$
-* Tridiagonal Hessian entries:
-  * Main diagonal: $a_0 = \omega_p$, $a_t = (1 + \rho^2)\omega_p$ for $1 \le t \le T-2$, $a_{T-1} = \omega_p$
-  * Off-diagonal: $b_t = -\rho\,\omega_p$ for $0 \le t \le T-2$
-* Add Spatial Neighbor & Day–Night Coupling terms directly onto main diagonal $a_t$ and linear gradient $g_t$:
-  * Neighbor coupling ($\alpha_s = 0.10$, sum over active 1-ring neighbors $g' \in \mathcal{N}(g)$ held fixed in the other 2 H3 colors):
-    $$\Delta \ell_{\text{sp}} = \frac{\alpha_s \omega_p}{2}\sum_{g' \in \mathcal{N}(g)} (z_t - z_{g', t})^2 \implies \Delta g_t = \alpha_s \omega_p\big(|\mathcal{N}|z_t - \sum z_{g',t}\big), \quad \Delta a_t = \alpha_s \omega_p |\mathcal{N}|$$
-  * Opposite Day/Night coupling ($\eta_{\text{dn}}, \beta_{\text{dn}}$):
-    $$\Delta \ell_{\text{dn}} = \frac{\eta_{\text{dn}} \omega_p}{2}\big(\delta_t - \beta_{\text{dn}}\delta_{\text{opp}, t}\big)^2 \implies \Delta g_t = \eta_{\text{dn}}\omega_p(\delta_t - \beta_{\text{dn}}\delta_{\text{opp}, t}), \quad \Delta a_t = \eta_{\text{dn}}\omega_p$$
-  * Floor final main diagonal safely with tiny numerical ridge `a_t = torch.clamp(a_t, min=1e-6)`.
+#### 5.3.3 Space × Time × Day-Night Prior Tridiagonal System
+Let $\delta_t = z_t - \mu_t$, $\omega_p = 1/\sigma^2_{\text{proc}, b}$, $\alpha_s = 0.10$:
+* Main diagonal $a_0 = a_{T-1} = \omega_p$, $a_t = (1 + \rho^2)\omega_p$ ($1 \le t \le T-2$); off-diagonal $b_t = -\rho\,\omega_p$.
+* Neighbor 1-ring term (fixed per H3 color): $\Delta a_t = \alpha_s\omega_p|\mathcal{N}(g)|$, $\Delta g_t = \alpha_s\omega_p(|\mathcal{N}(g)| z_t - \sum_{g'} z_{g', t})$.
+* Opposite half-day term: $\Delta a_t = \eta_{\text{dn}}\omega_p$, $\Delta g_t = \eta_{\text{dn}}\omega_p(\delta_t - \beta_{\text{dn}}\delta_{\text{opp}, t})$.
+* Floor diagonal: $a_t = \max(a_t, 10^{-6})$.
 
-### 4.4 Exact Batched `@torch.jit.script` Thomas $LDL^\top$, Takahashi, and Exact Joint Sampling
-Implement these exact `float64` recurrences (`shape (B, T)`):
-1. **Factorization (`H = L D L^T`):**
-   * `d[:, 0] = a[:, 0]`
-   * For `t` in `0..T-2`:
-     `l[:, t] = b[:, t] / d[:, t]`
-     `d[:, t+1] = torch.clamp(a[:, t+1] - l[:, t] * b[:, t], min=1e-7)`
-2. **Solve `H dx = grad`:**
-   * `y[:, 0] = grad[:, 0]`
-   * For `t` in `1..T-1`: `y[:, t] = grad[:, t] - l[:, t-1] * y[:, t-1]`
-   * `dx[:, T-1] = y[:, T-1] / d[:, T-1]`
-   * For `t` in `T-2..0`: `dx[:, t] = (y[:, t] / d[:, t]) - l[:, t] * dx[:, t+1]`
-3. **Armijo Backtracking Line Search:**
-   * Try `alpha in (1.0, 0.5, 0.25, 0.125, 0.0625)`: evaluate `J(clamp(z - alpha * dx, -8.0, 14.0))`; accept first step where `J_new <= J_curr - 1e-4 * alpha * sum(grad * dx)`. Stop Newton loop early when `max(|alpha * dx|) < 1e-4`.
-4. **Exact Takahashi Posterior Variances (`Sigma_{t,t}`):**
-   * `var[:, T-1] = 1.0 / d[:, T-1]`
-   * For `t` in `T-2..0`:
-     `cov_lag1[:, t] = -l[:, t] * var[:, t+1]`
-     `var[:, t] = (1.0 / d[:, t]) - l[:, t] * cov_lag1[:, t]`
-5. **Exact Joint Gaussian-Laplace Trajectory Sampling ($M = 200$ draws):**
-   * Sample `eps ~ N(0, 1)` of shape `(B_sub, T, M)` (`float32` scaled by `1/sqrt(d)` in `float64` backward scan):
-   * `u[:, T-1, :] = eps[:, T-1, :] / sqrt(d[:, T-1:T])`
-   * For `t` in `T-2..0`:
-     `u[:, t, :] = eps[:, t, :] / sqrt(d[:, t:t+1]) - l[:, t:t+1] * u[:, t+1, :]`
-   * `z_samples = z_hat.unsqueeze(-1) + u`
-   * Transform back per trajectory $m$: $\Phi^{(m)}_{g,d,\text{DN}} = \max(0.0,\; e^{z^{(m)}} - 0.05)$, combine 24h flux $\Phi^{(m)}_{g,d} = w_{\text{day}}\Phi^{(m)}_{\text{Day}} + w_{\text{night}}\Phi^{(m)}_{\text{Night}}$, aggregate monthly sums inside each `(g, year, month)`, and extract `q05, q50, q95, mean` across the 200 monthly totals!
+#### 5.3.4 Fused `float64` Thomas $LDL^\top$, Takahashi, and Joint Sampling (`thomas_takahashi.py` & `cuda_kernels.py`)
+1. **Factorization ($H = L D L^\top$):** $d_0 = a_0$; for $t = 0\dots T-2$: $l_t = b_t / d_t$, $d_{t+1} = \max(a_{t+1} - l_t b_t, 10^{-7})$.
+2. **Solve ($H\,\Delta z = g$):** $y_0 = g_0$, $y_t = g_t - l_{t-1} y_{t-1}$; $\Delta z_{T-1} = y_{T-1} / d_{T-1}$, $\Delta z_t = y_t / d_t - l_t \Delta z_{t+1}$.
+3. **Armijo Backtracking:** Test $\alpha \in \{1.0, 0.5, 0.25, 0.125, 0.0625\}$; accept when $J(z_{\text{new}}) \le J(z) - 10^{-4}\alpha\sum g\Delta z$; stop Newton loop early when $\|\alpha\Delta z\|_\infty < 10^{-4}$.
+4. **Takahashi Recursion:** $\Sigma_{T-1, T-1} = 1 / d_{T-1}$; for $t = T-2\dots 0$: $\Sigma_{t, t+1} = -l_t \Sigma_{t+1, t+1}$, $\Sigma_{t, t} = 1/d_t - l_t \Sigma_{t, t+1}$.
+5. **Exact Joint Cholesky Sampling ($M = 200$):** Draw $\varepsilon \sim \mathcal{N}(0, 1)$, solve $L^\top u = D^{-1/2}\varepsilon$ backwards ($u_{T-1} = \varepsilon_{T-1}/\sqrt{d_{T-1}}$, $u_t = \varepsilon_t/\sqrt{d_t} - l_t u_{t+1}$). Compute $z^{(m)} = \text{clip}(\hat{z} + u^{(m)}, -8.0, 14.0)$, $\Phi^{(m)}_{g,t,\text{DN}} = \exp(z^{(m)})$, $\Phi^{(m)}_{g,t} = 0.5(\Phi^{(m)}_{\text{Day}} + \Phi^{(m)}_{\text{Night}})$, $\text{FRE}^{(m)}_{g,t} = 0.0864\,\Phi^{(m)}_{g,t}$, aggregate within `(g, year, month)`, and extract `q05, q50, q95, mean`.
+6. **GPU Acceleration (`cuda_kernels.py`):** Implement `thomas_solve_cuda`, `takahashi_cuda`, and `cholesky_sample_cuda` as single-launch thread-per-cell `float64` CUDA C++ kernels via `torch.utils.cpp_extension.load_inline` (dispatching transparently to `thomas_takahashi.py` on CPU). Chunk size `B = 1000` (`~2.5 GB` peak VRAM per GPU across `T = 9510`).
+7. **3-Coloring & Fixed-Lag Streaming (`solver.py`):** Run `6` outer sweeps over **3-coloring** (`color in {0, 1, 2}`) × alternating `('D', 'N')`. Implement `run_fixed_lag_update(window_days=14)` anchoring `t_start - 1` via AR(1) to the saved state.
 
----
+### 5.4 Conformal Calibration, Diagnostics & Product Equations
 
-## 5. Exact Conformal Calibration, Diagnostics & Validation Metrics
+1. **Split Conformal Quantile Rescaling (`conformal.py`):**
+   Evaluate nonconformity scores $r_j = \frac{|\ln(\Phi_{\text{ref}, j}+1) - \ln(q_{50,\text{raw}, j}+1)|}{s_j}$ with $s_j = \max\big(\frac{\ln(q_{95,\text{raw}, j}+1) - \ln(q_{05,\text{raw}, j}+1)}{2},\; 0.05\big)$ on:
+   * Held-out `2018–2020` VIIRS-masked runs $\implies \hat{c}^{\text{modis}}_{0.90, b} \in [0.85, 3.5]$.
+   * Held-out `2018–2021` leave-one-VIIRS-platform-out runs $\implies \hat{c}^{\text{multi}}_{0.90, b} \in [0.85, 3.5]$.
+   Rescale intervals: $q_{05,\text{cal}} = \max(0, \exp(\ln(q_{50}+1) - \hat{c} s) - 1)$, $q_{95,\text{cal}} = \exp(\ln(q_{50}+1) + \hat{c} s) - 1$.
+2. **Hurdle-Adjusted vs Energy-Equivalent Event Counts (Respecting INV-02):**
+   * `energy_equiv_events_q50 = phi_q50_mw / F_event_b`
+   * `hurdle_adj_events`: Within each `(h3_index, solar_date, dn_flag)` half-day that had detections, take the **mean** across detecting platforms (never sum `SNPP + N20 + N21`!):
+     $$E^{\text{halfday}}_{g,t,\text{DN}} = \frac{1}{|P_{\text{det}}|}\sum_{p \in P_{\text{det}}} \frac{E^{\text{raw}}_{p,g,t,\text{DN}}}{\psi^{\text{CNT}}_{p,b}(\bar{A}_p, \text{DN}) \cdot v_{p,g,t}}$$
+     Sum $E^{\text{halfday}}$ over detected half-days in the month, and scale unobserved blind days smoothly by `1 / max(measured_fraction, 0.25)` (capped at `5.0 * raw_clustered_events` to prevent extreme noise blowups).
+3. **Diagnostic Flags & Bitmasks:**
+   * `active_platforms_bitmask`: Bit `0` (1) = Terra, Bit `1` (2) = Aqua, Bit `2` (4) = SNPP, Bit `3` (8) = NOAA-20, Bit `4` (16) = NOAA-21.
+   * `quality_flag`: `'ABSTAIN_LOW_EVIDENCE'` if $\ge 5$ consecutive days in month have `mean_cloud_frac > 0.85` AND zero detections in cell + 1-ring neighbors; `'CLIMATOLOGY_CLOUD_FALLBACK'` if cloud fraction came from 2012–2025 climatology; else `'NOMINAL'`.
+   * `attribution_flag`: Let $\Delta_{\text{raw}} = \frac{\text{raw\_frp\_sum} - \text{raw\_hist\_med}}{\max(\text{raw\_hist\_med}, 1.0)}$ and `harm_hist_med` = 2003–2020 cell-month median of `phi_q50_mw`:
+     - If `quality_flag == 'ABSTAIN_LOW_EVIDENCE'`: `'AMBIGUOUS_OVERLAPPING_CI'`
+     - Else if `q05_cal > harm_hist_med` or `q95_cal < harm_hist_med`: `'REAL_FIRE_CHANGE'`
+     - Else if $|\Delta_{\text{raw}}| > 0.50$ and `q05_cal <= harm_hist_med <= q95_cal`: `'SENSOR_ARTIFACT_CORRECTED'`
+     - Else: `'WITHIN_NORMAL_VARIABILITY'`.
+4. **Sparse Daily Export Filter (`export_duckdb.py`):**
+   Write `state_reconstructed_monthly.parquet` densely for all active cells × months, and write `state_reconstructed_daily.parquet` **sparsely** (include row iff `phi_q50_mw > 0.25` OR within $\pm 3$ days of a detection OR inside any `SPOTLIGHT_PRESETS` bounding box).
 
-1. **Split-Conformal CQR Multiplier (`src/engine/conformal.py`):**
-   * Run inference on held-out `2018-01-01 .. 2020-12-31` test subset twice: (a) Full multi-sensor reference $\Phi_{\text{ref}}$, and (b) VIIRS-masked `MODIS-only` inference yielding `(q05_raw, q50_raw, q95_raw)`.
-   * Compute nonconformity score in log-space for every active monthly cell $j$:
-     $$s_j = \max\!\left(\frac{\ln(q_{95,\text{raw}, j} + 1) - \ln(q_{05,\text{raw}, j} + 1)}{2},\;\; 0.05\right), \qquad r_j = \frac{|\ln(\Phi_{\text{ref}, j} + 1) - \ln(q_{50,\text{raw}, j} + 1)|}{s_j}$$
-   * Compute finite-sample 90% conformal quantile per pyrome $b$: $\hat{c}_{0.90, b} = \text{Quantile}_{\lceil (n_b + 1)\cdot 0.90 \rceil / n_b}(\{r_j\})$ (`clip [0.85, 3.5]`).
-   * For pre-2012 / MODIS-only monthly cells (`has_viirs == False`), rescale intervals as:
-     $$q_{05,\text{cal}} = \max\!\Big(0,\; \exp(\ln(q_{50} + 1) - \hat{c}_{0.90, b}\,s) - 1\Big), \qquad q_{95,\text{cal}} = \exp(\ln(q_{50} + 1) + \hat{c}_{0.90, b}\,s) - 1$$
-   * For multi-sensor (`2012–2026`) cells, compute conformal multiplier $\hat{c}^{\text{multi}}_{0.90, b}$ via leave-one-platform-out (`SNPP` vs `NOAA-20`) calibration residuals on `2018–2021`!
-2. **Real-Data Validation Metrics (`src/validation/diagnostics.py`):**
-   * **Chow / Segmented Poisson-Log Break Test** at `2002-07`, `2012-01`, `2018-04`, `2023-03`, and `2026-11`: compute F-stat & step-jump % before vs. after harmonization across stationary control pyromes.
-   * **Pettitt Non-Parametric Change-Point Test** across 2003–2025 per country.
-   * **2019–2021 Held-Out VIIRS-Masked Ablation:** report `log_RMSE`, `CRPS` (empirical CRPS across the 200 MC trajectories!), `empirical_90_coverage`, `Spearman_rho` on monthly rankings, and `Top-3 Peak Month Match %`.
-   * **`MCD64A1` Burned Area Cross-Check:** Spearman & Pearson correlation between monthly harmonized `FRE (TJ)` and independent `MCD64A1 burned_area_km2` vs. raw FIRMS hotspot counts (`2018–2025`).
-   * **Spotlight Case Verifications:** Save JSON/HTML diagnostic summaries for (1) `Chilecito ARG (Jul–Aug 2026)`, (2) `Kabylie DZA (2021 & 2023)` vs `Hassi Messaoud DZA (gas flare exclusion)`, and (3) `Nov 2, 2026 S-NPP cutoff continuity`.
+### 5.5 Exact FastAPI JSON & Web Contracts (`src/webapp/`)
+* `GET /api/calendar?min_lon=...&min_lat=...&max_lon=...&max_lat=...&start_year=2000&end_year=2026&metric=phi_q50_mw` (validates `min_lon < max_lon, min_lat < max_lat`, max bbox span `<= 25° × 25°` unless `country_iso` supplied):
+  Returns `{"meta": {...}, "cells": [{"year": int, "month": int, "value": float, "q05": float, "q95": float, "hist_median": float, "anomaly_ratio": float, "raw_count": int, "raw_frp": float, "measured_fraction": float, "quality_flag": str, "attribution_flag": str}]}`.
+* `GET /api/timeseries?...`: Returns monthly array + `constellation_events` (`2002-07`, `2012-01`, `2018-04`, `2022-01`, `2023-03`, `2026-11`).
+* `GET /api/map_hex?min_lon=...&year=2026&month=8&color_by=anomaly_ratio`: Returns GeoJSON `FeatureCollection` of H3 polygons (`<= 3000` features per query).
+* `GET /api/diagnostics`: Returns JSON contents of `diagnostics.json`.
+* `GET /api/export.csv?...`: Streams CSV sanitizing any string field starting with `=`, `+`, `-`, `@`, `\t`, `\r` by prefixing `'`.
+* **Frontend (`app.js`, `index.html`, `styles.css`):** Vanilla ES6 + MapLibre GL JS + Apache ECharts. Includes bounding-box ROI drawing, lat/lon input form, 6 spotlight preset buttons (`Chilecito ARG 2026: [-68.0,-29.6,-67.1,-28.7]`, `Kabylie DZA: [3.8,36.3,5.5,37.0]`, `Hassi Messaoud Gas Flares DZA: [5.5,31.3,6.6,32.2]`, `Alaska Boreal USA: [-156.0,63.0,-142.0,67.5]`, `Black Summer AUS: [147.0,-37.8,151.0,-34.5]`, `Kalimantan Peat IDN: [112.5,-3.3,115.2,-1.5]`), colorblind-safe `viridis`/`cividis` heatmap with diagonal hatching overlay on `ABSTAIN_LOW_EVIDENCE` / low-`measured_fraction` months, comparative raw-vs-harmonized time-series chart with conformal CI ribbons, and CSV download button.
 
 ---
 
-## 6. Exact Web Backend SQL Contracts (`src/webapp/server.py`)
+## 6. Complete Data Acquisition, Autonomous Mirror Discovery & Processing Pipeline
 
-`server.py` opens `fire_harmonized.duckdb` in read-only mode (`duckdb.connect(path, read_only=True)`) and serves:
-* `GET /api/calendar`: Query `state_reconstructed_monthly` joined with `uncertainty_diagnostics` filtered by bounding box (`min_lon, min_lat, max_lon, max_lat`) or `country_iso`, grouping by `(year, month)` summing `phi_q50_mw`, `phi_q05_mw`, `phi_q95_mw`, `std_events_q50`, `raw_count_sum`, `raw_frp_sum_mw`, weighted mean `measured_fraction`, and modal `quality_flag`. Compute region-level `anomaly_ratio = sum(phi_q50_mw) / max(0.5, median_2003_2020_sum)` cleanly in DuckDB SQL!
-* `GET /api/export.csv`: Stream DuckDB query results with strict formula-injection neutralization (`if val_str.startswith(('=', '+', '-', '@')): val_str = "'" + val_str`).
+### 6.1 Primary Verified Data Sources & Exact File Schemas
+1. **University of Maryland Fire Archive (`fuoco.geog.umd.edu`, login `fire` / password `burnt` via SFTP port 22 or FTP port 21):**
+   * `MCD14ML` (`MODIS/C6/MCD14ML` or `C61`): Fixed-width **space-delimited** `.txt.gz` with columns: `YYYYMMDD HHMM sat lat lon T21 T31 sample FRP conf type dn` (`version 1` omits `dn`; parse robustly, strip trailing dot on `sample` e.g. `681.`).
+   * `VNP14IMGML`, `VJ114IMGML`, `VJ214IMGML` (`VIIRS/VNP14IMGML`, `data/VIIRS/C2/...`): Comma-separated `.csv.gz` with columns: `YYYYMMDD, HHMM, Sat, Lat, Lon, T_I4, T_I5, Sample, Pixarea, FRP, Conf, Type`. Infer platform from filename (`VNP`->`SNPP`, `VJ1`->`NOAA-20`, `VJ2`->`NOAA-21`) if `Sat` is missing.
+   * **Cloud Denominator (`MOD14C8Q` / `MYD14C8Q` 8-day `0.25°` HDF4, falling back to `MOD14CMQ` / `MYD14CMQ` monthly HDF4):** Verified Table 8 SDS layers: `MeanCloudFraction`, `CorrFirePix`, `CloudCorrFirePix`, `RawFirePix` (`720 × 1440` grid, `0.25°`, upper-left center `-179.875°, +89.875°`). Read `scale_factor`, `add_offset`, and `_FillValue` dynamically from `pyhdf` SDS attributes; mask negative/fill values; normalize `[0, 100]` values to `[0.0, 1.0]`.
+   * **Burned Area Validation (`MCD64CMQ` monthly `0.25°` HDF4):** Verified SDS layers: `BurnedArea` (scaled by `scale_factor` `0.01` -> hectares $\times 0.01 = \text{km}^2$), `QA` (`2 = processed land`), `UnmappedFraction` (`0–100%`).
+2. **Cloud-Native GeoParquet 2.0 Global Mirror (`portolan-mirrors/firms-catalog` on Source Cooperative):**
+   * Verified root STAC catalog: `https://data.source.coop/portolan-mirrors/firms-catalog/catalog.json`.
+   * Year-partitioned GeoParquet files: `https://data.source.coop/portolan-mirrors/firms-catalog/detections/year=<YYYY>/detections.parquet` or `s3://us-west-2.opendata.source.coop/portolan-mirrors/firms-catalog/detections/year=*/detections.parquet`.
+   * Verified schema: `geometry` (`ST_Point`, extract via `ST_X(geometry), ST_Y(geometry)` using DuckDB `spatial` + `httpfs`), `acq_datetime`, `acq_date`, `sensor`, `satellite`, `quality`, `version`, `brightness`, `bright_t31`, `bright_ti4`, `bright_ti5`, `scan`, `track`, `frp`, `daynight`, `confidence`, `confidence_pct`, `type`, `_month`, `_hilbert`.
+3. **NASA FIRMS REST API (Strictly for Trailing 2026 NRT Gap-Fill):**
+   * Query `GET https://firms.modaps.eosdis.nasa.gov/api/data_availability/csv/{MAP_KEY}/ALL`.
+   * Fetch trailing windows via `GET https://firms.modaps.eosdis.nasa.gov/api/area/csv/{MAP_KEY}/{SOURCE}/{west,south,east,north}/{DAY_RANGE}/{YYYY-MM-DD}` with **`DAY_RANGE <= 5`** strictly, respecting the 5,000 tx / 10 min limit (`time.sleep(0.15)` + `429` exponential backoff).
+4. **Country Admin-0 Polygons:**
+   * Fetch `https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_50m_admin_0_countries.geojson`, extracting `ARG, DZA, BRA, IDN, AUS, USA`.
 
----
+### 6.2 Autonomous Data Source Discovery & Failover Protocol (If Links/Paths Change)
+If ANY primary URL, directory path, or file pattern returns `404`, `NoSuchFile`, or connection refusal, **do NOT crash, silently skip, or fabricate synthetic replacements**. Execute this exact deterministic discovery sequence and log the resolved source in `data_provenance_manifest.json`:
+1. **Remote Directory Tree Traversal (UMD SFTP / FTP):** If a hardcoded subpath (e.g. `MODIS/C6/MCD14ML`) does not exist, try FTP (`ftplib.FTP`) if SFTP port 22 fails, and recursively walk top-level directories (`sftp.listdir` / `ftp.nlst`) matching regex patterns `MCD14ML`, `V(NP|J1|J2)14IMGML`, `M[OY]D14C(8|M)Q`, `MCD64CMQ`.
+2. **STAC & Mirror Failover (Source Cooperative):** If `fuoco.geog.umd.edu` is unreachable or times out, fetch `https://data.source.coop/portolan-mirrors/firms-catalog/catalog.json` (and inspect its `child` links dynamically) or query `https://data.source.coop/portolan-mirrors/firms-catalog/detections/year=<YYYY>/detections.parquet` via DuckDB `httpfs` with bounding-box pruning (`WHERE ST_X(geometry) BETWEEN ... AND ST_Y(geometry) BETWEEN ...`)! Notice Portolan uses FIRMS `scan`/`track` schema directly from 2000 to today.
+3. **NASA CMR / Earthdata & FIRMS Bulk Archive Discovery:** For missing `MOD14C8Q` / `MOD14CMQ` / `MCD64CMQ` granules or if Portolan lacks ancillary grids, query NASA's unauthenticated Common Metadata Repository search API (`https://cmr.earthdata.nasa.gov/search/granules.json?short_name=MCD64CMQ&page_size=2000`) or FIRMS static download catalog (`https://firms.modaps.eosdis.nasa.gov/usfs/api/` / `https://firms.modaps.eosdis.nasa.gov/download/`) to locate alternate download endpoints. If no cloud CMG source can be reached for a historical period, verify whether `Mx14CMQ` exists; if all CMG fetches fail completely, log a critical warning in `data_provenance_manifest.json` and abort rather than silently fabricating zero-cloud assumptions.
+4. **Polygon Fallback Discovery:** If GitHub raw `natural-earth-vector` fails, automatically query GeoBoundaries Open API (`https://www.geoboundaries.org/api/current/gbOpen/{ISO3}/ADM0/`) and follow its `gjDownloadURL`.
+5. **Schema Validation Gate Before Acceptance:** Every dynamically discovered file must pass column-presence assertions (`lat/lon/frp/date/time` non-null rates `>= 99%`, `latitude in [-90, 90]`, `frp >= 0`, target date span populated) before entering `staged_raw/`.
 
-## 7. Exact Command Sequence (No Ambiguity)
-
-1. **Environment 1 (Internet ON, 0 GPU-hrs):**
-   * `bash src/ingest/build_wheels.sh`
-   * `python3 scripts/run_env1_stage.py --firms-key $FIRMS_MAP_KEY --out-dir ./staged_data`
-   * Upload `offline_wheels/` and `staged_data/` (`active_fires/`, `cloud_visibility_025deg.parquet`, `burned_area_val_h3.parquet`) as Kaggle Datasets.
-2. **Local/CPU Verification (`0` GPU-hrs):**
-   * `pytest tests/test_01_ingestion_schema.py tests/test_02_geometry_masking.py tests/test_03_event_clustering.py tests/test_04_observation_operators.py tests/test_05_likelihood_derivatives.py tests/test_06_gpu_solver_math.py tests/test_07_synthetic_twin_truth.py`
-   * Must pass 100% BEFORE uploading GitHub repo to Kaggle.
-3. **Environment 2 (`4x L4`, Internet OFF, Batch Execution):**
-   * `pip install --no-index --find-links=/kaggle/input/offline-wheels duckdb polars h3`
-   * `python3 scripts/run_env2_cpu_prep.py`
-   * `python3 scripts/run_env2_gpu_solve.py --gpus 4 --batch-size 2000`
-   * `python3 scripts/run_env2_validate.py`
-   * `pytest tests/test_08_conformal_uncertainty.py tests/test_09_validation_diagnostics.py tests/test_10_webapp_api_scale.py`
-4. **Environment 3 (Web App):**
-   * `uvicorn src.webapp.server:app --host 0.0.0.0 --port 8000`
-
----
-
-### Final Check Before Handing to Your Agent
-With `AGENT_MASTER_SPEC.md` + `ENGINE_MATH_AND_IMPLEMENTATION_CONTRACT.md` together, your agent now has:
-* **Zero competing architectures** (one scope, one ingestion flow, one HDF4 boundary, one 3-color GPU Newton/Thomas/Takahashi solver, one CQR conformalizer, one FastAPI + MapLibre/ECharts web app).
-* **Zero mathematical gaps** (verified analytical gradients, convexity-guarded Hurdle Hessians, exact $LDL^\top$ Takahashi & joint Cholesky trajectory sampling in `float64`, exact formulas for zero-detection operational passes).
-* **166+ deterministic `pytest` falsification tests** enforcing every invariant from ingestion through live API latency.
-
-
-
-## 1. Main Problem, Underlying Challenges, Hard Constraints, and Core Principles
-
-### 1.1 The Core Scientific Problem
-The NASA Space Apps 2026 Challenge (*"Harmonization of MODIS and VIIRS Hot Spots"*, authored by CONAE, Argentina) requires transforming more than 25 years (2000–2026) of fragmented satellite active-fire detections into a **sensor-independent, scientifically consistent record** and serving it inside an interactive **Burning Activity Calendar Web Application**.
-
-The real scientific difficulty is **not** aligning CSV schemas or rescaling one sensor to look like another. It is an **inverse state-estimation problem**: reconstructing what actually happened in the **physical world** (fire radiative intensity, total energy released, spatial expansion, combustion regime, persistence) from imperfect, incomplete, and heterogeneous reports generated in the **measurement world** by aging and retiring satellite constellations.
-
-Specifically, our system must separate three distinct causes of observed numerical change:
-1. **A real change in the fire:** Ignition, intensification, lateral spread, transition from daytime grass flaming to nighttime woody/peat smoldering, or extinction.
-2. **A change in the observing system:** Sensor replacement, spatial resolution jumps (`1 km` MODIS vs. `375 m` VIIRS), spectral bandpass & saturation differences (`3.96 um` Band 21/22 vs. `3.74 um` I4 saturating at ~367 K with `4.05 um` M13 fallback), scan-edge pixel stretching (`1 km2 -> 9.6 km2` MODIS vs. `0.14 km2 -> 0.62 km2` VIIRS), MODIS bow-tie overlap duplication vs. VIIRS bow-tie deletion, constellation multiplicity (Terra alone 2000–2002; +Aqua 2002–2021; +SNPP 2012–Nov 2, 2026; +NOAA-20 2018–present; +NOAA-21 2023–present), and post-2022 Terra/Aqua orbital clock drift (`10:30 AM -> ~8:45 AM` and `1:30 PM -> ~3:30–3:50 PM`).
-3. **A change in observation quality or availability:** Cloud obscuration, smoke, orbital swath gaps, detection confidence differences (`0–100` vs. `'l'/'n'/'h'`), South Atlantic Magnetic Anomaly (SAMA) false alarms, static industrial gas flares/volcanoes, and data latency (`URT/NRT` replacing missing `type` vs. reprocessed `Collection 2 / 6.1 ML` science archives).
-
-Across our discussion, we also recognized a **fundamental identifiability boundary**: active-fire radiometric power (FRP) alone cannot uniquely determine fuel load, combustion completeness, or exact sub-pixel flame temperature ($T_f$) vs. flame area ($A_f$) (classical Dozier dual-band inversions fail numerically on noisy orbital imagery). Therefore, the engine must restrict its outputs strictly to **identifiable or statistically bounded physical quantities** and explicitly report **uncertainty and ambiguity** rather than fabricating false precision.
-
-### 1.2 Hard Engineering & Resource Constraints
-Every architectural decision was shaped by five non-negotiable operational constraints:
-1. **36-Hour Total Deadline:** Complete ingestion, modeling, calibration, GPU inference, validation, testing, and web application delivery in 36 hours.
-2. **12 GPU-Hour Budget on 4x NVIDIA L4 (~96 GB aggregate VRAM):** Hosted in a Kaggle Code Competition environment. Crucially, Kaggle multi-GPU (`L4x4`) instances can consume weekly quota at **2x wall-clock speed** (`12 GPU-hours = ~6 real hours max`), requiring strict CPU-first development and batched GPU-only math execution.
-3. **Offline Execution & Disk Limits on Kaggle `L4x4`:** Internet access is disabled on the GPU notebook, Python runs **3.12** (`v173` runtime), `/kaggle/working` persists a maximum of **~20 GB**, and code/dependencies must enter via GitHub-imported Datasets and prebuilt `.whl` Datasets.
-4. **Geographic Bandwidth Constraint:** Working from Algeria makes downloading 40–55 GB of global raw NASA CSVs locally and re-uploading them to Kaggle physically infeasible within 36 hours.
-5. **Single-System Cohesion:** Late in the conversation, we locked a strict mandate to eliminate competing branches, alternative pipelines, and fallback UI prototypes so an autonomous coding agent executes one unambiguous end-to-end architecture.
-
-### 1.3 Ten Non-Negotiable Core Principles (Finalized)
-We finalized 10 system invariants (`INV-01` through `INV-10`):
-* **INV-01:** Never train a model making VIIRS imitate MODIS or MODIS blindly imitate VIIRS; fuse both into a shared physical latent state.
-* **INV-02:** Never sum same-orbit afternoon VIIRS platforms (`SNPP + NOAA-20 + NOAA-21` separated by ~50 min); treat them as repeated conditional observations of the same half-day state.
-* **INV-03:** Freeze cross-sensor calibration strictly to pre-drift **2012-01-20 through 2021-12-31**; handle 2022–2026 Terra/Aqua orbital drift via the time-of-day diurnal operator.
-* **INV-04:** Track exact satellite operational lifespans (`is_operational[p, d]`), explicitly closing `SNPP` on `2026-11-02`.
-* **INV-05:** Separate forward measurement operators $Y_{s,t} = h_s(X_t, \theta_s, G_{s,t}, A_{s,t}) + \epsilon_{s,t}$ and detection probability $D_{s,t} \sim \text{Bernoulli}(p_s)$ from physical-state estimation $P(X_t \mid Y_{1:t}, D_{1:t}, Q_{1:t}, G_{1:t})$.
-* **INV-06:** Never average raw MODIS and VIIRS brightness temperatures (`brightness`/`bright_t31` vs. `bright_ti4`/`bright_ti5`).
-* **INV-07:** Account for MODIS sub-threshold blindness ($F_{\min} \approx 3.7\text{–}40\,\text{MW}$) on zero-detection days so 2000–2011 uncertainty widens honestly.
-* **INV-08:** Separate static industrial heat sources, volcanoes, offshore platforms, and SAMA nighttime artifacts before biomass inference.
-* **INV-09:** Preserve untouched raw measurements alongside reconstructed states and diagnostic uncertainty via **3 complementary output products**.
-* **INV-10:** Exclude `latitude` and `longitude` from unsupervised behavioral pyrome clustering to prevent spatial memorization.
+### 6.3 Normalization & Verification (`normalize_dedup.py`)
+1. Normalize satellite descriptors (`T/Terra/TERRA -> Terra`, `A/Aqua/AQUA -> Aqua`, `N/SNPP/NPP/Suomi-NPP -> SNPP`, `1/J1/N20/NOAA-20 -> NOAA-20`, `2/J2/N21/NOAA-21 -> NOAA-21`).
+2. Preserve `conf_raw` natively (`'l'/'n'/'h'` or `'0'..'100'`), map `conf_num` (`low=20, nominal=65, high=95`, float parse for numeric). Set `type_raw = -1` when missing (`NRT`).
+3. Clip rows strictly inside the 6 Natural Earth Admin-0 polygons via `shapely.contains_xy`.
+4. **Science-Tier Dominance Deduplication:** Drop all `NRT` rows for any `(platform, acq_date)` covered by `ML_SCIENCE` or `SP_SCIENCE` for that platform (eliminating 40–300 m LUT geolocation-shift duplicates cleanly). Resolve intra-tier overlaps by `(platform, acq_date, acq_hhmm, ROUND(latitude, 3), ROUND(longitude, 3))` keeping `tier_rank ASC, ingest_ts DESC`.
+5. Compute `platform_active_day[P, T]`: mark platform $p$ inactive on UTC date $t$ if total detections across all 6 countries `< 5` (masking spacecraft safe-mode outages).
+6. Verify mandatory coverage checks: `ARG` Jul–Aug 2026 Chilecito detections present; `SNPP` ends on `2026-11-02`; `NOAA-20` & `NOAA-21` continue through `2026-11-14`; `DZA` preserves `type=2` static flares.
 
 ---
 
-## 2. Systematic Decision Record: Overall Architecture & Infrastructure
+## 7. Complete Testing & Validation Framework (`pytest` — 166+ Tests)
 
-### Decision D1: Three-Environment Pipeline Separation **[FINALIZED]**
-1. **Final Decision:** Split execution across three decoupled environments:
-   * **Environment 1 (Internet-ON Standard Kaggle CPU Notebook or Cloud Terminal, 0 GPU-hrs):** Downloads raw data cloud-to-cloud, parses HDF4 ancillary cloud files, normalizes/deduplicates into Parquet (`<= 2.5 GB`), and downloads Python 3.12 `manylinux` wheels (`duckdb`, `polars`, `h3`).
-   * **Environment 2 (Internet-OFF Kaggle `4x L4` GPU Notebook):** Mounts staged Parquet + GitHub Code + `.whl` Datasets via a single path resolver (`paths.py`), runs offline `pip install --no-index`, executes calibration, GPU state-space solver, conformal calibration, and exports DuckDB + 3 Parquet products (`<= 3–4 GB`).
-   * **Environment 3 (External Web Host / Local Server):** Runs `FastAPI + DuckDB` serving the frontend directly from the exported DuckDB database.
-2. **Reasoning:** Solves all three hard constraints simultaneously: avoids residential upload bottlenecks from Algeria, obeys offline Kaggle `L4x4` security restrictions, isolates C-library compilation (`libhdf4-dev` for `pyhdf`, which lacks Python 3.12 `manylinux` wheels) inside Environment 1 so Environment 2 stays pure prebuilt wheels, and avoids trying to expose an interactive web server from an ephemeral offline notebook.
-3. **Alternatives Considered:** (a) Downloading/uploading datasets from local PC to Kaggle; (b) Bundling CUDA/RAPIDS/PyHDF compiled wheels for Environment 2; (c) Hosting Streamlit/Gradio inside Kaggle via tunneling (`ngrok`).
-4. **Why Rejected:** (a) Multi-GB residential upload wastes 15–25 hours; (b) Compiling HDF4 or CUDA extensions across ABI mismatches inside a 36-hour hackathon causes catastrophic environment failures; (c) Internet-disabled `L4x4` notebooks block outbound tunnels completely and burn GPU quota while idling.
-5. **Layer Design Role:** Acts as the physical execution backbone connecting Ingestion (Layer 1) $\rightarrow$ Compute (Layers 2–7) $\rightarrow$ Presentation (Layer 8).
-6. **Consequences:** Adds one manual Dataset-publishing handoff step between Env 1 and Env 2 (and artifact download between Env 2 and Env 3), but reduces GPU waste to zero during ETL and makes offline runs deterministic.
-7. **Evidence & Confidence:** **High confidence (Engineering judgment grounded in verified Kaggle Python 3.12 `v173` / offline competition rules).**
+Every test file must execute deterministically via `pytest` with concrete assertions (zero placeholder tests):
 
-### Decision D2: Spatial Reference Grid (`Uber H3 Equal-Area Hexagons`) **[FINALIZED — CRITICAL REVISION NEEDED ON RESOLUTION]**
-1. **Final Decision (As Stated in Spec):** Tile space into equal-area **Uber H3 hexagons** at **Resolution 6** ($\bar{A} \approx 36.13\,\text{km}^2$) rather than matching raw points or using lat/lon degree cells, with **H3 Resolution 10** ($\sim 0.015\,\text{km}^2$) strictly for static gas-flare persistence masking.
-2. **Reasoning:** Point-to-point matching between `1 km` MODIS and `375 m` VIIRS is ill-posed (1 MODIS pixel spans 1–16 VIIRS pixels). Standard $0.25^\circ \times 0.25^\circ$ lat/lon cells shrink in area by $\cos(\text{latitude})$ toward the poles, distorting fire density (requiring explicit cosine corrections as in GFED5). H3 hexagons provide uniform area globally, isotropic adjacency (6 equidistant neighbors for 1-ring spatial coupling), and fast integer indexing.
-3. **Alternatives Considered:** (a) Point-to-point nearest-neighbor matching; (b) Uniform $0.25^\circ \times 0.25^\circ$ or $0.1^\circ \times 0.1^\circ$ lat/lon grid; (c) Global coarse `H3-Res4` ($\sim 1,770\,\text{km}^2$) Tier 2 dual-pipeline alongside `H3-Res6`.
-4. **Why Rejected:** (a) Fails when pixel footprints expand 9× off-nadir; (b) Suffers poleward area distortion and non-uniform diagonal vs. edge neighbor distances; (c) Maintaining a second global `H3-Res4` branch alongside `H3-Res6` violated the single-system mandate and risked missing Hour-4 deadlines.
-5. **Layer Design Role:** `src/geometry/h3_utils.py` wraps `h3 v3/v4` APIs, maps raw points to 64-bit integer H3 indices, builds the sparse active-cell adjacency list, and computes a **3-coloring** of active hexagons.
-6. **Consequences & Brutally Honest Critique (Critical Audit Catch!):**
-   * Look closely at the numbers we assumed in our last spec (`~35,000–65,000` active cells across the 6 countries) vs. reality: the combined land area of `BRA + AUS + USA + IDN + ARG + DZA` is **~33.1 million $\text{km}^2$**, which equals **~916,000** H3 Resolution 6 hexagons. Across 26 years (especially with sensitive `375 m` VIIRS), **250,000 to 400,000+ hexagons** will contain at least 1 fire detection—**5× to 8× larger** than the `35,000–65,000` assumed!
-   * **Impact:** `300,000 cells × 9,510 days = 2.85 billion daily records`! That blows up BOTH GPU wall-clock runtime AND Kaggle's **20 GB** output limit if dense daily grids are exported!
-   * **Recommended Revision:** Either (i) run the core engine at **H3 Resolution 5** ($\bar{A} \approx 252.9\,\text{km}^2$, ~130k land hexagons total / ~50k–80k fire-active hexagons—matching municipal/landscape calendar scale cleanly!) while keeping **H3-Res6** strictly for high-detail spotlight verification tiles (`Chilecito`, `Kabylie`, `Alaska`), OR (ii) keep `H3-Res6` only for cells with $\ge 3$ active fire days over 26 years AND **never export dense daily tables** (see Decision D13).
-7. **Evidence & Confidence:** **High confidence in H3 over lat/lon; Low confidence in our earlier `35k–65k` active-cell count estimate at Res-6—needs immediate empirical count at Hour 4!**
-
-### Decision D3: Geographic Scope (6 Multi-Biome Benchmark Countries) **[FINALIZED — BBOX VS. POLYGON FLAW IDENTIFIED]**
-1. **Final Decision:** Operate on **6 scientifically chosen countries** (`ARG`, `DZA`, `BRA`, `IDN`, `AUS`, `USA` split into `CONUS` + `Alaska`), rather than attempting global pixel-level ingestion in 36 hours.
-2. **Reasoning:** Each country stress-tests an essential scientific failure mode while keeping compressed raw data manageable (~1.5–3 GB Parquet):
-   * `ARG`: CONAE July–Aug 2026 Chilecito spotlight, Pampas crop fires, SAMA zone.
-   * `DZA`: Northern Kabylie Mediterranean crown fires (2021/2023) vs. Saharan Hassi Messaoud static gas flares.
-   * `BRA`: High-density 2012–2021 Amazon/Cerrado calibration backbone + tropical clouds + SAMA.
-   * `IDN`: Extreme equatorial cloud persistence (`<30–40%` single-pass visibility) + nighttime peat smoldering + abstention flag stress test.
-   * `AUS`: Low-FRP savanna burns + 2019–2020 Black Summer VIIRS I4 (`367 K`) saturation.
-   * `USA`: Western crown fires, SE prescribed burns, and Alaska boreal fire clusters (testing the ~47% boreal MODIS-vs-VIIRS discrepancy documented by Li et al.).
-3. **Alternatives Considered:** (a) Full global pixel-level 2000–2026 harmonization (`150M+` rows); (b) Only 1–2 small countries (e.g., Argentina + Algeria alone).
-4. **Why Rejected:** (a) Global raw `150M+` rows (`35–55 GB` CSV) exceeds Kaggle's 20 GB output cap and 36-hour compute window; (b) 1–2 countries fail to span boreal, peat, savanna, and deforestation regimes, leaving cross-biome generalization unvalidated.
-5. **Layer Design Role:** Defined purely as geographic coordinate filters inside `src/config/settings.py`; all downstream physics, pyromes, and solvers remain 100% coordinate-agnostic.
-6. **Consequences & Brutally Honest Critique (Critical Audit Catch!):**
-   * Filtering global SFTP CSVs using **rectangular bounding boxes** (`[min_lon, min_lat, max_lon, max_lat]`) accidentally captures **huge non-target landmasses** (`BRA` bbox captures Bolivia, Paraguay, Peru, Uruguay, Colombia; `DZA` bbox captures Tunisia and parts of Morocco, Libya, Mali, Niger; `ARG` bbox captures Chile). This silently doubles active cell counts and wastes GPU hours!
-   * **Recommended Revision:** Inside Environment 1 (`normalize_dedup.py`), apply exact **country polygon clipping** (`shapely.contains_xy` using Natural Earth / GeoBoundaries admin-0 polygons for `ARG, DZA, BRA, IDN, AUS, USA`) right after the fast bounding-box prefilter.
-7. **Evidence & Confidence:** **High confidence in the 6-country biome selection; High confidence that bounding-box-only filtering must be upgraded to polygon clipping.**
-
-### Decision D4: Implementation Language, Libraries & Offline Packaging **[FINALIZED]**
-1. **Final Decision:**
-   * **ETL & Tabular Analytics:** `DuckDB` + `Polars` + `pyarrow` + `h3` (CPU).
-   * **Geometry & Clustering:** `scipy.spatial.cKDTree` + `scipy.sparse.csgraph.connected_components` + `shapely` (CPU).
-   * **Calibration:** `scikit-learn` (`GaussianMixture`, `IsotonicRegression`) + `lightgbm` (CPU).
-   * **Inference Engine:** Pure `PyTorch` (`torch.float64` `@torch.jit.script` kernels, `torch.multiprocessing` across `4x L4`).
-   * **Offline Wheels Dataset:** Strictly `duckdb`, `polars`, `h3` (`manylinux2014_x86_64`, Python 3.12).
-2. **Reasoning:** `DuckDB` + `Polars` execute vectorized out-of-core queries on tens of millions of rows in seconds on CPU without spending GPU quota. Kaggle's base Docker image already ships compiled CUDA `PyTorch`, `LightGBM`, `Scikit-learn`, `SciPy`, and `Shapely`. Pure `@torch.jit.script` avoids custom C++/CUDA kernel compilation while retaining native GPU execution.
-3. **Alternatives Considered:** (a) RAPIDS `cuDF` / `cuSpatial`; (b) `JAX` + `NumPyro`; (c) `GeoPandas` + `PostGIS` for ETL.
-4. **Why Rejected:** (a) Multi-GB CUDA wheels risk fatal driver/glibc conflicts offline; (b) Same offline wheel compilation risk plus multi-day MCMC infeasibility; (c) GeoPandas/PostGIS are orders of magnitude slower on 30M+ points than DuckDB/Polars + ECEF `cKDTree`.
-5. **Consequences:** Minimal wheel dataset (`< 80 MB`), ~10-second offline install, clean separation of CPU I/O from GPU numerical math.
-6. **Evidence & Confidence:** **High confidence (95%).**
+1. **`tests/test_01_ingestion_schema.py` (18 tests):** Space-delimited `MCD14ML` (`sample` with trailing dot, v1 missing `dn`), `Vxx14IMGML` CSV, Portolan GeoParquet `geometry` extraction, FIRMS API CSV, satellite alias mapping, mixed confidence parsing, missing `type -> -1`, `(platform, acq_date)` Science dominance dropping shifted NRT duplicates, polygon clipping excluding neighboring countries (`Bolivia/Tunisia/Chile`), base-60 `acq_hhmm` conversion (`51 -> 0.85h`), and solar date midnight rollover across $\pm 180^\circ$.
+2. **`tests/test_02_geometry_masking.py` (18 tests):** Exact spherical `Sample -> scan, track, VZA` (MODIS nadir `1.00 km²`, edge `~9.72 km²`), monotone spline VZA inversion `[0, 65]`, MODIS bow-tie overlap conservation (`2 × 40 MW -> 40 MW`), SAMA nighttime low-conf filter, `H3-Res8` gas flare isolation absorbing 200 m geolocation jitter while preserving seasonal fires, `h3 v3/v4` `int64 <-> str` compatibility, and strict 3-coloring validity (`color[u] != color[v]` across all adjacent edges).
+3. **`tests/test_03_event_clustering.py` (14 tests):** 3×3 contiguous VIIRS cluster -> 1 event, separated clusters -> 2 events, `SNPP + N20 + N21` within 50 min kept as 3 distinct pass rows (never summed), 5-minute pass gap split, `i4_m13_fallback` vs Tobit `sat_flag` classification.
+4. **`tests/test_04_observation_operators.py` (20 tests):** Detection threshold ordering (`MODIS_day > MODIS_night > VIIRS_night`), analytical survival integrals $\psi \in (0, 1]$ monotonicity, conditional $\psi^{\text{FRP, eff}}$ smoothing (`E_raw=1` vs `E_raw=5`), separate 12-hour `Day` (`06–18`) and `Night` (`18–06`) Fourier integrals equaling `1.0 ± 1e-4`, `ln(v)` strictly absent from $\mu^{\text{gain, det}}$, monotonic EQM ordering, heteroscedastic $\sigma^2$ ordering, coordinate-shift invariance of GMM pyromes, and trailing-2026 cloud climatology fallback.
+5. **`tests/test_05_likelihood_derivatives.py` (22 tests):** Finite-difference gradient & Hessian parity (`< 1e-6`) for Obs, Tobit Saturation (over `w in [-35, +5]` testing asymptotic tail without `NaN`/`Inf`), and Hurdle Zero; Tobit asymmetry; convexity guard (`h_miss >= 0`) inside `(v=0.7, Lambda=2.5)`; uniform $\Phi = e^z$ consistency; empirical `platform_active_day` outage masking.
+6. **`tests/test_06_gpu_solver_math.py` (20 tests):** `float64` Thomas solver vs `torch.linalg.solve` (`< 1e-10`); Takahashi diagonal & lag-1 vs `torch.linalg.inv(H)` (`< 1e-10`); empirical covariance of $10{,}000$ joint Cholesky draws $L^\top u = D^{-1/2}\varepsilon$ matching $H^{-1}$; Armijo strict objective descent; 3-color spatial cloud recovery; `cuda_kernels.py` CUDA-vs-CPU parity (`< 1e-10`); dynamic range `10^-4 .. 10^6 MW` stability.
+7. **`tests/test_07_synthetic_twin_truth.py` (18 tests):** Complete 26-year synthetic forward simulator with known ground truth $X_{\text{true}}$ (`Day/Night` contrast, 2002 Aqua, 2012 SNPP, 2018 N20, 2022 drift, 2023 N21, Nov 2026 SNPP end, 50% clouds, bow-tie, gas flares) asserting: 2012 raw jump `> +150%` eliminated (`< ±10%`); 3-satellite inflation eliminated; `night_day_ratio` preserved (`error < 15%`); Nov 2026 cutoff unbiased; post-2022 drift corrected; monthly correlation `r > 0.90`; 5× drought spike preserved within `±15%`.
+8. **`tests/test_08_conformal_uncertainty.py` (12 tests):** Split-conformal coverage inside `[1 - alpha - 0.03, 1 - alpha + 0.05]` for $\alpha \in \{0.05, 0.10, 0.20\}$; `q05 <= q50 <= q95`; 2005 uncertainty strictly wider than 2024; cloudy uncertainty wider than clear; `ABSTAIN_LOW_EVIDENCE` trigger; 14-day fixed-lag update matching full batch (`< 1e-3`) across an active fire transition.
+9. **`tests/test_09_validation_diagnostics.py` (12 tests):** Chow & Pettitt structural breaks catching raw 2012 jump (`p < 0.001`) and passing harmonized control (`p > 0.05`); 2019–2021 VIIRS ablation outperforming raw MODIS on CRPS & Spearman $\rho$; `MCD64CMQ` burned-area correlation improvement; Product 1/2/3 schema & sparse daily export invariants.
+10. **`tests/test_10_webapp_api_scale.py` (12 tests):** All 5 FastAPI endpoints return 200 and expected JSON keys; CSV formula-injection neutralization (`=`, `+`, `-`, `@`); empty-bbox handling; DuckDB query latency `< 300 ms`; single-GPU chunk (`batch_size = 1000, T = 9510`) VRAM `< 6 GB`.
 
 ---
 
-## 3. Layer-by-Layer Design & Technical Decisions
+## 8. Sequential Implementation Plan & Verification Gates
 
-### Layer 1: Data Acquisition, Ancillary Cloud/Validation Grids & Normalization (Decision D5)
-* **Status:** **[FINALIZED IN LATEST CONTRACT — SUPERSEDES EARLIER DRAFT & CARRIES UNTESTED PORT-22 RISK]**
-1. **Final Decision:**
-   * Primary historical active fires (`MCD14ML`, `VNP14IMGML`, `VJ114IMGML`, `VJ214IMGML`), cloud grids (`Mx14CMQ`), and burned area validation shapefiles (`MCD64A1/SHP`) stream from `sftp://fire:burnt@fuoco.geog.umd.edu`.
-   * Environment 1 parses `Mx14CMQ` HDF4 files immediately into `cloud_visibility_025deg.parquet` (`< 25 MB`) and `MCD64A1` shapefiles into `burned_area_val_h3.parquet`.
-   * Trailing 2026 `*_NRT` detections up to `2026-11-14` pull via NASA FIRMS `/api/data_availability/csv/{MAP_KEY}/ALL` and `/api/area/csv/{MAP_KEY}/{SOURCE}/{bbox}/5/{DATE}` (`DAY_RANGE <= 5`), deduplicating overlaps strictly by `ML_SCIENCE > SP_SCIENCE > NRT`.
-2. **Reasoning:** UMD `fuoco.geog.umd.edu` hosts complete post-May-2025 reprocessed Collection 2 VIIRS `ML` files (fixing the historical `type=2` bug) and Collection 6.1 MODIS `ML` files alongside `Mx14CMQ` cloud denominators. NASA FIRMS `/api/country` is currently unavailable, leaving `/api/area/csv/.../5/...` as the verified live REST bridge for trailing 2026 NRT data.
-3. **Alternatives Considered:** (a) Using `01_download_and_stage.py`'s earlier `/api/country/csv` + HTML scraper fallback; (b) Extracting daily pixel-level cloud masks from raw `MOD35`/`VNP35` L2 swath granules; (c) Using only `NRT` streams or ignoring cloud denominators.
-4. **Why Rejected:** (a) `/api/country` is disabled on FIRMS API, making Turn 7's script broken unless patched; (b) Daily L2 `MOD35`/`VNP35` across 26 years exceeds 10 TB; (c) Ignoring clouds makes cloudy non-detections indistinguishable from zero-fire days.
-5. **Layer Design & Data Flow:** Streams one monthly `.csv.gz` to `/tmp` $\rightarrow$ filters to polygon/bbox $\rightarrow$ normalizes `brightness/bright_ti4 -> t_mir_k`, `bright_t31/bright_ti5 -> t_tir_k`, satellite aliases, mixed confidence, missing `type -> -1` $\rightarrow$ deletes `/tmp/*.csv.gz` $\rightarrow$ deduplicates in DuckDB $\rightarrow$ writes Zstd Parquet partitioned by `(country_iso, year)`.
-6. **Consequences & Brutally Honest Critique (Critical Audit Catch!):**
-   * **Contradiction Flag:** Our code snippet in Turn 7 still contained `/api/country/csv` and HTML scraping, which Turn 9 explicitly superseded—that script MUST be updated before Hour 0!
-   * **Untested Port-22 / API Rate Risk:** We have **not** tested whether Kaggle's internet-enabled CPU containers allow outbound SFTP on TCP port 22 (`fuoco.geog.umd.edu`). If port 22 is firewalled, falling back to `/api/area/csv/.../5/...` across 26 years $\times$ 7 boxes $\times$ 4 sources requires `~50,000+` HTTP requests, violating NASA's `5,000 transactions / 10 min` limit and blowing past Hour 4!
-   * **Cloud Temporal Granularity Weakness:** Using *monthly* `MOD14CMQ` (`Mx14CMQ`) smears 3-day cloudy storms across an entire month. `fuoco.geog.umd.edu` also hosts **8-day `MOD14C8Q` / `MYD14C8Q`** CMG files—upgrading from monthly to **8-day** cloud grids improves daily missingness fidelity 4× at negligible cost!
-7. **Evidence & Confidence:** **Medium confidence — requires an immediate Hour-0.5 live connectivity check on Kaggle port 22 & FIRMS `MAP_KEY`, with pre-queued FIRMS Archive Bulk Zip Downloads (`firms.modaps.eosdis.nasa.gov/download/`) as the real SFTP fallback rather than 50,000 5-day API calls.**
-
-### Layer 2: Geometry Correction, Hygiene & Event Association (Decision D6)
-1. **Final Decision:**
-   * Compute local solar time $\tau_i$ and split into **Day** vs. **Night** regimes.
-   * Recover pixel footprint $A_i = \text{scan}_i \times \text{track}_i$ and monotone spline VZA $\theta_i \in [0^\circ, 65^\circ]$.
-   * Remove volcanoes (`type=1`), offshore (`type=3`), nighttime low-conf SAMA points, and **H3-Res10 persistent industrial/gas-flare sources** (`type=2` OR $Y_m \ge 3$ active years, $\ge 15$ active days/yr, day/night symmetry $> 0.30$).
-   * Within single-platform overpasses ($\Delta t \le 5\,\text{min}$), apply MODIS bow-tie overlap down-weighting ($\omega^{\text{bt}}_i = 1 / (1 + \text{deg}_{\text{bt}}(i))$ for $A_i > 1.5\,\text{km}^2$), cluster touching pixels via `cKDTree` + connected components (`d_ij <= 1.4 * max(sqrt(A_i), sqrt(A_j))`), flag `i4_m13_fallback` vs. true Tobit saturation `sat_flag`, and aggregate strictly per `(h3_index, solar_date, platform, dn_flag)`—never summing across platforms.
-   * For zero-detection operational passes (`Y == 0`), supply analytical swath-averaged parameters ($\bar{A}_{\text{MODIS}}=2.35\,\text{km}^2, \bar{A}_{\text{VIIRS}}=0.23\,\text{km}^2$, latitude swath probability $p_{\text{swath}}$, and piecewise-linear orbital drift solar hour $\bar{\tau}(d)$).
-2. **Reasoning:** Eliminates bow-tie scan-edge inflation (Freeborn et al., 2014), prevents VIIRS pixel-splitting from inflating counts, prevents NRT gas flares (especially Algeria's Saharan oil fields) from masquerading as wildfires, prevents `SNPP + N20 + N21` triple-counting, and guarantees zero `NaN`s when computing the Hurdle non-detection likelihood.
-3. **Alternatives Considered:** (a) Naive point aggregation; (b) Probabilistic Multi-Hypothesis Tracking (MHT) linking fire perimeters across multiple weeks; (c) Hard-dropping all low-confidence detections.
-4. **Why Rejected:** (a) Violates basic physics and injects 3×–5× sensor artifacts; (b) MHT across 26 years of discontinuous polar passes is computationally intractable in 36 hours and unnecessary for monthly/daily cell reconstruction; (c) Dropping low-confidence agricultural/understory fires induces severe omission bias.
-5. **Consequences:** Clean separation of static sources, preserved raw events in Product 1, and well-defined `pass_observations` inputs for calibration and GPU inference.
-6. **Evidence & Confidence:** **High confidence (90%, grounded in Freeborn et al., Giglio et al., Andela et al. FEDS clustering, and NASA C2 documentation); note the heuristic H3-Res10 thresholds (`3 yrs, 15 days/yr, 0.30`) are engineering judgments requiring visual verification on Algeria & Indonesia peatlands.**
-
-### Layer 3: Pre-Drift Observation Operator Calibration (Decision D7)
-1. **Final Decision:** Fit all cross-sensor parameters strictly on `2012-01-20 .. 2021-12-31`:
-   * Coordinate-free `K=7` GMM behavioral pyromes (`pyromes.py`).
-   * Isotonic confidence reliability curve $w_i \in [0.15, 1.0]$.
-   * Linear pixel-area detection limits $F_{\min, p}(A, \text{DN})$ (Sofiev & Kouznetsov, 2026) + MLE Log-Normal fire-cluster distribution $\implies$ closed-form analytical survival integrals $\psi^{\text{CNT}}, \psi^{\text{FRP}}$.
-   * Monotonic LightGBM + Empirical Quantile Mapping (EQM) residual transfer $\gamma_{\text{MODIS}, b}(\bar{\theta}_p, q)$ on synchronous 45-minute Aqua–SNPP pairs ($\gamma_{\text{VIIRS}} \equiv 1$).
-   * 2-harmonic Fourier diurnal & drift curve $D_{b,s}(\tau)$ normalized to 24-hour unit mean, fitted on Terra–Aqua (`2003–2021`) plus Aqua's post-2022 solar-hour drift vs. stationary NOAA-20 (updating *only* diurnal coefficients, never cross-sensor $\psi, \gamma$).
-   * Heteroscedastic log-variance model $\sigma^2_{p,g,d,\text{DN}} \in [0.025, 2.50]$.
-2. **Reasoning:** Directly models *why* MODIS and VIIRS differ across intensity quantiles, scan angles, ecosystems, and solar hours without collapsing them into a single universal constant (which fails between +47% boreal clusters and -20% global averages). Using closed-form Log-Normal survival avoids noisy numerical quadrature.
-3. **Alternatives Considered:** (a) Single global MODIS/VIIRS scaling ratio; (b) Random Forest / MLP trained end-to-end `VIIRS -> MODIS`; (c) Hourly geostationary GOES/SEVIRI diurnal templates.
-4. **Why Rejected:** (a) Scientifically invalid across biomes and intensity tails; (b) Violates INV-01; (c) Ingesting 26 years of GOES + Meteosat SEVIRI breaks the 36-hour deadline.
-5. **Consequences & Honest Critique:**
-   * **Fragile Assumption:** Estimating the 2-harmonic diurnal curve solely from polar overpasses (~10:30, ~13:30, ~15:30, and ~12h night pairs) leaves daytime afternoon peak curvature between `15:30` and `21:00` weakly constrained—meaning 24-hour FRE integration relies heavily on the 2-harmonic smoothness assumption.
-   * **Non-Stationarity Risk:** Applying `2012–2021` Log-Normal small-fire distributions $\psi$ backward to `2000–2011` assumes within-pyrome fire-size shapes didn't radically change across decades.
-6. **Evidence & Confidence:** **High confidence in the correction-before-fusion framework (Kaur et al., 2019; Ding et al., 2026; Sofiev & Kouznetsov, 2026); Moderate confidence in polar-only 24h diurnal peak accuracy (`FRE` absolute TJ may carry systematic bias even when relative monthly anomalies are accurate).**
-
-### Layer 4: Latent State-Space Model, Likelihoods & GPU Solver (Decisions D8, D9, D10)
-
-#### Decision D8: Physics-Informed Bayesian State-Space Model vs. ML/Tensor/MCMC **[FINALIZED]**
-1. **Final Decision:** Reconstruct daily latent Day and Night log-fluxes $z_{g,d,\text{Day}}, z_{g,d,\text{Night}}$ via a **Space x Time x Day-Night Gaussian Markov Random Field (GMRF) / State-Space MAP-Laplace Model** with deterministic Empirical Bayes priors $(\mu_{g,m,\text{DN}}, \rho_b, \sigma_{\text{proc},b}, \lambda_{0,b}, \beta_{\text{dn},b}, \eta_{\text{dn},b})$ learned from 2012–2021 VIIRS.
-2. **Reasoning:** Preserves physical conservation and units ($\text{MW}$, $\text{TJ}$), handles unequal observation times/precisions via inverse-variance weighting, bridges patchy cloud gaps via temporal persistence + 1-ring spatial neighbors, never hallucinates fake megafires, and runs deterministically in minutes on `4x L4`.
-3. **Alternatives Considered:** (a) Deep Transformers / ConvLSTM / Diffusion models; (b) Low-Rank Tensor Completion (CP/Tucker across Space x Time x Feature); (c) Full Bayesian HMC/MCMC (`NumPyro` / `PyMC`); (d) Joint active-fire + `MCD64A1` burned-area raster inversion.
-4. **Why Rejected:** (a) No wall-to-wall ground-truth labels exist globally across 2000–2026, risking severe hallucination; (b) Low-rank completion systematically oversmooths rare sudden extreme wildfires (which are inherently high-rank outliers); (c) MCMC over $10^5$ cells $\times 9,510$ days cannot converge in 12 GPU-hours; (d) Joint raster-point inversion adds huge cross-modality lag complexity in 36h, so `MCD64A1` is cleaner as an independent validator.
-5. **Consequences:** Transparent, auditable equations where every prediction decomposes into measured data likelihood vs. prior persistence.
-6. **Evidence & Confidence:** **High confidence (90%, directly generalizes CAMS GFAS Kalman persistence of Kaiser et al., 2012).**
-
-#### Decision D9: Three-Part Likelihood with Convexity Guard **[FINALIZED]**
-1. **Final Decision:** Combine (A) Gaussian log-FRP likelihood for unsaturated detections, (B) **Right-Censored Tobit likelihood** (via stable `log_ndtr` + inverse Mills ratio) for saturated detections, and (C) **Hurdle Poisson-Cloud Mixture likelihood** $P(D=0 \mid z) = (1-v) + v e^{-\Lambda(z)}$ for zero-detection operational passes—using the **exact analytical gradient** alongside a **positive-projected Gauss-Newton Hessian guard** $h_{\text{miss}} = \max(0.0, \ell''_{\text{miss}})$.
-2. **Reasoning:** Directly enforces INV-07 and handles detector saturation without treating ceilings as exact point values. Because the two-component cloud mixture $(1-v) + v e^{-\Lambda}$ exhibits slight negative curvature when $v < 1$ and $\Lambda \in (1, 4)$, the `max(0.0, ...)` guard mathematically guarantees a Symmetric Positive Definite ($H \succ 0$) Hessian on every Newton step while keeping the exact MAP stationary point ($\nabla J(z^*) = 0$).
-3. **Alternatives Considered:** (a) Treating zero-detection days as $Y = 0.01\,\text{MW}$ Gaussian data; (b) Ignoring saturation flags; (c) Running unguarded Newton-Raphson.
-4. **Why Rejected:** (a) Crushes 2005 small fires artificially toward zero with tiny fake uncertainty; (b) Biases extreme megafires downward; (c) Negative Hessian pivots crash Cholesky/Thomas solvers with `NaN`.
-5. **Consequences:** Bulletproof numerical stability across 10 orders of magnitude ($10^{-4}\text{–}10^6\,\text{MW}$) verified by finite-difference `pytest` checks.
-6. **Evidence & Confidence:** **High confidence (95% mathematically verified).**
-
-#### Decision D10: GPU Solver (`H3 3-Coloring` + `float64` Thomas $LDL^\top$ + Takahashi) **[FINALIZED — REQUIRES HOUR-14 BENCHMARK GATE]**
-1. **Final Decision:** Shard active cells across 4 GPUs (`cuda:0..3`, `batch_size = 2,000` for Newton, `500` for MC); iterate `6` outer spatial sweeps over **H3 3-Coloring (`color in {0, 1, 2}`)** $\times$ alternating `Day/Night`; solve each `(T, T)` tridiagonal system in **`torch.float64`** via `@torch.jit.script` Thomas $LDL^\top$ factorization + Armijo backtracking; extract exact variances via **Takahashi Recursion** and sample $M=200$ joint posterior trajectories directly via backward Cholesky substitution $L^\top u = D^{-1/2}\varepsilon$.
-2. **Reasoning:**
-   * **Why 3-Coloring (Correcting Earlier Error):** Planar hexagonal grids have chromatic number **3** (three hexagons meet at every vertex); Red-Black 2-coloring leaves neighbors in the same batch and breaks Gauss-Seidel independence.
-   * **Why `float64`:** Solving 9,510-step sequential Thomas + Takahashi recurrences in `float32` risks cumulative floating-point drift; `float64` uses only ~4.2–6.0 GB per 24 GB L4 GPU and achieves `< 1e-10` agreement with dense `torch.linalg.inv`.
-   * **Why Joint Cholesky Sampling:** Drawing $L^\top u = D^{-1/2}\varepsilon$ samples from the *exact* $9510 \times 9510$ multivariate Gaussian-Laplace covariance $H^{-1}$ rather than an approximate lag-1 chain.
-3. **Alternatives Considered:** (a) Red-Black 2-coloring; (b) `float32` Thomas solver; (c) **Parallel Cyclic Reduction (PCR)** (`14` vectorized steps instead of `9,510` sequential steps); (d) Solving on 8-day bins (`T = 1,189`) instead of daily (`T = 9,510`).
-4. **Why Rejected & Brutal Runtime Warning:** (a) Mathematically invalid on hexagons; (b) Numerically fragile across 9,510 steps; (c) PCR avoids Python/TorchScript loop latency (`14` steps vs `9,510`), **but** non-power-of-2 indexing in PCR is notoriously error-prone under a 36h deadline. **HOWEVER**, sequential `for t in range(9510)` inside `@torch.jit.script` STILL executes sequentially on GPU! If `N_active` turns out to be `250,000+` (see D2 audit), even 60s/batch $\times$ 125 batches could consume >4 GPU-hours!
-   * **Mandatory Runtime Mitigation Gate:** Benchmark 1 batch (`B=2000, T=9510`) immediately on first `L4` test. If `time > 45s/batch`, either drop single-day isolated cells (`min_active_days >= 2`), move spatial grid to **H3-Res5**, or switch the solver time step to **3-day / 5-day pentad resolution (`T = 1,902`, 5× faster!)**.
-5. **Evidence & Confidence:** **High confidence in mathematical exactness; Medium confidence in wall-clock speed at `T=9510` if `N_active > 100k`.**
-
-### Layer 5: Uncertainty Quantification, Conformal Guarantees & Attribution (Decision D11)
-1. **Final Decision:** Rescale raw Monte Carlo monthly quantiles `(q05_raw, q95_raw)` using **Multiplicative Log-Space Split Conformal Calibration (`CQR`)** computed separately for `MODIS-only` (via held-out `2018–2020` VIIRS-masked folds) and `Multi-sensor` (via leave-one-VIIRS-platform-out folds), clamping `0 <= q05_cal <= q50 <= q95_cal`. Output `measured_fraction`, `attribution_flag`, and `quality_flag = ABSTAIN_LOW_EVIDENCE` whenever $\ge 5$ consecutive days suffer `cloud_frac > 0.85` with zero neighbor detections.
-2. **Reasoning:** Raw Bayesian Laplace intervals assume Gaussianity and correct priors and can under-cover real fire distributions. Split conformal calibration provides distribution-free finite-sample coverage guarantees ($\approx 90\%$) while log-space scaling guarantees non-negative bounds and zero quantile crossing. Abstention prevents inventing confident trends during prolonged monsoon clouds.
-3. **Alternatives Considered:** (a) Uncalibrated Bayesian credible intervals; (b) Symmetric linear-space conformal margins $\hat{y} \pm \hat{q}\hat{\sigma}$.
-4. **Why Rejected:** (a) Lacks finite-sample coverage guarantee; (b) Produces negative lower flux bounds on skewed fire data.
-5. **Consequences & Unresolved Limitation:** Conformal coverage holds strictly under exchangeability between `2018–2020` and `2000–2011`; multi-decadal land-use transformation remains unmeasured by 2018–2020 calibration folds.
-6. **Evidence & Confidence:** **High confidence (90%, grounded in Romano et al., 2019 CQR).**
-
-### Layer 6: Streaming & Delayed Revisions (Decision D12)
-* **Status:** **[TENTATIVELY DECIDED — SCHEDULER WIRING UNRESOLVED]**
-1. **Final Decision:** Implement `run_fixed_lag_update(window_days=14)` anchoring $z_{g, t_{\text{start}}-1}$ to the stored historical state so late arrivals and `NRT -> ML` replacements re-solve only the trailing 14 days, storing both `acq_date/hhmm` ($t_{\text{obs}}$) and `ingest_ts` ($t_{\text{arrival}}$) plus `revision_count`.
-2. **Reasoning:** Reconciles NASA's progressive `URT -> NRT -> Science ML` replacement lifecycle without building an enterprise Kafka/Flink streaming engine and particle filter in 36 hours.
-3. **Alternatives Considered:** (a) Real-time event-time Kafka/Flink streaming with particle filters; (b) Static-only batch processing ignoring `t_arrival`.
-4. **Why Rejected:** (a) Impossible to engineer, test, and host within 36 hours on offline Kaggle; (b) Fails to track NRT-to-Science revisions.
-5. **Unresolved Gap (Honest Audit):** `run_fixed_lag_update` exists as a Python API function tested in `tests/test_08`, **not** as an automated live cron/daemon polling FIRMS every hour inside Environment 3. In the 36-hour submission, it acts as a reproducible incremental update entrypoint rather than an autonomous live ingestion service.
-6. **Evidence & Confidence:** **Moderate confidence — right 36-hour compromise, provided its offline-batch nature is represented honestly.**
-
-### Layer 7: Three Complementary Output Products & Storage Layout (Decision D13)
-* **Status:** **[FINALIZED — CRITICAL STORAGE FIX REQUIRED FOR DAILY TABLE]**
-1. **Final Decision:** Export **3 distinct tables** into `fire_harmonized.duckdb` + Zstd Parquet:
-   * **Product 1 (`obs_harmonized_provenance`):** Untouched raw sensor measurements + derived geometry, static/SAMA flags, bow-tie weights, reliability, forward gains, and cluster IDs.
-   * **Product 2 (`state_reconstructed_monthly` & `daily`):** Raw baselines (`raw_count_sum`, `raw_frp_sum_mw`), Day/Night/Total reconstructed flux (`phi_q05`, `phi_q50`, `phi_q95`, `phi_mean`), FRE (`TJ`), standardized events (`E`), active footprint (`km2`), night/day ratio, and 2003–2020 calendar anomaly indices (`anomaly_ratio` regularized with $\delta = 0.5\,\text{MW}$, `anomaly_zscore`, `climatology_pctile`).
-   * **Product 3 (`uncertainty_diagnostics`):** Conformal factor, relative CI width, `measured_fraction`, active platform bitmask, mean cloud fraction, `attribution_flag`, `quality_flag`, `revision_count`.
-2. **Reasoning:** Separates raw observations, corrected measurements, and inferred physical states (Challenge #10 & #14) so users and downstream researchers can audit every step.
-3. **Alternatives Considered:** Single flattened CSV/Parquet table discarding raw fields or overwriting NRT/MODIS inputs.
-4. **Why Rejected:** Loses provenance, mixes Category A/B/C variables inconsistently, and blocks reproducibility.
-5. **Consequences & Critical Storage Bug Caught in Audit:** Exporting **dense** `state_reconstructed_daily` for all active cells $\times 9,510$ days (at `250k+` Res-6 cells) yields **~2.4+ billion rows (~35–45 GB)**, exceeding Kaggle's **20 GB `/kaggle/working` cap** and slowing DuckDB web queries!
-   * **Mandatory Fix:** Store `state_reconstructed_monthly` densely (`year x month` for all active cells $\approx$ 30–80M rows, `~1–2 GB`), and store `state_reconstructed_daily` **sparsely** (emit rows ONLY where `phi_q50_mw > 0.25` OR within $\pm 7$ days of a detection OR inside spotlight validation tiles)!
-6. **Evidence & Confidence:** **High confidence in the 3-product schema; 100% certainty that dense global daily export must be stored sparsely.**
-
-### Layer 8: Web Application Architecture (Decision D14)
-1. **Final Decision:** Single unified web server: **FastAPI + DuckDB** (`src/webapp/server.py`) serving vanilla HTML5/ES6 **`MapLibre GL JS` + `Apache ECharts`** (`src/webapp/static/`), with 5 REST endpoints (`/api/calendar`, `/api/timeseries`, `/api/map_hex`, `/api/diagnostics`, `/api/export.csv` with CSV formula-injection neutralization), accessible `viridis`/`cividis` ramps, uncertainty hatching/opacity, and 6 spotlight preset buttons (`Chilecito ARG 2026`, `Kabylie DZA`, `Hassi Messaoud Gas Flares`, `Alaska Boreal`, `Black Summer AUS`, `Kalimantan Peat IDN`).
-2. **Reasoning:** Directly fulfills NASA's interactive Burning Activity Calendar requirement (`< 300 ms` DuckDB SQL aggregations, ROI bounding-box selection, downloadable CSV) with zero `npm`/`webpack` build failures and zero fallback dead code.
-3. **Alternatives Considered:** (a) Dual React + Streamlit fallback architecture; (b) Static browser-only DuckDB-Wasm.
-4. **Why Rejected:** (a) Maintaining two UIs violates the single-system constraint and splits scarce hours; (b) Shipping a >1 GB DuckDB file directly into client browser memory via DuckDB-Wasm fails on user laptops.
-5. **Consequences & Unresolved Deployment Question:** Requires hosting Environment 3 outside Kaggle (e.g., local machine for demo recording or cloud container with 2–4 GB storage). Hosting destination (`local Docker` vs. `Hugging Face Spaces` / `VPS`) has not yet been locked.
-6. **Evidence & Confidence:** **High confidence (90%).**
+1. **Phase 1 (Hours 0–4 — Env 1 Stager & Ingestion):** Implement repo skeleton, `pyproject.toml`, `Makefile`, `src/config/`, `src/ingest/`, `scripts/run_env1_stage.py`, and `test_01`. Run connectivity checks against UMD / Source Coop Portolan / FIRMS API; stage Parquet (`<= 2.5 GB`) and `.whl` bundle (`<= 80 MB`). **Gate 1:** `test_01` passes 100% and coverage audit verifies Chilecito 2026, Nov 2 SNPP end, and Algeria flares.
+2. **Phase 2 (Hours 4–10 — Geometry & Clustering):** Implement `src/geometry/`, `test_02`, `test_03`. **Gate 2:** `test_01..test_03` pass 100% on CPU.
+3. **Phase 3 (Hours 10–14 — Operators & Likelihoods):** Implement `src/calibration/`, `likelihoods.py`, `priors.py`, `test_04`, `test_05`. **Gate 3:** `test_04..test_05` pass 100% on CPU.
+4. **Phase 4 (Hours 14–17 — Solver, CUDA Kernel & Synthetic Twin):** Implement `thomas_takahashi.py`, `cuda_kernels.py`, `solver.py`, `synthetic_twin.py`, `test_06`, `test_07`. **Gate 4:** `test_01..test_07` pass 100%; single-chunk (`B=1000`) GPU timing benchmark confirms `< 6 GB` VRAM and full run fits well under GPU quota.
+5. **Phase 5 (Hours 17–21 — Full GPU Execution & Export):** Execute `run_env2_cpu_prep.py`, `run_env2_gpu_solve.py`, `conformal.py`, `export_duckdb.py`, `test_08`. **Gate 5:** `fire_harmonized.duckdb` + 3 Parquet products (`<= 4 GB`) exported cleanly and `test_08` passes.
+6. **Phase 6 (Hours 21–24 — Scientific Validation):** Implement `diagnostics.py`, run `run_env2_validate.py` (`test_09`). **Gate 6:** Structural breaks, ablation, `MCD64CMQ` cross-check, and spotlight reports pass.
+7. **Phase 7 (Hours 24–34 — Web App & Final Audit):** Implement `src/webapp/`, `test_10`, run complete `pytest` (`166+` tests), verify spotlight views visually, and freeze final documentation.
 
 ---
 
-## 4. Validation & Software Verification Decisions
+## 9. Agent Behavioral Boundaries
 
-### Decision D15: Five-Pronged Scientific Validation Protocol **[FINALIZED]**
-1. **Final Decision:** Validate harmonization validity (proving genuine physical fidelity rather than artificial similarity) via:
-   * **Chow & Pettitt Structural-Break Tests** across all 5 transitions (`2002-07`, `2012-01`, `2018-04`, `2023-03`, `2026-11`).
-   * **2019–2021 Held-Out VIIRS-Masked Ablation** measuring `log_RMSE`, `CRPS` across 200 MC draws, empirical 90% coverage, `Spearman rho`, and `Top-3 Peak Month Match`.
-   * **Independent `MCD64A1` Burned Area Cross-Check** (`2018–2025`) proving harmonized `FRE (TJ)` correlates stronger with physical burned scars than raw FIRMS counts.
-   * **Residual VZA ($0^\circ\text{–}65^\circ$) & Solar-Time ($08{:}00\text{–}16{:}00$) Slope Diagnostics** testing complete drift & swath bias removal.
-   * **Spotlight Case Audits:** `Chilecito ARG Jul–Aug 2026`, `Kabylie vs. Hassi Messaoud DZA`, and `Nov 2, 2026 S-NPP cutoff`.
-2. **Reasoning:** Proves simultaneously that sensor jumps vanish, real anomalies survive, uncertainty bounds are calibrated, and outputs agree with non-hotspot physical scars.
-3. **Alternatives Considered:** Checking only in-sample `R^2` between raw MODIS and raw VIIRS.
-4. **Why Rejected:** An algorithm that corrupts VIIRS down to blurry MODIS achieves high cross-sensor correlation while destroying physical accuracy.
-5. **Evidence & Confidence:** **High confidence (95%).**
+### Must Do
+* Enforce all 10 Scientific Invariants (`INV-01..10`) and every formula in Section 5 verbatim.
+* Execute the Autonomous Discovery Protocol (Section 6.2) if any data URL fails, logging provenance transparently.
+* Perform all tridiagonal/Takahashi/Cholesky solves in `torch.float64`.
+* Verify every module with its corresponding `pytest` suite before advancing phases.
 
-### Decision D16: Mandatory 166+ Automated `pytest` Verification Suite **[FINALIZED]**
-1. **Final Decision:** Enforce 10 dedicated test suites (`test_01`..`test_10`, `>= 166` parameterized tests) covering ingestion schemas, H3 3-coloring (`color[u] != color[v]`), bow-tie conservation, cluster separation, survival integral bounds, finite-difference gradient/Hessian parity (`< 1e-6`), `float64` Thomas/Takahashi parity against dense `torch.linalg.inv` (`< 1e-10`), a **26-year synthetic ground-truth digital twin simulator**, split-conformal empirical coverage, structural-break detection, FastAPI security/latency (`< 300 ms`), and single-L4 VRAM bounds (`< 18 GB`).
-2. **Reasoning:** Prevents silent math sign errors, off-by-one time indexing, CUDA numerical divergence, or schema drift when handing the spec to an autonomous coding agent.
-3. **Alternatives Considered:** Informal ad-hoc plotting checks in notebooks.
-4. **Why Rejected:** Non-linear state-space optimization and censored derivatives fail silently without finite-difference and synthetic-twin falsification tests.
-5. **Evidence & Confidence:** **High confidence (95%).**
+### Must Not Do
+* Never introduce competing pipelines, alternate UIs, or dead configuration branches.
+* Never fabricate or substitute synthetic data when a real data download fails.
+* Never put cloud visibility $\ln v$ into detected observation likelihoods (`Case A/B`).
+* Never normalize $D(\tau)$ over 24 hours across `z_Day` and `z_Night`.
+* Never export dense `N_active × 9,510` daily rows (always emit sparse episode rows).
+* Never import `pyhdf` inside Environment 2 or hardcode paths outside `paths.py`.
+* Never claim completion without citing concrete passing `pytest` counts and measured validation metrics.
 
 ---
 
-## 5. Honest Audit Summary: Decision Status Ledger & 5 Mandatory Fixes Before Hour 0
+## 10. Final Deliverables & Acceptance Checklist
 
-### 5.1 Complete Status Ledger (Nothing Invented, Nothing Hidden)
-
-| Topic | Exact Current Status | Critical Caveat / Next Action |
-| :--- | :--- | :--- |
-| 3-Environment Separation (`Env1 -> Env2 -> Env3`) | **Finalized** | Requires `Env1` internet-ON session first; zero alternative paths. |
-| 10 Scientific Invariants (`INV-01..10`) | **Finalized** | Fully enforced by tests & equations. |
-| Technology Stack (`DuckDB + Polars + H3 + PyTorch float64 + FastAPI + MapLibre/ECharts`) | **Finalized** | Verified against Kaggle Python 3.12 runtime; `pyhdf` isolated in `Env1`. |
-| Mathematical Formulation (`Day/Night State-Space + Tobit + Hurdle + 3-Color Thomas/Takahashi + CQR`) | **Finalized** | Exact formulas, convexity guard, and derivatives locked. |
-| 3 Complementary Output Products & Validation Suite (`166+` tests) | **Finalized** | Schema & test tolerances fully specified. |
-| Geographic Scope (6 Countries) | **Finalized (Needs Polygon Fix)** | Must clip with admin-0 polygons instead of raw bounding boxes. |
-| Active Cell Spatial Scale (`H3-Res6`) & Daily Table Storage | **Needs Immediate Revision** | Pure `H3-Res6` across 6 huge countries risks `250k–400k` cells & `>40 GB` dense daily output; switch to sparse daily export + evaluate `H3-Res5` vs `Res-6` count at Hour 4. |
-| Cloud Grid Granularity (`Mx14CMQ` Monthly vs `8-Day`) | **Tentatively Monthly (Upgrade Recommended)** | Switch to `MOD14C8Q / MYD14C8Q` (8-day) if available on `fuoco.geog.umd.edu`. |
-| Streaming (`14-day Fixed-Lag Batch`) | **Tentative / Unwired** | Implemented as callable function + tested; live polling daemon deferred past 36h. |
-| `01_download_and_stage.py` (Turn 7 Draft) vs FIRMS API Contract | **Superseded / Broken if Unpatched** | Turn 7 used disabled `/api/country`—must be rewritten to `/api/area/csv/.../5/...` + SFTP probe. |
-| Kaggle Outbound SFTP Port 22 & Quota Burn Rate (`2x` vs `1x`) | **Unresolved** | Must be verified empirically in first 15 minutes of Hour 0. |
-| Environment 3 Web Hosting Target | **Unresolved** | Local Docker demo vs. external Hugging Face Space / VPS not yet chosen. |
-
-### 5.2 Five High-Leverage Corrections You Should Apply Before Telling the Agent "Start"
-1. **Fix `01_download_and_stage.py` Immediately:** Remove `/api/country` and HTML scraping; implement `/api/area/csv/.../5/...` ONLY for trailing 2026 NRT (`~3–6` months max), test SFTP port 22 on `fuoco.geog.umd.edu` at Minute 15, and have FIRMS Bulk Download Archive (`firms.modaps.eosdis.nasa.gov/download/`) ready if Kaggle blocks port 22.
-2. **Add Country Polygon Clipping in `Env 1`:** Clip bounding-box filtered rows against Natural Earth / GeoBoundaries admin-0 polygons (`ARG, DZA, BRA, IDN, AUS, USA`) using `shapely` so neighboring countries don't double your active cell count.
-3. **Make `state_reconstructed_daily` Sparse (or Upgrade Main Grid to `H3-Res5`):** Never write `N_cells x 9,510` dense zero-background daily rows to `/kaggle/working`. Emit dense `monthly` rows (`~15–50M` rows) and sparse `daily` episode rows (`phi_q50_mw > 0.25` or spotlight regions) so total DuckDB + Parquet output stays cleanly under `3–4 GB`.
-4. **Enforce an Hour-14 GPU Speed Gate on `B=2000, T=9510`:** If one 2,000-cell batch takes `> 45s` on a single L4 due to the sequential `9,510`-step Thomas loop, immediately aggregate the temporal solver grid to **3-day pentads (`T = 3,170`)** or **H3 Resolution 5** rather than risking burning all 12 GPU-hours before validation runs.
-5. **Prefer 8-Day `Mx14C8Q` Cloud Grids Over Monthly `Mx14CMQ`:** Same `fuoco.geog.umd.edu` directory tree, same `pyhdf` parsing in `Env 1`, 4× sharper cloud-gap precision.
+1. Complete tested Python repository (`src/`, `scripts/`, `tests/`, `pyproject.toml`, `Makefile`).
+2. Clean staged data & wheel artifacts (`<= 2.5 GB` + `<= 80 MB`).
+3. `fire_harmonized.duckdb` + indexed Zstd Parquet **Product 1 (`obs_harmonized_provenance`)**, **Product 2 (`state_reconstructed_monthly` dense & `daily` sparse)**, and **Product 3 (`uncertainty_diagnostics`)** (`<= 4 GB` total).
+4. Reproducible validation report (`diagnostics.json`) demonstrating structural continuity, VIIRS-masked ablation gains, `MCD64CMQ` correlation superiority, and Chilecito 2026 / Algeria flare / Nov 2026 SNPP verification.
+5. Working `FastAPI + DuckDB + MapLibre + ECharts` Burning Activity Calendar web application (`< 300 ms` query latency, sanitized CSV download).
+6. **100% passing `pytest` execution across all `166+` tests in `tests/test_01`..`tests/test_10`.**
