@@ -494,6 +494,7 @@ def fetch_umd_history(paths: DataPaths, years: list[int],
                              "superseded_older_collection": len(superseded)}))
         attempts: dict[str, int] = {}
         failures: dict[str, list[str]] = {}
+        cloud_logged: set[str] = set()
         years_set = set(int(y) for y in years)
         todo = [(k, r) for k, pl in files.items() for r in pl
                 if _year_of_name(r) in years_set]
@@ -580,15 +581,34 @@ def fetch_umd_history(paths: DataPaths, years: list[int],
                                     f"CMG file name {name!r}")
                         if key in ("MOD14C8Q", "MYD14C8Q"):
                             if meta:
-                                sds = read_hdf4_sds(hdf_path, CMQ_CLOUD_LAYERS,
-                                                    required=("MeanCloudFraction",))
+                                sds = read_cloud_cmg_sds(hdf_path)
+                                summ = cloud_layer_summary(sds)
+                                if key not in cloud_logged:
+                                    cloud_logged.add(key)
+                                    logger.info("UMD %s cloud layer: %s", key,
+                                                json.dumps(summ))
+                                    if manifest:
+                                        manifest.log(f"{key}_cloud_layer", rel,
+                                                     "parse",
+                                                     detail=json.dumps(summ))
                                 f = parse_cloud_cmg(sds, meta["year"],
                                                     meta["period"],
                                                     meta["period_kind"])
                                 f["platform"] = meta["product"][:3]
-                                result["cloud"].append(
-                                    f[_in_boxes(f["lat_025"], f["lon_025"],
-                                                bboxes)])
+                                f = f[_in_boxes(f["lat_025"], f["lon_025"],
+                                                bboxes)]
+                                if f.empty:
+                                    raise ValueError(
+                                        "no valid cloud-fraction values inside "
+                                        "the target boxes; layer summary: "
+                                        + json.dumps(summ))
+                                result["cloud"].append(f)
+                                logger.info("UMD [%d/%d] cloud %s %d-%02d: %d "
+                                            "cells, mean %.3f, %.0fs", n_done,
+                                            len(todo), summ["layer"],
+                                            meta["year"], meta["period"],
+                                            len(f), f["cloud_frac"].mean(),
+                                            time.time() - t_file)
                         elif key == "MCD64CMQ":
                             if meta:
                                 sds = read_hdf4_sds(hdf_path, CMQ_BURN_LAYERS,
@@ -902,7 +922,14 @@ def _firms_get(url: str, max_retries: int = 6) -> str:
 # ---------------------------------------------------------------------------
 # HDF4 CMG grids (pyhdf; Env 1 only)
 # ---------------------------------------------------------------------------
-CMQ_CLOUD_LAYERS = ("MeanCloudFraction", "CorrFirePix", "CloudCorrFirePix", "RawFirePix")
+# Cloud-fraction SDS name by collection: C5 CMG grids carry
+# ``MeanCloudFraction``; the live C6 ``Mx14CMQ`` grids carry
+# ``MeanLandCloudFraction`` (observed 2026-11-14: CloudCorrFirePix,
+# CorrFirePix, LandCloudPix, MeanFRP, MeanLandCloudFraction, NumFRP,
+# RawFirePix, TotalPix).  The first one present is used.
+CLOUD_FRACTION_LAYERS = ("MeanCloudFraction", "MeanLandCloudFraction")
+CMQ_CLOUD_LAYERS = CLOUD_FRACTION_LAYERS + ("CorrFirePix", "CloudCorrFirePix",
+                                            "RawFirePix")
 CMQ_BURN_LAYERS = ("BurnedArea", "QA", "UnmappedFraction")
 
 
@@ -944,6 +971,41 @@ def read_hdf4_sds(path: str | Path, layer_names: tuple[str, ...],
     return out
 
 
+def read_cloud_cmg_sds(path: str | Path) -> dict:
+    """Read a CMG cloud grid; at least one of ``CLOUD_FRACTION_LAYERS`` must
+    exist (KeyError listing the file's actual layers otherwise)."""
+    sds = read_hdf4_sds(path, CMQ_CLOUD_LAYERS, required=())
+    if not any(n in sds for n in CLOUD_FRACTION_LAYERS):
+        try:
+            from pyhdf.SD import SD, SDC
+            sd = SD(str(path), SDC.READ)
+            available = sorted(sd.datasets().keys())
+            sd.end()
+        except Exception:  # noqa: BLE001
+            available = "?"
+        raise KeyError(f"{Path(path).name}: none of the cloud-fraction SDS "
+                       f"{list(CLOUD_FRACTION_LAYERS)}; available {available}")
+    return sds
+
+
+def cloud_layer_summary(sds_layers: dict) -> dict:
+    """Name, HDF attributes and raw value statistics of the cloud-fraction
+    layer (logged once per product so the unit handling is auditable)."""
+    name = next(n for n in CLOUD_FRACTION_LAYERS if n in sds_layers)
+    attrs, raw = sds_layers[name]
+    fin = raw[np.isfinite(raw)]
+    keep = ("units", "valid_range", "scale_factor", "add_offset",
+            "_FillValue", "long_name")
+    return {"layer": name,
+            "attrs": {k: (np.asarray(v).tolist() if not isinstance(v, str)
+                          else v) for k, v in attrs.items() if k in keep},
+            "raw_min": float(fin.min()) if fin.size else None,
+            "raw_max": float(fin.max()) if fin.size else None,
+            "raw_p50": float(np.median(fin)) if fin.size else None,
+            "raw_distinct_ge_100": [float(x) for x in
+                                    np.unique(fin[fin >= 100])[:8]]}
+
+
 def apply_sds_scaling(attrs: dict, data: np.ndarray) -> np.ndarray:
     """Apply dynamic scale_factor / add_offset / _FillValue from SDS attrs."""
     fill = attrs.get("_FillValue")
@@ -969,14 +1031,30 @@ def parse_cloud_cmg(sds_layers: dict, year: int, period: int,
                     period_kind: str) -> pd.DataFrame:
     """Parse MOD14C8Q / MYD14C8Q / Mx14CMQ cloud SDS layers to a tidy frame.
 
-    ``MeanCloudFraction`` values in [0,100] are normalized to [0,1].
+    Uses ``MeanCloudFraction`` (C5) or ``MeanLandCloudFraction`` (C6).
+    Values outside the SDS ``valid_range`` (when present), the
+    ``_FillValue`` and negatives are missing; after ``scale_factor`` /
+    ``add_offset``, values in [0,100] are normalized to [0,1] (percent when
+    the ``units`` say so or any valid value exceeds 1); values > 100 are
+    treated as fill.
     """
     lats, lons = cmg_grid_centers()
-    attrs, cloud_raw = sds_layers["MeanCloudFraction"]
+    name = next((n for n in CLOUD_FRACTION_LAYERS if n in sds_layers), None)
+    if name is None:
+        raise KeyError(f"no cloud-fraction layer among {list(sds_layers)}")
+    attrs, cloud_raw = sds_layers[name]
+    cloud_raw = np.asarray(cloud_raw, dtype=np.float64)
+    vr = attrs.get("valid_range")
+    if vr is not None and np.size(vr) == 2:
+        lo, hi = (float(x) for x in np.ravel(vr))
+        cloud_raw = np.where((cloud_raw < lo) | (cloud_raw > hi), np.nan,
+                             cloud_raw)
     cloud = apply_sds_scaling(attrs, cloud_raw)
-    cloud = np.where(cloud > 100.0, np.nan, cloud)
+    cloud = np.where((cloud > 100.0) | (cloud < 0.0), np.nan, cloud)
+    units = str(attrs.get("units", "")).lower()
     cmax = np.nanmax(cloud) if np.isfinite(cloud).any() else 0.0
-    cloud = cloud / 100.0 if cmax > 1.0 else cloud
+    if "percent" in units or "%" in units or cmax > 1.0:
+        cloud = cloud / 100.0
     lat_g, lon_g = np.meshgrid(lats[: cloud.shape[0]], lons[: cloud.shape[1]],
                                indexing="ij")
     df = pd.DataFrame({
@@ -1187,8 +1265,7 @@ def download_cmr_granules(urls: list[str], tmp_dir: Path, bboxes,
                 out["burned"].append(f[_in_boxes(f["lat_025"], f["lon_025"],
                                                  bboxes)])
             else:
-                f = parse_cloud_cmg(read_hdf4_sds(dest, CMQ_CLOUD_LAYERS,
-                                                  required=("MeanCloudFraction",)),
+                f = parse_cloud_cmg(read_cloud_cmg_sds(dest),
                                     meta["year"], meta["period"],
                                     meta["period_kind"])
                 f["platform"] = meta["product"][:3]

@@ -453,3 +453,16 @@ one bad line discarded the whole file. Fixed in the codebase:
   dirty (untracked files are irrelevant: the package uses `git archive
   <commit>`); if anything remains it lists the files. Verified on a
   simulated Drive clone (chmod-flipped scripts + stray file + edited readme).
+* Follow-up 4: the live C6 `Mx14CMQ` grids have NO `MeanCloudFraction`;
+  their layers are `CloudCorrFirePix, CorrFirePix, LandCloudPix, MeanFRP,
+  MeanLandCloudFraction, NumFRP, RawFirePix, TotalPix` (fail-fast stopped
+  the Colab run after 3 files / 32 s, as designed). `read_cloud_cmg_sds`
+  now accepts `MeanCloudFraction` (C5) or `MeanLandCloudFraction` (C6);
+  `parse_cloud_cmg` masks `valid_range`/`_FillValue`/negatives/>100,
+  divides by 100 when `units` say percent or any valid value > 1. The
+  layer name, HDF attrs and raw stats of the first file per product are
+  logged + written to the manifest (`<key>_cloud_layer`), each file logs
+  cells/mean, and a grid with no valid value inside the target boxes is a
+  failure. Tested on real HDF4 files written with pyhdf (uint8 percent with
+  fill 255, float fraction with -1 water). Units of the live layer still to
+  be confirmed from that manifest entry on the next run.

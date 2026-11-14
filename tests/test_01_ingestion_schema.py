@@ -689,3 +689,69 @@ def test_01_unparseable_cmg_name_is_a_failure_not_a_silent_skip(paths,
     with pytest.raises(RuntimeError, match="all failed"):
         d.fetch_umd_history(paths, [2001], d.ProvenanceManifest(
             paths.provenance_manifest), session=_FakeUMD(tree))
+
+
+def _write_c6_cmq(path, cloud, dtype_code, attrs):
+    """Real HDF4 file with the layer set of the live C6 Mx14CMQ grids."""
+    from pyhdf.SD import SD, SDC
+    import numpy as np
+    sd = SD(str(path), SDC.WRITE | SDC.CREATE)
+    layers = {"CloudCorrFirePix": np.zeros((720, 1440)),
+              "CorrFirePix": np.zeros((720, 1440)),
+              "LandCloudPix": np.zeros((720, 1440)),
+              "MeanFRP": np.zeros((720, 1440)), "NumFRP": np.zeros((720, 1440)),
+              "RawFirePix": np.zeros((720, 1440)),
+              "TotalPix": np.zeros((720, 1440))}
+    for name, arr in layers.items():
+        v = sd.create(name, SDC.FLOAT32, arr.shape)
+        v[:] = arr.astype(np.float32)
+        v.endaccess()
+    v = sd.create("MeanLandCloudFraction", dtype_code, cloud.shape)
+    for k, val in attrs.items():
+        setattr(v, k, val)
+    v[:] = cloud
+    v.endaccess()
+    sd.end()
+
+
+@pytest.mark.parametrize("variant", ["percent_uint8_fill255", "fraction_float"])
+def test_01_c6_cmq_mean_land_cloud_fraction_real_hdf(paths, tmp_path, variant):
+    """Live C6 Mx14CMQ grids have MeanLandCloudFraction (no
+    MeanCloudFraction): read it from a real HDF4 file, mask fill/water and
+    normalize to [0,1]."""
+    pyhdf_sd = pytest.importorskip("pyhdf.SD")
+    import numpy as np
+    from src.ingest import download_data as d
+    lats, lons = d.cmg_grid_centers()
+    land = (np.abs(lats[:, None]) < 60) & np.ones((1, 1440), bool)
+    if variant == "percent_uint8_fill255":
+        cloud = np.where(land, 35, 255).astype(np.uint8)
+        attrs = {"_FillValue": np.uint8(255), "units": "percent"}
+        code = pyhdf_sd.SDC.UINT8
+    else:
+        cloud = np.where(land, 0.35, -1.0).astype(np.float32)
+        attrs = {}
+        code = pyhdf_sd.SDC.FLOAT32
+    f = tmp_path / "MOD14CMQ.200011.006.01.hdf"
+    _write_c6_cmq(f, cloud, code, attrs)
+    tree = {"data/MODIS/C6/Mx14CMQ/MOD14CMQ.200011.006.01.hdf": f.read_bytes()}
+    man = d.ProvenanceManifest(paths.provenance_manifest)
+    res = d.fetch_umd_history(paths, [2000], man, session=_FakeUMD(tree))
+    cloud_df = pd.concat(res["cloud"])
+    assert len(cloud_df) > 1000
+    assert np.allclose(cloud_df["cloud_frac"], 0.35, atol=1e-6)
+    assert any(e["product"] == "MOD14C8Q_cloud_layer" and
+               "MeanLandCloudFraction" in e["detail"] for e in man.entries)
+
+
+def test_01_cmq_without_any_cloud_layer_fails_with_layer_list(tmp_path):
+    pytest.importorskip("pyhdf.SD")
+    from pyhdf.SD import SD, SDC
+    import numpy as np
+    from src.ingest import download_data as d
+    f = tmp_path / "MOD14CMQ.200011.006.01.hdf"
+    sd = SD(str(f), SDC.WRITE | SDC.CREATE)
+    v = sd.create("TotalPix", SDC.FLOAT32, (4, 4)); v[:] = np.zeros((4, 4), np.float32)
+    v.endaccess(); sd.end()
+    with pytest.raises(KeyError, match="TotalPix"):
+        d.read_cloud_cmg_sds(f)
