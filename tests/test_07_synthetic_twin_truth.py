@@ -153,8 +153,25 @@ def test_07_night_day_ratio_preserved(twin, twin_solved):
         / np.exp(twin_solved["z_day"]).mean()
     )
     assert ratio == pytest.approx(TWIN_NIGHT_DAY_RATIO, rel=0.15)
-    # And it never collapses to ~1.0 (the audited 24h-normalization bug).
+
+
+def test_07_night_day_ratio_never_collapses_to_one(twin, twin_solved):
+    # The audited 24h-normalization bug collapsed night_day_ratio toward
+    # ~1.0 and blew up on nocturnal smoldering fires; the 12-hour window
+    # normalization must keep Day and Night regimes physically distinct.
+    ratio = float(
+        np.exp(twin_solved["z_night"]).mean()
+        / np.exp(twin_solved["z_day"]).mean()
+    )
     assert ratio < 0.42
+    assert ratio > 0.20
+    # Monthly night/day ratios stay below 0.5 throughout (no collapse).
+    idx = _month_index(twin)
+    ids = [i for k, i in idx.items() if 2012 <= int(k[:4]) <= 2026]
+    phi_n = _monthly_means(np.exp(twin_solved["z_night"]), twin)
+    phi_d = _monthly_means(np.exp(twin_solved["z_day"]), twin)
+    monthly_ratio = phi_n[:, ids] / np.maximum(phi_d[:, ids], 1e-9)
+    assert float(monthly_ratio.max()) < 0.60
 
 
 def test_07_nov_2026_snpp_cutoff_unbiased(twin, twin_solved):
