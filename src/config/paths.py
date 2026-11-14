@@ -13,25 +13,69 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+def _find_kaggle_dataset(kaggle_input: Path, name: str,
+                         marker: str | None = None) -> Path | None:
+    """Locate an attached Kaggle dataset directory by slug.
+
+    Kaggle mounts datasets at ``/kaggle/input/<slug>`` (classic) or
+    ``/kaggle/input/datasets/<owner>/<slug>`` (current layout), and
+    competitions under ``/kaggle/input/competitions/<slug>``; search up to
+    four levels deep.  ``marker`` (e.g. ``active_fires``) also identifies the
+    staged-data root when the dataset was published under another slug.
+    """
+    if not kaggle_input.is_dir():
+        return None
+    frontier = [kaggle_input]
+    for _depth in range(4):
+        nxt = []
+        for d in frontier:
+            try:
+                children = sorted(c for c in d.iterdir() if c.is_dir())
+            except OSError:
+                continue
+            for c in children:
+                if c.name == name:
+                    return c
+                if marker is not None and (c / marker).is_dir():
+                    return c
+                nxt.append(c)
+        frontier = nxt
+    return None
+
+
 def _detect_roots(base_dir: str | os.PathLike | None = None) -> tuple[Path, Path, Path]:
-    """Return (staged_input_root, wheels_dir, output_root)."""
+    """Return (staged_input_root, wheels_dir, output_root).
+
+    Precedence: explicit ``base_dir`` > per-path environment overrides
+    (``FIRE_HARMONIZER_STAGED_DIR`` / ``FIRE_HARMONIZER_WHEELS_DIR`` /
+    ``FIRE_HARMONIZER_OUTPUT_DIR``) > Kaggle auto-detection > repository
+    ``FIRE_HARMONIZER_BASE`` > local ``./data`` + ``./output``.
+    """
     if base_dir is not None:
         root = Path(base_dir)
         return root / "data", root / "offline_wheels", root / "output"
-    kaggle_input = Path("/kaggle/input")
-    if kaggle_input.is_dir() and (kaggle_input / "staged-data").exists():
-        staged = kaggle_input / "staged-data"
-        wheels = kaggle_input / "offline-wheels"
-        output = Path("/kaggle/working/output")
-        return staged, wheels, output
-    # Environment-variable override (FIRE_HARMONIZER_BASE=<repo root>)
     env_base = os.environ.get("FIRE_HARMONIZER_BASE")
     if env_base:
         root = Path(env_base)
-        return root / "data", root / "offline_wheels", root / "output"
-    # Local execution from the repository root
-    root = Path(__file__).resolve().parents[2]
-    return root / "data", root / "offline_wheels", root / "output"
+        staged, wheels, output = (root / "data", root / "offline_wheels",
+                                  root / "output")
+    else:
+        root = Path(__file__).resolve().parents[2]
+        staged, wheels, output = (root / "data", root / "offline_wheels",
+                                  root / "output")
+        kaggle_input = Path("/kaggle/input")
+        k_staged = _find_kaggle_dataset(kaggle_input, "staged-data",
+                                        marker="active_fires")
+        if k_staged is not None:
+            staged = k_staged
+            k_wheels = _find_kaggle_dataset(kaggle_input, "offline-wheels")
+            wheels = k_wheels if k_wheels is not None else staged / "offline_wheels"
+        if Path("/kaggle/working").is_dir():
+            output = Path("/kaggle/working/output")
+    staged = Path(os.environ.get("FIRE_HARMONIZER_STAGED_DIR", staged))
+    wheels = Path(os.environ.get("FIRE_HARMONIZER_WHEELS_DIR", wheels))
+    output = Path(os.environ.get("FIRE_HARMONIZER_OUTPUT_DIR", output))
+    return staged, wheels, output
 
 
 @dataclass
@@ -107,5 +151,11 @@ class DataPaths:
             self.raw_stage_dir, self.active_fires_dir, self.wheels_dir,
             self.duckdb_path.parent,
         ):
-            if attr is not None:
+            if attr is None:
+                continue
+            try:
                 Path(attr).mkdir(parents=True, exist_ok=True)
+            except OSError:
+                # read-only Kaggle input mounts (Env 2 never writes there)
+                if attr == self.duckdb_path.parent:
+                    raise
