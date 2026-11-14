@@ -243,10 +243,10 @@ def test_05_vectorized_eval_pointwise_matches_cases():
     la, ga, ha = L.case_a_nll_grad_hess(
         torch.tensor([z[0, 1, 0, 1], z[1, 0, 1, 2]]),
         torch.log(torch.tensor([5.0, 3.0])), torch.zeros(2), torch.ones(2))
-    assert nll[0, 1, 0, 1] == pytest.approx(la[0], abs=1e-12)
-    assert nll[1, 0, 1, 2] == pytest.approx(la[1], abs=1e-12)
-    assert grad[1, 0, 1, 2] == pytest.approx(ga[1], abs=1e-12)
-    assert hess[1, 0, 1, 2] == pytest.approx(ha[1], abs=1e-12)
+    assert nll[0, 1, 0, 1] == pytest.approx(float(la[0]), abs=1e-12)
+    assert nll[1, 0, 1, 2] == pytest.approx(float(la[1]), abs=1e-12)
+    assert grad[1, 0, 1, 2] == pytest.approx(float(ga[1]), abs=1e-12)
+    assert hess[1, 0, 1, 2] == pytest.approx(float(ha[1]), abs=1e-12)
 
 
 def test_05_non_operational_pass_zero_contribution():

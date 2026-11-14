@@ -188,6 +188,60 @@ def test_06_cuda_single_launch_shape():
     assert torch.max(torch.abs(dz - ref)) < 1e-10
 
 
+@pytest.mark.cuda
+def test_06_cuda_multi_device_residency():
+    """Every visible GPU (cuda:0..3 on a 4x L4 node) runs the kernels on
+    its own device: outputs stay on the input device (no .cpu() round
+    trip, no cross-device mixing) and match the CPU reference."""
+    assert cuda_kernels.cuda_available(), cuda_kernels.compile_error()
+    a, b = _spd_tridiag(37, 129, 11)
+    g = torch.randn(37, 129)
+    dz_ref, l_ref, d_ref = tt.thomas_factor_and_solve(a, b, g)
+    sd_ref, _ = tt.takahashi_marginals(l_ref, d_ref)
+    torch.manual_seed(5)
+    eps = torch.randn(37, 129, 8)
+    u_ref = tt.joint_cholesky_sample(l_ref, d_ref, eps)
+    for k in range(torch.cuda.device_count()):
+        dev = torch.device("cuda", k)
+        dz, l, d = cuda_kernels.thomas_solve_batched(
+            a.to(dev), b.to(dev), g.to(dev), use_cuda=True)
+        assert dz.device == dev and l.device == dev and d.device == dev
+        l2, d2 = cuda_kernels.thomas_factor_batched(a.to(dev), b.to(dev),
+                                                    use_cuda=True)
+        assert torch.equal(l2, l) and torch.equal(d2, d)
+        sd, _ = cuda_kernels.takahashi_batched(l, d, use_cuda=True)
+        u = cuda_kernels.cholesky_sample_batched(l, d, eps.to(dev),
+                                                 use_cuda=True)
+        assert sd.device == dev and u.device == dev
+        assert torch.max(torch.abs(dz.cpu() - dz_ref)) < 1e-10
+        assert torch.max(torch.abs(sd.cpu() - sd_ref)) < 1e-10
+        assert torch.max(torch.abs(u.cpu() - u_ref)) < 1e-10
+
+
+def _nvcc_toolkit_present() -> bool:
+    try:
+        from torch.utils.cpp_extension import CUDA_HOME
+    except Exception:  # noqa: BLE001
+        return False
+    import os
+    return bool(CUDA_HOME) and os.path.exists(
+        os.path.join(CUDA_HOME, "bin", "nvcc"))
+
+
+@pytest.mark.skipif(not _nvcc_toolkit_present(),
+                    reason="nvcc / CUDA toolkit not installed (toolchain-gated)")
+def test_06_cuda_extension_compiles_with_nvcc():
+    """The load_inline extension BUILDS (nvcc + host C++; no GPU needed):
+    bindings come from functions=[...] + C++ prototypes, with no duplicate
+    PYBIND11_MODULE in the CUDA translation unit."""
+    assert "PYBIND11_MODULE" not in cuda_kernels._CUDA_SOURCE
+    assert "CUDAGuard" in cuda_kernels._CUDA_SOURCE
+    mod = cuda_kernels.build_module()
+    for fn in ("thomas_solve_cuda", "thomas_factor_cuda", "takahashi_cuda",
+               "cholesky_sample_cuda"):
+        assert hasattr(mod, fn)
+
+
 # ---------------------------------------------------------------- Armijo
 def test_06_armijo_strict_descent():
     from src.engine.solver import GMRFSolver, SolverData
