@@ -251,22 +251,6 @@ def test_05_convexity_guard_zero_region_exists():
     assert found_negative
 
 
-def test_05_case_c_gradient_sign_and_limits():
-    # Zero-detection evidence pushes z downward: g = r * Lambda > 0.
-    _, g, _ = _hurdle_case(0.0, 1.0, 0.9)
-    assert float(g) > 0
-    # Lambda clip bounds: tiny k -> near-zero gradient even at large z.
-    _, g_tiny, _ = _hurdle_case(10.0, 1e-13, 0.9)
-    assert 0.0 <= float(g_tiny) < 1e-6
-    # Lambda clipped at 80: exp(-80) ~ 1.8e-35, still finite and SPD-guarded.
-    n, g, h = _hurdle_case(20.0, 1e6, 0.5)
-    assert np.isfinite(float(n)) and np.isfinite(float(g))
-    assert float(h) >= 0.0
-
-
-# --------------------------------------------------------------------------- #
-# Uniform Phi = e^z consistency across cases
-# --------------------------------------------------------------------------- #
 
 def test_05_uniform_phi_exp_z_consistency():
     # Case A at the perfectly explained observation: nll ~ 0.
@@ -378,6 +362,15 @@ def test_05_hurdle_lambda_clip_bounds():
     lam_hi = lk.hurdle_lambda(z, torch.tensor(1e30))
     assert float(lam_lo) == pytest.approx(S.LAMBDA_CLIP[0], abs=1e-18)
     assert float(lam_hi) == pytest.approx(S.LAMBDA_CLIP[1])
+    # Zero-detection evidence pushes z downward: g = r * Lambda > 0, and
+    # the gradient stays bounded across the Lambda clip range.
+    _, g, _ = _hurdle_case(0.0, 1.0, 0.9)
+    assert float(g) > 0
+    _, g_tiny, _ = _hurdle_case(10.0, 1e-13, 0.9)
+    assert 0.0 <= float(g_tiny) < 1e-6
+    n, g, h = _hurdle_case(20.0, 1e6, 0.5)
+    assert np.isfinite(float(n)) and np.isfinite(float(g))
+    assert float(h) >= 0.0
 
 
 def test_05_hessian_spd_all_cases():

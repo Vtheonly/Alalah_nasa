@@ -92,20 +92,14 @@ def test_04_psi_frp_eff_blending():
     assert op.w_multi(1) == 0.0
     assert op.w_multi(2) > op.w_multi(1)
     assert op.w_multi(10) > op.w_multi(5)
-
-
-def test_04_psi_eff_isolated_fire_not_inflated():
-    # An isolated single-cluster detection must NOT be divided by a tiny
-    # psi (anti-inflation guarantee, readme.md 5.2 item 3 note).
-    mu, sigma = -0.5, 1.6  # heavy small-fire distribution
-    fmin = op.fmin_threshold(2.35, "MODIS", "D")
-    eff = op.psi_frp_eff(fmin, mu, sigma, 1)
+    # Anti-inflation guarantee: an isolated single-cluster detection is
+    # never divided by a tiny psi (heavy small-fire distribution).
+    mu2, sigma2 = -0.5, 1.6
+    fmin2 = op.fmin_threshold(2.35, "MODIS", "D")
+    eff = op.psi_frp_eff(fmin2, mu2, sigma2, 1)
     assert eff >= S.PSI_FRP_EFF_FLOOR - 1e-9
 
 
-# --------------------------------------------------------------------------- #
-# 12-hour diurnal normalization
-# --------------------------------------------------------------------------- #
 
 def test_04_diurnal_day_window_unit_mean():
     for coeffs in (
@@ -117,6 +111,13 @@ def test_04_diurnal_day_window_unit_mean():
         assert op.diurnal_window_integral(norm, "D") == pytest.approx(
             1.0, abs=1e-4
         )
+    # Day and Night normalization constants are independent (the audited
+    # 24h-collapse bug keeps them distinct), and D stays positive.
+    norm = op.normalize_diurnal_coeffs(np.array([1.0, -0.8, 0.3, 0.2]))
+    assert norm["c0_day"] != norm["c0_night"]
+    for tau in np.linspace(0, 24, 48):
+        assert op.diurnal_value(norm, tau, "D") > 0
+        assert op.diurnal_value(norm, tau, "N") > 0
 
 
 def test_04_diurnal_night_window_unit_mean():
@@ -130,16 +131,6 @@ def test_04_diurnal_night_window_unit_mean():
             1.0, abs=1e-4
         )
 
-
-def test_04_diurnal_day_night_normalizations_independent():
-    coeffs = np.array([1.0, -0.8, 0.3, 0.2])
-    norm = op.normalize_diurnal_coeffs(coeffs)
-    # Distinct normalization constants keep Phi_Day / Phi_Night physical.
-    assert norm["c0_day"] != norm["c0_night"]
-    # D stays strictly positive everywhere.
-    for tau in np.linspace(0, 24, 48):
-        assert op.diurnal_value(norm, tau, "D") > 0
-        assert op.diurnal_value(norm, tau, "N") > 0
 
 
 def test_04_diurnal_ridge_recovers_known_curve():
@@ -391,6 +382,11 @@ def test_04_pyrome_gmm_labels_and_sparse_assignment():
             hex_pyromes.loc[hex_pyromes["h3_index"] == row["h3_index"],
                             "pyrome_id"].iloc[0]
         ) < S.PYROME_K
+    # GMM configuration matches the spec exactly.
+    assert gmm.n_components == S.PYROME_K == 7
+    assert gmm.covariance_type == "full"
+    assert gmm.reg_covar == S.GMM_REG_COVAR == 1e-4
+    assert gmm.random_state == S.GMM_RANDOM_STATE == 42
 
 
 def test_04_pyrome_coordinate_shift_invariance():
@@ -409,19 +405,6 @@ def test_04_pyrome_coordinate_shift_invariance():
     )
 
 
-def test_04_pyrome_gmm_config_matches_spec():
-    po = _synthetic_pass_obs(n_cells=60, seed=31)
-    feats = pyr.compute_pyrome_features(po)
-    _, gmm, _ = pyr.fit_pyromes(feats)
-    assert gmm.n_components == S.PYROME_K == 7
-    assert gmm.covariance_type == "full"
-    assert gmm.reg_covar == S.GMM_REG_COVAR == 1e-4
-    assert gmm.random_state == S.GMM_RANDOM_STATE == 42
-
-
-# --------------------------------------------------------------------------- #
-# Cloud climatology fallback
-# --------------------------------------------------------------------------- #
 
 def _cloud_frame():
     return pd.DataFrame(
