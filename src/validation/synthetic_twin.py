@@ -371,20 +371,15 @@ def build_chunk_problem(
 
     df = twin["pass_df"]
     if mask_platforms:
-        sel = ~df["platform"].isin(mask_platforms)
         if mask_window is not None:
             inside = (
                 (df["t_index"] >= mask_window[0])
                 & (df["t_index"] <= mask_window[1])
             )
-            sel = ~(~sel & inside) | ~inside
-            keep = df[inside & df["platform"].isin(mask_platforms)]
-            sel = ~(df["platform"].isin(mask_platforms) & inside)
-        df = df[sel]
+        else:
+            inside = pd.Series(True, index=df.index)
+        df = df[~(df["platform"].isin(mask_platforms) & inside)]
     B_all = len(twin["cells"])
-    T = twin["pass_df"]["t_index"].max() + 1
-    if len(df):
-        T = max(T, int(df["t_index"].max()) + 1)
     T = len(twin["month_ids"])
     cell_pos_map = {c: i for i, c in enumerate(cell_positions)}
     obs = sv.build_observation_tensors(
@@ -392,6 +387,17 @@ def build_chunk_problem(
         twin["platform_calendar"], twin["k_table"],
         twin["priors"]["pyrome"], twin["vis_matrix"], device,
     )
+    if mask_platforms:
+        # A masked platform is not an operational witness in the masked
+        # window: zero is_op there so its (now removed) detections never
+        # turn into false clear-sky non-detection evidence.
+        lo = mask_window[0] if mask_window else 0
+        hi = mask_window[1] if mask_window else T - 1
+        for p, platform in enumerate(S.PLATFORMS):
+            if platform in mask_platforms:
+                for dn in ("D", "N"):
+                    obs[dn]["is_op"][:, lo : hi + 1, p] = 0
+                    obs[dn]["vis"][:, lo : hi + 1, p] = 0.0
     priors = twin["priors"]
     colors = twin["colors"][cell_positions]
     # remap neighbor positions to the chunk-local frame

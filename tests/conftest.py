@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+import numpy as np
 import pytest
 
 # Repository root on sys.path so `import src.*` works under plain pytest.
@@ -107,7 +108,11 @@ def twin_solved(twin):
 
 @pytest.fixture(scope="session")
 def twin_ablation_solved(twin):
-    """2019-2021 VIIRS-masked ablation solve (MODIS-only reconstruction)."""
+    """2019-2021 VIIRS-masked ablation solve (MODIS-only reconstruction).
+
+    Masked VIIRS platforms are marked non-operational inside the window so
+    their removed detections never become false clear-sky non-detections.
+    """
     from src.engine import solver as sv
     from src.validation.synthetic_twin import build_chunk_problem
 
@@ -116,16 +121,10 @@ def twin_ablation_solved(twin):
     viirs = ("SNPP", "NOAA-20", "NOAA-21")
 
     def build(cells, dev):
-        df = twin["pass_df"]
-        inside = (
-            (df["t_index"] >= t_lo) & (df["t_index"] <= t_hi)
-            & df["platform"].isin(viirs)
+        return build_chunk_problem(
+            twin, cells, dev, mask_platforms=viirs,
+            mask_window=(t_lo, t_hi),
         )
-        masked = build_chunk_problem(
-            {**twin, "pass_df": df[~inside].reset_index(drop=True)},
-            cells, dev,
-        )
-        return masked
 
     return sv.solve_all_chunks(
         build, len(twin["cells"]), batch_size=1000, sweeps=6,
@@ -137,3 +136,68 @@ def twin_helpers_build(twin, cells, dev):
     from src.validation.synthetic_twin import build_chunk_problem
 
     return build_chunk_problem(twin, cells, dev)
+
+
+@pytest.fixture(scope="session")
+def twin_products(twin, twin_solved):
+    """The four product frames built from the twin solve (shared by
+    test_09 schema invariants and test_10 API fixtures)."""
+    from src.products import export_duckdb as ex
+
+    cells = twin["cells"]
+    latlon = np.asarray(twin["latlon"], dtype=float)
+    cell_meta = pd.DataFrame(
+        {
+            "cell_pos": np.arange(len(cells)),
+            "h3_index": np.asarray(cells, dtype=np.int64),
+            "pyrome_id": np.zeros(len(cells), dtype=int),
+            "latitude": latlon[:, 0],
+            "longitude": latlon[:, 1],
+            "country_iso": ["ARG"] * len(cells),
+        }
+    )
+    pass_df = twin["pass_df"].copy()
+    pass_df["data_tier"] = "ML_SCIENCE"
+    solved = dict(twin_solved)
+    solved["month_ids"] = twin["month_ids"]
+    solved["platform_calendar"] = twin["platform_calendar"]
+    f_event = np.full(7, 5.0)
+    p1 = ex.build_product1(
+        _twin_provenance_frame(twin), pass_df
+    )
+    p2m = ex.build_product2_monthly(
+        solved, cell_meta, twin["month_keys"], pass_df, f_event,
+        cqr_factor=1.5,
+    )
+    p2d = ex.build_product2_daily(solved, cell_meta, twin["month_keys"],
+                                  pass_df)
+    p3 = ex.build_product3(
+        solved, cell_meta, twin["month_keys"], pass_df, p2m, 1.5
+    )
+    return {"p1": p1, "p2m": p2m, "p2d": p2d, "p3": p3,
+            "cell_meta": cell_meta, "pass_df": pass_df}
+
+
+def _twin_provenance_frame(twin):
+    """Minimal provenance-base frame for Product 1 schema verification."""
+    df = twin["pass_df"].head(50).copy()
+    df["acq_date"] = df["solar_date"]
+    df["acq_hhmm"] = 1345
+    df["t_mir_k"] = 340.0
+    df["t_tir_k"] = 300.0
+    df["conf_raw"] = "n"
+    df["type_raw"] = 0
+    df["data_tier"] = "ML_SCIENCE"
+    df["scan_km"] = np.nan
+    df["track_km"] = np.nan
+    df["sza_deg"] = 40.0
+    df["pixel_area_km2"] = 0.2
+    df["vza_deg"] = 30.0
+    df["is_static_industrial"] = False
+    df["is_sama_filtered"] = False
+    df["bowtie_weight"] = 1.0
+    df["reliability_prob"] = 0.9
+    df["event_cluster_id"] = 0
+    df["frp_mw"] = df["y_frp_mw"]
+    df["ingest_ts"] = "2026-11-14T00:00:00Z"
+    return df
