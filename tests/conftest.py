@@ -205,4 +205,7 @@ def twin_diagnostics(full_twin):
     from src.validation.diagnostics import run_diagnostics
     return run_diagnostics(full_twin["monthly"], full_twin["truth"],
                            None, full_twin["pass_obs"],
-                           full_twin["pass_cal"])
+                           full_twin["pass_cal"],
+                           ablation_fold=full_twin["ablation_fold"],
+                           daily=full_twin["daily"],
+                           c_modis=full_twin["c_modis"])

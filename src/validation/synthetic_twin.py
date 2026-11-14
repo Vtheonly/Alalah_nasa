@@ -65,14 +65,24 @@ class PyromeTruth:
 
 
 AGRI_SEASONAL = (0.05, 0.03, 0.10, 0.40, 1.30, 0.80, 0.30, 3.30, 3.80, 2.80, 0.50, 0.10)
-FOREST_SEASONAL = (0.75, 0.65, 0.80, 0.95, 1.05, 0.85, 1.15, 1.45, 1.35, 1.15, 0.90, 0.75)
+# Dry-season forest fire regime (Cerrado/Amazon-like: Jul-Oct burning,
+# near-dormant wet season).  A year-round burning hexagon is physically a
+# persistent heat source: at H3-Res8 it trips the readme 5.1.3 static
+# industrial persistence mask exactly like a gas flare, so the twin's
+# wildfire regimes must be episodic (and their fronts must move, see
+# ``_cluster_slots``).
+FOREST_SEASONAL = (0.25, 0.15, 0.12, 0.12, 0.20, 0.45, 1.10, 2.10, 2.70, 2.30, 1.30, 0.55)
 
 PYROME_TRUTHS = {
     0: PyromeTruth("agri", lambda0=4.5, f_event=15.0, phi_day_base=10.0,
                    night_day_ratio=0.08, seasonal=AGRI_SEASONAL,
                    rho=0.70, sigma_proc=0.35, diurnal_amp=0.35),
+    # ndr 0.20: with VIIRS's higher night survival (lower night F_min) the
+    # per-micro-cell detection symmetry R_DN of a 0.25 regime sits exactly
+    # on the 0.30 static-flare threshold; 0.20 keeps the twin forest an
+    # unambiguous (non-industrial) wildfire regime.
     1: PyromeTruth("forest", lambda0=3.5, f_event=22.0, phi_day_base=15.0,
-                   night_day_ratio=0.25, seasonal=FOREST_SEASONAL,
+                   night_day_ratio=0.20, seasonal=FOREST_SEASONAL,
                    rho=0.60, sigma_proc=0.50, diurnal_amp=0.55),
 }
 
@@ -198,8 +208,8 @@ def generate_truth(cfg: TwinConfig):
 # Cloud table (CMG 8-day schema)
 # ---------------------------------------------------------------------------
 def _cmg_center(lat, lon):
-    row = int(np.clip(np.floor((89.875 - lat) / 0.25), 0, 719))
-    col = int(np.floor((lon + 179.875) / 0.25)) % 1440
+    row = int(np.clip(np.floor((90.0 - lat) / 0.25), 0, 719))
+    col = int(np.floor((lon + 180.0) / 0.25)) % 1440
     return 89.875 - 0.25 * row, -179.875 + 0.25 * col
 
 
@@ -280,38 +290,45 @@ def _hhmm_of(hours: float) -> int:
 def _area_of(fam, sample, pixarea):
     if fam == "MODIS":
         _, _, _, a = modis_sample_to_geometry(np.array([sample]))
-        return float(a)
+        return float(np.asarray(a).item())
     return float(pixarea)
 
 
 def _cluster_slots(rng, lat: float, lon: float, n: int):
-    """Spatially separated cluster positions inside one H3-Res6 cell.
+    """Spatially separated, MOVING cluster positions inside one H3-Res6 cell.
 
-    Centre + 3 ring points at 2.65 km (> the 2.51 km MODIS event-clustering
-    threshold at A = 3.2 km^2; 2.65 km + jitter < the ~2.89 km hex inradius
-    so slots never leak into neighbouring cells), so each generated cluster
-    survives as its own ``event_cluster_id`` (raw_event_count == n, keeping
-    the calibrated psi_FRP_eff(n) exactly consistent with generation).
-    Event rates are tuned so n <= 4 with high probability.
+    Each pass draws fresh positions uniformly over a disk of radius
+    ``2.85 km`` (< the ~2.89 km hex inradius, so fires never leak into a
+    neighbouring cell) with pairwise separation ``>= 2.55 km`` (> the
+    2.51 km MODIS event-clustering threshold at A = 3.2 km^2), by
+    sequential rejection sampling.  Every generated cluster therefore
+    survives as its own ``event_cluster_id`` (raw_event_count == n keeps the
+    calibrated psi_FRP_eff(n) consistent with generation) while real
+    wildfire fronts MOVE: no H3-Res8 micro-cell is revisited day after day
+    the way a static industrial flare is (the readme 5.1.3 persistence mask
+    -- Y >= 3 yr, D >= 15 d/yr, R_DN > 0.30 -- must flag the twin's flare
+    cells, never its wildfire cells).  When no separated position remains
+    (rare large n) the cluster is placed at a random in-disk position.
     """
-    rot = rng.uniform(0.0, 2.0 * np.pi)
-    slots = [(0.0, 0.0)]
-    for k in range(3):
-        ang = rot + (2.0 * np.pi / 3.0) * k
-        slots.append((2.65 * np.cos(ang), 2.65 * np.sin(ang)))
-    rng.shuffle(slots)
-    out = []
-    for i in range(n):
-        if i < len(slots):
-            dx, dy = slots[i]
-        else:                      # rare n > 4: random in-cell position
-            ang = rng.uniform(0, 2 * np.pi)
-            rad = 2.6 * np.sqrt(rng.uniform())
-            dx, dy = rad * np.cos(ang), rad * np.sin(ang)
-        dx += rng.normal(0.0, 0.03)
-        dy += rng.normal(0.0, 0.03)
-        out.append((lat + dy / 111.0, lon + dx / (111.0 * np.cos(np.deg2rad(lat)))))
-    return out
+    radius, sep = 2.85, 2.55
+    pts: list[tuple[float, float]] = []
+    for _i in range(n):
+        placed = None
+        for _try in range(60):
+            ang = rng.uniform(0.0, 2.0 * np.pi)
+            rad = radius * np.sqrt(rng.uniform())
+            cand = (rad * np.cos(ang), rad * np.sin(ang))
+            if all((cand[0] - q[0]) ** 2 + (cand[1] - q[1]) ** 2 >= sep * sep
+                   for q in pts):
+                placed = cand
+                break
+        if placed is None:
+            ang = rng.uniform(0.0, 2.0 * np.pi)
+            rad = radius * np.sqrt(rng.uniform())
+            placed = (rad * np.cos(ang), rad * np.sin(ang))
+        pts.append(placed)
+    return [(lat + dy / 111.0, lon + dx / (111.0 * np.cos(np.deg2rad(lat))))
+            for dx, dy in pts]
 
 
 def generate_twin_detections(cfg: TwinConfig, lognorm: dict | None = None):
@@ -475,8 +492,8 @@ def twin_lognorm_params(seed: int = 42, iters: int = 4) -> dict:
     """
     if seed in _PILOT_CACHE:
         return _PILOT_CACHE[seed]
-    from ..calibration.pyromes import extract_cluster_table
-    from ..calibration.operators import fit_lognorm_params
+    from ..calibration.operators import (fit_lognorm_params,
+                                         lognorm_cluster_table)
     from ..geometry.preprocess_geometry import preprocess_observations
 
     params = {b: tuple(v) for b, v in INITIAL_LOGNORM.items()}
@@ -485,20 +502,21 @@ def twin_lognorm_params(seed: int = 42, iters: int = 4) -> dict:
     for _ in range(iters):
         cfg = TwinConfig(seed=seed, t_days=t_lo + pilot_len, outages=(),
                          events=(), drift=False)
-        det, cells, _z, _tr, _cl, _out = generate_twin_detections(cfg, params)
+        det, cells, _z, _tr, cl_df, _out = generate_twin_detections(cfg,
+                                                                     params)
         prov, _pas = preprocess_observations(det)
         prov_bio = prov[prov["is_biomass"]]
-        clusters = extract_cluster_table(prov_bio)
         twin_pyrome = {int(latlon_to_h3_int([lat], [lon], S.H3_MAIN_RES)[0]): b
                        for lat, lon, b, _role in cfg.cells}
-        clusters["pyrome_id"] = clusters["h3_index"].map(
-            lambda h: twin_pyrome.get(int(h), 0)).astype(int)
-        clusters["vza_deg"] = 20.0
-        clusters["cloud_frac"] = 0.0
+        hexp = pd.DataFrame({"h3_index": list(twin_pyrome),
+                             "pyrome_id": list(twin_pyrome.values())})
+        # identical cluster selection to operators.calibrate(): window,
+        # VIIRS, real cluster VZA < 20 deg, cloud_frac < 0.30
+        clusters = lognorm_cluster_table(prov_bio, hexp, cl_df)
         fitted = fit_lognorm_params(clusters)
         # key by the twin's true pyrome ids only
         params = {int(b): tuple(v) for b, v in fitted.items()
-                  if int(b) in INITIAL_LOGNORM}
+                  if not isinstance(b, str) and int(b) in INITIAL_LOGNORM}
         for b in INITIAL_LOGNORM:
             params.setdefault(int(b), tuple(INITIAL_LOGNORM[b]))
     _PILOT_CACHE[seed] = params

@@ -29,44 +29,18 @@ def _t_of(dates):
 
 
 def _monthly_from_z(z_map, cells, t_days):
-    """True monthly means directly from the MAP latent states (reference)."""
-    dates = pd.DatetimeIndex([T0 + pd.Timedelta(days=t) for t in range(t_days)])
-    months = dates.month.to_numpy()
-    years = dates.year.to_numpy()
+    """Monthly means directly from the MAP latent states (reference)."""
+    dates = T0 + pd.to_timedelta(np.arange(t_days), unit="D")
+    ym = dates.year.to_numpy() * 12 + dates.month.to_numpy() - 1
+    uym, mi = np.unique(ym, return_inverse=True)
+    cnt = np.bincount(mi, minlength=len(uym))
+    phi24 = 0.5 * (np.exp(z_map[:, :, 0]) + np.exp(z_map[:, :, 1]))
     rows = []
     for i, c in enumerate(cells):
-        for y in np.unique(years):
-            for m in range(1, 13):
-                sel = (years == y) & (months == m)
-                if not sel.any():
-                    continue
-                phi_d = float(np.exp(z_map[i, sel, 0]).mean())
-                phi_n = float(np.exp(z_map[i, sel, 1]).mean())
-                rows.append({"h3_index": int(c), "year": int(y), "month": int(m),
-                             "phi_ref": 0.5 * (phi_d + phi_n)})
-    return pd.DataFrame(rows)
-
-
-def _raw_baselines(pass_obs, t_days):
-    """Raw (unharmonized) per cell-month baselines: counts / FRP / events."""
-    p = pass_obs.copy()
-    p["t"] = _t_of(p["solar_date"])
-    dates = pd.DatetimeIndex([T0 + pd.Timedelta(days=t) for t in p["t"]])
-    p["year"] = dates.year.to_numpy()
-    p["month"] = dates.month.to_numpy()
-    g = p.groupby(["h3_index", "year", "month"], as_index=False).agg(
-        raw_count_sum=("n_pixels", "sum"),
-        raw_frp_sum_mw=("y_frp_mw", "sum"),
-        raw_clustered_events=("raw_event_count", "sum"))
-    return g
-
-
-def _platform_mask_fn(masked_platforms, t_lo, t_hi):
-    def mask(pi, t):
-        if pi not in masked_platforms:
-            return True
-        return not (t_lo <= t <= t_hi)
-    return mask
+        mm = np.bincount(mi, weights=phi24[i], minlength=len(uym)) / cnt
+        rows.append(pd.DataFrame({"h3_index": int(c), "year": uym // 12,
+                                  "month": uym % 12 + 1, "phi_ref": mm}))
+    return pd.concat(rows, ignore_index=True)
 
 
 def run(det, cells, z_true, truth, cloud_df, cfg, paths=None,
@@ -88,111 +62,63 @@ def run(det, cells, z_true, truth, cloud_df, cfg, paths=None,
     prov, pass_obs = preprocess_observations(det)
     prov_bio = prov[prov["is_biomass"]].copy()
 
-    # ---- pyromes --------------------------------------------------------------
+    # ---- pyromes + operator calibration (2012-2021 freeze) ----------------
     hex_pyromes, _gmm, _scaler = fit_pyromes(prov_bio)
-
-    # ---- operator calibration ---------------------------------------------------
     artifacts, pass_cal = ops.calibrate(prov_bio, pass_obs, hex_pyromes,
                                         cloud_df)
 
-    # ---- priors -------------------------------------------------------------------
-    def psi_cnt_fn(b, g):
-        """Per-row psi_CNT (platform-aware: MODIS at A_avg 2.35, VIIRS 0.23)."""
-        n = len(g)
-        fams = [S.SENSOR_FAMILY.get(str(p), "VIIRS")
-                for p in (g["platform"].to_numpy()
-                          if "platform" in g.columns
-                          else np.full(n, "SNPP", dtype=object))]
-        dns = g["dn_flag"].to_numpy()
-        out = np.empty(n)
-        for fam in ("MODIS", "VIIRS"):
-            m = np.array([f == fam for f in fams])
-            if m.any():
-                out[m] = ops.psi_cnt(fam, b, S.PASS_GEOMETRY_AVG[fam][0],
-                                     dns[m], artifacts["lognorm_params"])
-        return out
+    # ---- priors -------------------------------------------------------------
+    psi_cnt_fn = ops.psi_cnt_row_fn(artifacts)
     active_cells = sorted(set(int(c) for c in pass_cal["h3_index"].unique()))
     priors = pr.estimate_priors(pass_cal, hex_pyromes, active_cells, cloud_df,
                                 artifacts.get("cloud_climatology"),
-                                t_days=t_days, psi_cnt_fn=psi_cnt_fn)
+                                t_days=t_days, psi_cnt_fn=psi_cnt_fn,
+                                platform_active=platform_active)
 
-    # ---- main solve --------------------------------------------------------------
-    res = slv.solve_all_chunks(pass_cal, active_cells, hex_pyromes, priors,
-                               artifacts, cloud_df, t_days=t_days,
-                               platform_active=platform_active)
-    monthly_state, daily_state = slv.aggregate_trajectories(
-        res["cells"], t_days,
-        {(int(c), s): None for c in res["cells"] for s in (0, 1)}) \
-        if False else (res["monthly"], res["daily"])
-    monthly, daily = slv.combine_states_to_products(monthly_state, daily_state)
-    monthly = monthly.merge(
-        hex_pyromes[["h3_index", "pyrome_id"]], on="h3_index", how="left")
-    monthly["pyrome_id"] = monthly["pyrome_id"].fillna(0).astype(int)
-
-    # ---- conformal folds -----------------------------------------------------------
-    t_2018 = (pd.Timestamp("2018-01-01") - T0).days
-    t_2021 = (pd.Timestamp("2021-12-31") - T0).days
-    viirs_idx = [S.PLATFORM_INDEX[p] for p in S.VIIRS_PLATFORMS]
-    fold_modis = slv.solve_all_chunks(
+    # ---- solve + conformal + finalize ---------------------------------------
+    h = conf.harmonize_and_calibrate(pass_cal, pass_obs, prov, hex_pyromes, priors, artifacts,
+                  cloud_df, platform_active, t_days=t_days,
+                  batch_size=chunk_cells or S.BATCH_SIZE)
+    res = h["res"]
+    monthly = h["monthly"]
+    ablation = viirs_masked_ablation_fold(
         pass_cal, active_cells, hex_pyromes, priors, artifacts, cloud_df,
-        t_days=t_days, platform_active=platform_active,
-        platform_mask=_platform_mask_fn(set(viirs_idx), t_2018, t_2021))
-    fm, _fd = slv.combine_states_to_products(fold_modis["monthly"],
-                                             fold_modis["daily"])
-    fm = fm.merge(hex_pyromes[["h3_index", "pyrome_id"]], on="h3_index",
-                  how="left")
-    fm["pyrome_id"] = fm["pyrome_id"].fillna(0).astype(int)
-    phi_ref_by_key = {(int(h), int(y), int(m)): v for h, y, m, v in
-                      zip(monthly["h3_index"], monthly["year"],
-                          monthly["month"], monthly["phi_q50_mw"])}
-    c_modis = conf.conformal_multipliers(
-        fm[(fm["year"] >= 2018) & (fm["year"] <= 2020)], phi_ref_by_key)
-
-    # leave-one-VIIRS-platform-out folds (SNPP held out 2018-2021)
-    snpp_idx = S.PLATFORM_INDEX["SNPP"]
-    fold_loo = slv.solve_all_chunks(
-        pass_cal, active_cells, hex_pyromes, priors, artifacts, cloud_df,
-        t_days=t_days, platform_active=platform_active,
-        platform_mask=_platform_mask_fn({snpp_idx}, t_2018, t_2021))
-    fl, _fd2 = slv.combine_states_to_products(fold_loo["monthly"],
-                                              fold_loo["daily"])
-    fl = fl.merge(hex_pyromes[["h3_index", "pyrome_id"]], on="h3_index",
-                  how="left")
-    fl["pyrome_id"] = fl["pyrome_id"].fillna(0).astype(int)
-    c_multi = conf.conformal_multipliers(
-        fl[(fl["year"] >= 2018) & (fl["year"] <= 2021)], phi_ref_by_key)
-
-    # ---- apply conformal rescaling ---------------------------------------------------
-    modis_only_era = monthly["year"] < 2012
-    monthly = conf.apply_conformal(monthly, c_modis, c_multi, modis_only_era)
-    monthly = conf.climatology_indices(monthly)
-
-    # ---- raw baselines + event indices -------------------------------------------------
-    raw = _raw_baselines(pass_obs, t_days)
-    monthly = monthly.merge(raw, on=["h3_index", "year", "month"], how="left")
-    monthly[["raw_count_sum", "raw_frp_sum_mw", "raw_clustered_events"]] = \
-        monthly[["raw_count_sum", "raw_frp_sum_mw",
-                 "raw_clustered_events"]].fillna(0.0)
-    f_event = priors["f_event"]
-    monthly["energy_equiv_events_q50"] = conf.energy_equiv_events(
-        monthly["phi_q50_mw"],
-        [f_event.get(int(b), 1.0) for b in monthly["pyrome_id"]])
-
-    z_map = res["z_map"]
-    phi_ref = _monthly_from_z(z_map, res["cells"], t_days)
-    result = {
+        platform_active, t_days, chunk_cells or S.BATCH_SIZE)
+    phi_ref = _monthly_from_z(res["z_map"], res["cells"], t_days)
+    return {
         "prov": prov, "prov_bio": prov_bio, "pass_obs": pass_obs,
         "pass_cal": pass_cal, "hex_pyromes": hex_pyromes,
-        "artifacts": artifacts, "priors": priors, "platform_active":
-            platform_active,
-        "z_map": z_map, "var": res["var"], "cells": res["cells"],
-        "monthly": monthly, "daily": daily,
-        "monthly_state": monthly_state, "truth": truth, "z_true": z_true,
+        "artifacts": artifacts, "priors": priors,
+        "platform_active": platform_active,
+        "z_map": res["z_map"], "var": res["var"], "cells": res["cells"],
+        "monthly": monthly, "daily": h["daily"],
+        "monthly_state": res["monthly"], "truth": truth, "z_true": z_true,
         "cloud_df": cloud_df, "cfg": cfg,
-        "c_modis": c_modis, "c_multi": c_multi,
+        "c_modis": h["c_modis"], "c_multi": h["c_multi"],
+        "fold_modis": h["fold_modis"], "fold_loo": h["fold_loo"],
         "phi_ref": phi_ref, "solver_results": res["results"],
+        "op": res["op"], "ablation_fold": ablation,
     }
-    return result
+
+
+def viirs_masked_ablation_fold(pass_cal, active_cells, hex_pyromes, priors,
+                               artifacts, cloud_df, platform_active,
+                               t_days: int, batch_size: int = S.BATCH_SIZE):
+    """Re-solve with ALL VIIRS platforms masked over 2019-01-01..2021-12-31
+    (readme 2019-2021 VIIRS-masked ablation); 2019-2021 monthly rows."""
+    viirs = [S.PLATFORM_INDEX[p] for p in S.VIIRS_PLATFORMS]
+    t19 = (pd.Timestamp("2019-01-01") - T0).days
+    t21 = (pd.Timestamp("2021-12-31") - T0).days
+    fold = slv.solve_all_chunks(
+        pass_cal, active_cells, hex_pyromes, priors, artifacts, cloud_df,
+        t_days=t_days, platform_active=platform_active,
+        platform_mask=slv.PlatformMask(viirs, t19, t21), daily_mode="none",
+        keep_years=(2019, 2021), keep_states=False, batch_size=batch_size)
+    m = fold["monthly"].merge(hex_pyromes[["h3_index", "pyrome_id"]]
+                              .drop_duplicates("h3_index"),
+                              on="h3_index", how="left")
+    m["pyrome_id"] = m["pyrome_id"].fillna(0).astype(int)
+    return m
 
 
 def twin_assertion_metrics(res: dict) -> dict:

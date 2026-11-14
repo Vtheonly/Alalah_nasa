@@ -22,8 +22,6 @@ import numpy as np
 import pandas as pd
 
 from ..config import settings as S
-from ..engine import conformal as conf
-from ..geometry.h3_utils import h3_boundary_geojson
 
 PRODUCT1_COLUMNS = [
     "platform", "data_tier", "acq_date", "acq_hhmm", "frp_mw", "t_mir_k",
@@ -88,183 +86,138 @@ def build_product1(prov: pd.DataFrame, pass_cal: pd.DataFrame) -> pd.DataFrame:
 
 def sparse_daily_filter(daily: pd.DataFrame, pass_obs: pd.DataFrame,
                         t_days: int) -> pd.Series:
-    """Sparse episode filter: phi_q50 > 0.25 OR within +-3 days of a
-    detection OR inside a spotlight ROI."""
+    """Sparse episode filter (readme 5.4.4): keep a daily row iff
+    ``phi_q50_mw > 0.25`` OR the SAME cell had a detection within +-3 days
+    OR the cell centre lies inside a spotlight ROI.  Vectorized."""
     if not len(daily):
         return pd.Series(False, index=daily.index)
+    from ..engine.solver import _cell_centers, spotlight_mask
     t0 = pd.Timestamp(S.DATE_START)
-    det_t = set()
-    if len(pass_obs):
-        det_t = set(((pd.to_datetime(pass_obs["solar_date"]) - t0).dt.days)
-                    .astype(int).tolist())
-    t = daily["t"].to_numpy(dtype=int)
-    near_det = np.zeros(len(daily), dtype=bool)
-    for pad in range(-S.DAILY_SPARSE_DETECTION_PAD_DAYS,
-                     S.DAILY_SPARSE_DETECTION_PAD_DAYS + 1):
-        near_det |= np.isin(t, np.array(sorted(det_t)) + pad) if det_t else False
-    keep = (daily["phi_q50_mw"] > S.DAILY_SPARSE_PHI_MIN).to_numpy() | near_det
-    # spotlight ROIs (per-cell lat/lon inside any preset bbox)
-    from ..geometry.h3_utils import h3_cell_center
-    in_spot = np.zeros(len(daily), dtype=bool)
-    cells = {int(c): h3_cell_center(int(c)) for c in daily["h3_index"].unique()}
-    for i, c in enumerate(daily["h3_index"].to_numpy()):
-        lat, lon = cells.get(int(c), (0.0, 0.0))
-        for sp in S.SPOTLIGHT_PRESETS:
-            if (sp.bbox[0] <= lon <= sp.bbox[2]
-                    and sp.bbox[1] <= lat <= sp.bbox[3]):
-                in_spot[i] = True
-                break
-    return pd.Series(keep | in_spot, index=daily.index)
+    h = daily["h3_index"].to_numpy(np.int64)
+    t = daily["t"].to_numpy(np.int64)
+    keep = (daily["phi_q50_mw"] > S.DAILY_SPARSE_PHI_MIN).to_numpy()
+    if pass_obs is not None and len(pass_obs):
+        po = pass_obs
+        if "y_frp_mw" in po.columns:
+            po = po[po["y_frp_mw"] > 0]
+        dt = (pd.to_datetime(po["solar_date"]) - t0).dt.days.to_numpy(np.int64)
+        dh = po["h3_index"].to_numpy(np.int64)
+        pad = S.DAILY_SPARSE_DETECTION_PAD_DAYS
+        offs = np.arange(-pad, pad + 1)
+        kh = np.repeat(dh, len(offs))
+        kt = (dt[:, None] + offs[None, :]).ravel()
+        det_keys = np.unique(kh * (t_days + 2 * pad + 1) + (kt + pad))
+        row_keys = h * (t_days + 2 * pad + 1) + (t + pad)
+        keep |= np.isin(row_keys, det_keys)
+    uc, inv = np.unique(h, return_inverse=True)
+    lat, lon = _cell_centers(uc)
+    keep |= spotlight_mask(lat, lon)[inv]
+    return pd.Series(keep, index=daily.index)
+
+
+REQUIRED_FINAL_COLUMNS = ("conformal_c_factor", "quality_flag",
+                          "attribution_flag", "measured_fraction",
+                          "mean_cloud_frac", "active_platforms_bitmask")
 
 
 def build_products(monthly: pd.DataFrame, daily: pd.DataFrame,
                    pass_obs: pd.DataFrame, prov: pd.DataFrame,
-                   pass_cal: pd.DataFrame, priors: dict,
-                   artifacts: dict, cloud_df: pd.DataFrame | None,
+                   pass_cal: pd.DataFrame, priors: dict | None = None,
+                   artifacts: dict | None = None, cloud_df=None,
                    t_days: int = S.T_DAYS) -> dict:
-    """Assemble Products 1-3 (monthly dense, daily sparse, diagnostics)."""
+    """Assemble Products 1-3 from the FINALIZED monthly frame
+    (:func:`src.engine.conformal.finalize_monthly`) and the sparse daily
+    posterior rows.  No defaults are fabricated: missing diagnostics raise.
+    """
+    missing = [c for c in REQUIRED_FINAL_COLUMNS if c not in monthly.columns]
+    if missing:
+        raise ValueError("monthly frame is not finalized (missing "
+                         f"{missing}); run conformal.finalize_monthly first")
     product1 = build_product1(prov, pass_cal)
-
-    m = monthly.copy()
-    if "country_iso" not in m.columns and len(prov):
-        cc = prov.groupby("h3_index")["country_iso"].first()
-        m["country_iso"] = m["h3_index"].map(
-            lambda h: cc.get(int(h)) if pd.notna(cc.get(int(h))) else "ARG")
-    elif "country_iso" not in m.columns:
-        m["country_iso"] = "ARG"
-    # burning footprint + flux density + event indices
-    area_model = artifacts.get("area_model")
-    from ..calibration.operators import predict_burn_area
-    hex_area = 36.13
-    m["est_active_area_km2"] = predict_burn_area(
-        area_model, np.log(m["phi_q50_mw"].clip(lower=1e-3) + 0.01),
-        (m["phi_night_mw"] / m["phi_day_mw"].clip(lower=1e-6)).fillna(1.0),
-        m["pyrome_id"], hex_area)
-    m["phi_flux_mw_km2"] = m["phi_q50_mw"] / hex_area
-    f_event = priors["f_event"]
-    m["energy_equiv_events_q50"] = conf.energy_equiv_events(
-        m["phi_q50_mw"], [f_event.get(int(b), 1.0) for b in m["pyrome_id"]])
-    # hurdle_adj_events: mean over detecting platforms per half-day, scaled
-    # by 1/max(measured_fraction, 0.25), capped at 5x raw clustered events
-    po_all = pass_cal if (pass_cal is not None and len(pass_cal)) else pass_obs
-    if po_all is not None and len(po_all) and "pyrome_id" in po_all.columns:
-        po = po_all.copy()
-        t0 = pd.Timestamp(S.DATE_START)
-        po["t"] = ((pd.to_datetime(po["solar_date"]) - t0).dt.days).astype(int)
-        lognorm = artifacts["lognorm_params"]
-        from ..calibration.operators import psi_cnt
-        po["psi_cnt_pass"] = [
-            float(psi_cnt(S.SENSOR_FAMILY.get(str(p), "VIIRS"), int(b),
-                          float(a), str(dn), lognorm))
-            for p, b, a, dn in zip(po["platform"], po["pyrome_id"],
-                                   po["mean_area_km2"], po["dn_flag"])]
-        po["e_half"] = po["raw_event_count"] / np.maximum(
-            po["psi_cnt_pass"] * 0.9, 1e-6)
-        hd = po.groupby(["h3_index", "t", "dn_flag"], as_index=False).agg(
-            e_half=("e_half", "mean"), platforms=("platform", lambda s:
-                                                  conf.active_platforms_bitmask(s)))
-        dd = daily.copy()
-        dd["year"] = pd.Timestamp(S.DATE_START).year + (
-            dd["t"] // 365).clip(upper=26)
-        dates = pd.DatetimeIndex([pd.Timestamp(S.DATE_START)
-                                  + pd.Timedelta(days=int(t))
-                                  for t in dd["t"]])
-        dd["year"] = dates.year
-        dd["month"] = dates.month
-        mm = dd.merge(hd, on=["h3_index", "t"], how="left")
-        mm["e_half"] = mm["e_half"].fillna(0.0)
-        agg = mm.groupby(["h3_index", "year", "month"], as_index=False).agg(
-            e_sum=("e_half", "sum"),
-            bitmask=("platforms", "max"),
-            meas=("e_half", lambda s: float((s > 0).mean())))
-        m = m.merge(agg, on=["h3_index", "year", "month"], how="left")
-        m["hurdle_adj_events"] = np.minimum(
-            m["e_sum"] / np.maximum(m["meas"].fillna(1.0),
-                                    S.MEASURED_FRACTION_FLOOR),
-            S.HURDLE_EVENTS_CAP_FACTOR * m["raw_clustered_events"]
-        ).fillna(m["raw_clustered_events"])
-        m["hurdle_adj_events"] = m["hurdle_adj_events"].fillna(0.0)
-    else:
-        m["hurdle_adj_events"] = 0.0
-        m["bitmask"] = 0
-        m["meas"] = 1.0
-    m["night_day_ratio"] = (m["phi_night_mw"]
-                            / m["phi_day_mw"].clip(lower=1e-6)).fillna(0.0)
-
-    # conformal era + flags already applied upstream (calibrated intervals)
+    m = monthly
     product2_monthly = m[[c for c in PRODUCT2_MONTHLY_COLUMNS
-                          if c in m.columns]].copy()
-
-    # daily sparse
-    daily2 = daily.copy()
-    keep = sparse_daily_filter(daily2, pass_obs, t_days)
-    product2_daily = daily2.loc[keep].copy()
-
-    # Product 3: diagnostics 1-to-1 with monthly
-    def _col(name, default):
-        if name in m.columns:
-            return m[name]
-        return pd.Series(np.full(len(m), default), index=m.index)
-
-    p3 = pd.DataFrame({
-        "h3_index": m["h3_index"].to_numpy(),
-        "year": m["year"].to_numpy(),
-        "month": m["month"].to_numpy(),
-        "conformal_c_factor": _col("conformal_c_factor", 1.0).to_numpy(),
-        "rel_uncertainty_width": ((m["phi_q95_mw"] - m["phi_q05_mw"])
-                                  / m["phi_q50_mw"].clip(lower=1e-6)).to_numpy(),
-        "measured_fraction": pd.Series(_col("meas", 1.0)).fillna(1.0).to_numpy(),
-        "inferred_fraction": (1.0 - pd.Series(_col("meas", 1.0))
-                              .fillna(1.0)).clip(0, 1).to_numpy(),
-        "active_platforms_bitmask": pd.Series(_col("bitmask", 0))
-            .fillna(0).astype(int).to_numpy(),
-        "mean_cloud_frac": pd.Series(_col("mean_cloud_frac", 0.0))
-            .fillna(0.0).to_numpy(),
-        "has_nrt_gapfill": 0,
-        "attribution_flag": _col("attribution_flag",
-                                 "WITHIN_NORMAL_VARIABILITY").to_numpy(),
-        "quality_flag": _col("quality_flag", "NOMINAL").to_numpy(),
-        "revision_count": 1,
-    })
-    product3 = p3[[c for c in PRODUCT3_COLUMNS if c in p3.columns]]
+                          if c in m.columns]].reset_index(drop=True)
+    daily2 = daily
+    if len(daily2):
+        keep = sparse_daily_filter(daily2, pass_obs, t_days)
+        daily2 = daily2.loc[keep.to_numpy()].copy()
+        dates = pd.Timestamp(S.DATE_START) + pd.to_timedelta(
+            daily2["t"].to_numpy(), unit="D")
+        daily2["solar_date"] = dates.strftime("%Y-%m-%d")
+        daily2["year"] = dates.year
+        daily2["month"] = dates.month
+    product2_daily = daily2.reset_index(drop=True)
+    product3 = m[[c for c in PRODUCT3_COLUMNS if c in m.columns]] \
+        .reset_index(drop=True)
     return {"product1": product1, "product2_monthly": product2_monthly,
             "product2_daily": product2_daily, "product3": product3}
 
 
-def export_duckdb(products: dict, duckdb_path, parquet_dir=None) -> None:
-    """Write indexed Zstd Parquet + load all tables into fire_harmonized.duckdb."""
+PRODUCT_TABLES = {"product1": "obs_harmonized_provenance",
+                  "product2_monthly": "state_reconstructed_monthly",
+                  "product2_daily": "state_reconstructed_daily",
+                  "product3": "uncertainty_diagnostics"}
+
+
+def hex_centers_frame(monthly: pd.DataFrame) -> pd.DataFrame:
+    """One row per active hexagon: centre lat/lon + country (web index)."""
+    from ..engine.solver import _cell_centers
+    cells = np.unique(monthly["h3_index"].to_numpy(np.int64))
+    lat, lon = _cell_centers(cells)
+    country = (monthly.drop_duplicates("h3_index").set_index("h3_index")
+               ["country_iso"].reindex(cells).to_numpy()
+               if "country_iso" in monthly.columns else None)
+    return pd.DataFrame({"h3_index": cells, "latitude": lat,
+                         "longitude": lon, "country_iso": country})
+
+
+def export_duckdb(products: dict, duckdb_path, parquet_dir=None,
+                  diagnostics: dict | None = None) -> dict:
+    """Write indexed Zstd Parquet (spec filenames) + load every product into
+    ``fire_harmonized.duckdb`` with the ``hex_centers`` index table, the
+    ``diagnostics`` table and the ``v_calendar`` view.  Returns the
+    {table: parquet_path} map."""
+    import json
+
     import duckdb
 
     duckdb_path = str(duckdb_path)
     os.makedirs(os.path.dirname(duckdb_path) or ".", exist_ok=True)
-    if parquet_dir:
-        os.makedirs(parquet_dir, exist_ok=True)
+    out_dir = parquet_dir or os.path.dirname(duckdb_path) or "."
+    os.makedirs(out_dir, exist_ok=True)
     parquet_paths = {}
     for name, df in products.items():
-        path = os.path.join(parquet_dir or (os.path.dirname(duckdb_path)),
-                            f"{name}.parquet")
+        table = PRODUCT_TABLES[name]
+        path = os.path.join(out_dir, f"{table}.parquet")
         df.to_parquet(path, index=False, compression="zstd")
-        parquet_paths[name] = path
-
+        parquet_paths[table] = path
+    centers = hex_centers_frame(products["product2_monthly"])
     con = duckdb.connect(duckdb_path)
     try:
-        for name, path in parquet_paths.items():
-            table = {"product1": "obs_harmonized_provenance",
-                     "product2_monthly": "state_reconstructed_monthly",
-                     "product2_daily": "state_reconstructed_daily",
-                     "product3": "uncertainty_diagnostics"}[name]
+        for table, path in parquet_paths.items():
             con.execute(f"DROP TABLE IF EXISTS {table}")
             con.execute(
-                f"CREATE TABLE {table} AS SELECT * FROM read_parquet('{path}')")
+                f"CREATE TABLE {table} AS SELECT * FROM read_parquet(?)",
+                [path])
             if table in ("state_reconstructed_monthly",
                          "uncertainty_diagnostics"):
-                con.execute(
-                    f"CREATE INDEX IF NOT EXISTS idx_{table}_cell_ym ON "
-                    f"{table}(h3_index, year, month)")
-            elif table == "obs_harmonized_provenance":
-                con.execute(
-                    f"CREATE INDEX IF NOT EXISTS idx_{table}_h3 ON "
-                    f"{table}(h3_index)")
+                con.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_cell_ym "
+                            f"ON {table}(h3_index, year, month)")
+            elif table in ("obs_harmonized_provenance",
+                           "state_reconstructed_daily"):
+                con.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_h3 ON "
+                            f"{table}(h3_index)")
+        con.execute("DROP TABLE IF EXISTS hex_centers")
+        con.register("_centers", centers)
+        con.execute("CREATE TABLE hex_centers AS SELECT * FROM _centers")
+        con.unregister("_centers")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_hex_centers_ll ON "
+                    "hex_centers(longitude, latitude)")
+        con.execute("DROP TABLE IF EXISTS diagnostics")
+        con.execute("CREATE TABLE diagnostics (diagnostics_json VARCHAR)")
+        if diagnostics is not None:
+            con.execute("INSERT INTO diagnostics VALUES (?)",
+                        [json.dumps(diagnostics, default=float)])
         con.execute("""
             CREATE OR REPLACE VIEW v_calendar AS
             SELECT m.h3_index, m.country_iso, m.pyrome_id, m.year, m.month,
@@ -278,5 +231,22 @@ def export_duckdb(products: dict, duckdb_path, parquet_dir=None) -> None:
               ON m.h3_index = u.h3_index AND m.year = u.year
              AND m.month = u.month
         """)
+    finally:
+        con.close()
+    return parquet_paths
+
+
+def store_diagnostics(duckdb_path, diagnostics: dict) -> None:
+    """(Re)write the diagnostics table after validation."""
+    import json
+
+    import duckdb
+    con = duckdb.connect(str(duckdb_path))
+    try:
+        con.execute("CREATE TABLE IF NOT EXISTS diagnostics "
+                    "(diagnostics_json VARCHAR)")
+        con.execute("DELETE FROM diagnostics")
+        con.execute("INSERT INTO diagnostics VALUES (?)",
+                    [json.dumps(diagnostics, default=float)])
     finally:
         con.close()
