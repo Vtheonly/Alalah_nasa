@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Burning Activity Calendar — MODIS/VIIRS Harmonized</title>
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" />
+  <link rel="stylesheet" href="/static/styles.css" />
+  <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+</head>
+<body>
+  <header id="topbar">
+    <h1>Burning Activity Calendar</h1>
+    <span class="subtitle">MODIS / VIIRS physics-informed harmonization — NASA Space Apps 2026</span>
+  </header>
+
+  <main id="layout">
+    <section id="controls">
+      <div class="panel">
+        <h2>Area of Interest</h2>
+        <div class="row">
+          <label>min lon <input id="min_lon" type="number" step="0.1" value="-68.0" /></label>
+          <label>min lat <input id="min_lat" type="number" step="0.1" value="-29.6" /></label>
+        </div>
+        <div class="row">
+          <label>max lon <input id="max_lon" type="number" step="0.1" value="-67.1" /></label>
+          <label>max lat <input id="max_lat" type="number" step="0.1" value="-28.7" /></label>
+        </div>
+        <div class="row">
+          <button id="btn-apply">Apply AOI</button>
+          <button id="btn-draw" title="Drag on the map to draw a bounding box">Draw bbox</button>
+        </div>
+        <div class="row years">
+          <label>from <input id="start_year" type="number" min="2000" max="2026" value="2000" /></label>
+          <label>to <input id="end_year" type="number" min="2000" max="2026" value="2026" /></label>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>Spotlights</h2>
+        <div id="presets" class="presets"></div>
+      </div>
+
+      <div class="panel">
+        <h2>Display</h2>
+        <div class="row">
+          <label>metric
+            <select id="metric">
+              <option value="phi_q50_mw" selected>Harmonized flux q50 (MW)</option>
+              <option value="fre_tj_q50">FRE (TJ/month)</option>
+              <option value="raw_count_sum">Raw hotspot counts</option>
+              <option value="anomaly_ratio">Anomaly ratio vs 2003–2020</option>
+            </select>
+          </label>
+          <label>palette
+            <select id="palette">
+              <option value="viridis" selected>viridis (colour-blind safe)</option>
+              <option value="cividis">cividis (colour-blind safe)</option>
+            </select>
+          </label>
+        </div>
+        <label class="chk"><input id="show_uncertainty" type="checkbox" checked /> Show uncertainty ribbons</label>
+        <label class="chk"><input id="hatch_abstain" type="checkbox" checked /> Hatch low-evidence months</label>
+        <div class="row">
+          <button id="btn-export">Download CSV</button>
+        </div>
+      </div>
+    </section>
+
+    <section id="map-panel">
+      <div id="map"></div>
+      <div id="map-legend">H3 hexagons — colour: <span id="legend-metric">anomaly ratio</span></div>
+    </section>
+
+    <section id="charts">
+      <div class="panel chart-panel">
+        <h2>Year × Month calendar</h2>
+        <div id="calendar" class="chart"></div>
+      </div>
+      <div class="panel chart-panel">
+        <h2>Raw vs harmonized monthly activity</h2>
+        <div id="timeseries" class="chart"></div>
+      </div>
+    </section>
+  </main>
+
+  <footer id="statusline">
+    <span id="status">Ready.</span>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

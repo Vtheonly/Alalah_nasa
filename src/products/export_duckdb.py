@@ -403,16 +403,18 @@ def export_all(
             )
         con.execute(
             "CREATE OR REPLACE VIEW v_monthly_summary AS SELECT "
-            "country_iso, year, month, COUNT(DISTINCT h3_index) AS n_cells, "
-            "SUM(raw_count_sum) AS raw_counts, "
-            "SUM(phi_q50_mw) AS harmonized_phi_mw, "
-            "SUM(fre_tj_q50) AS harmonized_fre_tj, "
-            "AVG(rel_uncertainty_width) AS avg_rel_width "
+            "m.country_iso AS country_iso, m.year AS year, "
+            "m.month AS month, COUNT(DISTINCT m.h3_index) AS n_cells, "
+            "SUM(m.raw_count_sum) AS raw_counts, "
+            "SUM(m.phi_q50_mw) AS harmonized_phi_mw, "
+            "SUM(m.fre_tj_q50) AS harmonized_fre_tj, "
+            "AVG(u.rel_uncertainty_width) AS avg_rel_width "
             "FROM state_reconstructed_monthly m "
             "JOIN uncertainty_diagnostics u "
             "ON m.h3_index = u.h3_index AND m.year = u.year "
             "AND m.month = u.month "
-            "GROUP BY country_iso, year, month ORDER BY year, month"
+            "GROUP BY m.country_iso, m.year, m.month "
+            "ORDER BY m.year, m.month"
         )
         counts = {
             "product1": len(product1),
