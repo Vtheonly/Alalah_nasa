@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Burning Activity Calendar — MODIS-VIIRS Harmonized</title>
+<link rel="stylesheet" href="/static/styles.css">
+<link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet">
+<script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+</head>
+<body>
+<header>
+  <h1>Burning Activity Calendar</h1>
+  <p class="sub">MODIS-VIIRS physics-informed Bayesian harmonization (2000-2026)</p>
+</header>
+<section id="controls">
+  <div id="preset-buttons"></div>
+  <form id="bbox-form">
+    <label>W <input name="min_lon" type="number" step="0.1" value="-69"></label>
+    <label>S <input name="min_lat" type="number" step="0.1" value="-31.5"></label>
+    <label>E <input name="max_lon" type="number" step="0.1" value="-66"></label>
+    <label>N <input name="max_lat" type="number" step="0.1" value="-28.5"></label>
+    <button type="submit">Load</button>
+    <button type="button" id="draw-roi">Draw ROI on map</button>
+    <button type="button" id="download-csv">Download CSV</button>
+    <select id="palette">
+      <option value="viridis">viridis</option>
+      <option value="cividis">cividis</option>
+    </select>
+  </form>
+</section>
+<main>
+  <div id="map"></div>
+  <div id="right">
+    <div id="calendar"></div>
+    <div id="timeseries"></div>
+  </div>
+</main>
+<footer>
+  <p>Products: obs_harmonized_provenance / state_reconstructed_monthly+daily /
+     uncertainty_diagnostics — split conformal 90% intervals. Hatched months =
+     ABSTAIN_LOW_EVIDENCE or low measured fraction.</p>
+</footer>
+<script src="/static/app.js"></script>
+</body>
+</html>

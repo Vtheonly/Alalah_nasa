@@ -1,0 +1,57 @@
+# ============================================================================
+# Repository hygiene: caches, build artifacts, environments, secrets
+# ============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+*.egg-info/
+.eggs/
+dist/
+build/
+*.so
+*.o
+*.whl
+!offline_wheels/.gitkeep
+
+# Environment / secret files (NEVER commit credentials, MAP_KEYs, tokens)
+.env
+.env.*
+*key*
+*token*
+*.pem
+*.p12
+secrets/
+.firms_map_key
+
+# Data, model, and binary artifacts (too large for git; produced by Env1/Env2)
+data/
+staged_data/
+staged_raw/
+offline_wheels/
+output/
+*.parquet
+*.duckdb
+*.duckdb.*
+*.hdf
+*.hdf4
+*.gz
+*.zip
+*.pkl
+*.pt
+*.pth
+*.csv
+!tests/fixtures/*.csv
+*.tar
+*.log
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Coverage / benchmark scratch
+.coverage
+htmlcov/
+.benchmarks/
