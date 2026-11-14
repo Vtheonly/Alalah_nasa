@@ -255,3 +255,214 @@ log corr 0.97, drift ratio 1.05.
   `python3 -m pytest tests/test_06_gpu_solver_math.py -k cuda`,
   `python3 scripts/run_env2_gpu_solve.py --timing-gate-only` (Gate 4), then
   the full `make cpu-prep gpu-solve validate`.
+
+---
+
+## Handoff update — Colab acquisition + Kaggle execution notebooks
+
+### Deliverables
+* `notebooks/01_colab_data_acquisition.ipynb` (Env 1 launcher on Colab):
+  clone exact commit -> inspect entry points (Makefile, scripts/, pyproject
+  groups, `DataPaths`) -> install the `ingest` group (pyhdf has manylinux
+  wheels cp310-cp314) -> `run_env1_stage.py --probe-only` ->
+  `run_env1_stage.py` (acquisition) -> `build_wheels.sh <dir> 3.13` ->
+  verification -> package -> Kaggle auth -> create OR new version.
+* `notebooks/02_kaggle_harmonization.ipynb` (Env 2 launcher on Kaggle,
+  offline): find `package_manifest.json` anywhere under /kaggle/input ->
+  extract `.zip` components if Kaggle left them archived -> SHA-256 verify
+  -> copy codebase to /kaggle/tmp -> pip --no-index only for missing deps ->
+  set `FIRE_HARMONIZER_{STAGED,WHEELS,OUTPUT}_DIR` -> codebase tests_06 ->
+  `run_env2_cpu_prep.py` -> `run_env2_gpu_solve.py --timing-gate-only` ->
+  `run_env2_gpu_solve.py` -> `run_env2_validate.py` -> output inventory +
+  run_manifest.json + resources.csv/png. Stage markers (package_id + commit
+  + args + upstream markers) make re-runs skip finished stages.
+* Neither notebook contains processing/scientific logic; both only call
+  codebase entry points. Builders were kept out of the repo; edit the
+  `.ipynb` directly (cells are plain Python).
+
+### Package contract (keep both notebooks in sync)
+`package_manifest.json` (schema_version 1) at the dataset root with
+`layout = {codebase: codebase, staged_data: staged-data, wheels:
+offline-wheels[, originals: originals]}`, `files{relpath: {bytes, sha256}}`,
+codebase {repo_url, ref, commit}, target_env2_python. Upload uses
+`kaggle datasets create|version -r zip -t` (`-t` keeps Parquet unconverted).
+
+### Codebase changes made for this (acquisition side, src/ingest)
+* `probe_sources()` + `run_env1_stage.py --probe-only`.
+* Portolan PyArrow streaming failover (DuckDB httpfs/spatial must otherwise
+  be downloaded at run time); resume skips staged years.
+* Originals: SHA-256/size of every UMD original in the provenance manifest;
+  `--originals-dir` + `--keep-originals {all,ancillary}`.
+* `run_normalization` streams per file / per acquisition month (bounded
+  RAM); verified identical output (322,243 rows, same audit) on the twin.
+
+### Verified facts (2026-11-14, from this sandbox with an allow-listed env)
+* NASA CMR has NO collections for MCD14ML, MOD14C8Q, MYD14C8Q, MOD14CMQ,
+  MYD14CMQ, MCD64CMQ, VNP14IMGML, VJ114IMGML (CMR has MCD64A1, MOD14A2,
+  VNP14IMG, ...). The cloud CMG grids exist ONLY on the UMD archive
+  (fuoco.geog.umd.edu SFTP 22 / FTP 21): if UMD is unreachable, Env 1
+  correctly aborts (no zero-cloud fabrication). The readme's CMR failover
+  for CMG grids cannot succeed.
+* Portolan catalog + year partitions: HTTP 200 (2000: 4 MB ... 2026: 917 MB,
+  updated hourly); live PyArrow fetch of 2000 -> 62,694 Terra detections.
+* FIRMS API live (401 without MAP_KEY); Natural Earth + GeoBoundaries 200.
+* UMD unreachable from this sandbox (raw TCP not proxied) -> real
+  acquisition NOT executed here.
+
+### Verification performed
+* Notebook 1 executed headless (repackage mode, RUN_ACQUISITION=0, staged
+  twin) incl. real GitHub clone + wheel build; publish path executed twice
+  against a stub `kaggle` CLI: create (v1) then new version (v2); kaggle.json
+  mode 600; key absent from package/outputs/logs.
+* Notebook 2 executed headless against simulated /kaggle/input in both forms
+  (zipped components under datasets/<owner>/<slug>/, and extracted read-only
+  dirs): integrity OK, all codebase stages succeeded on CPU, outputs
+  verified, web API 200; second run skipped every completed stage.
+* Not executed: real Colab (Drive/Secrets/upload widgets), real Kaggle API,
+  real GPUs, real UMD acquisition.
+
+---
+
+## SESSION 2026-11-14 (agent: Z.ai, task: handoff fix-list execution + lineage reconciliation)
+
+### Parallel-work reconciliation (IMPORTANT for future agents)
+
+During this session TWO agents independently executed the same handoff
+fix-list from parallel checkouts:
+
+1. **Local lineage (this session, commit 6ff5835, now orphaned in the
+   reflog):** Python-3.13 unlock; CUDA kernel rewrite (CUDAGuard, no
+   PYBIND11 duplicate, on-device tensors, factor-only kernel); vectorized
+   fused posterior + fixed-lag boundary fix + intra-chunk n_nbrs +
+   torch.multiprocessing; INV-03 window filters; AR(1) shift(1) fix;
+   >=20-day GMM fit + country modal; batched vectorized priors; real
+   Product-3 diagnostics; twin redesign (joint (lognorm, f_event, lambda0)
+   pilot fixed point, M13 pixel split, persistent fire episodes, fixed
+   slots, ndr 0.12/0.15, robust evidence-month ndr metric). test_06+07
+   verified 36 passed with spec tolerances (ndr < 15, spike 0.85-1.15,
+   fixed-lag < 1e-3).
+2. **Remote lineage (origin/main @ 8ac453b, "claude/eloquent-hamilton"):
+   the same handoff items plus Env 1 acquisition hardening and
+   Colab/Kaggle notebooks; claims 190 passed / 4 gated skips.
+
+**Decision:** adopted the remote lineage as the base (broader coverage,
+same spec-tightened tolerances) and RE-VERIFIED it in this sandbox rather
+than resolving a 49-file/10k-line mutual rewrite. The local lineage was
+discarded (available in the reflog if its twin design is ever wanted).
+
+### Root-cause findings from the discarded investigation (still valuable)
+
+These mechanisms were empirically isolated while tuning the twin; they
+explain several knife-edge behaviours any future agent will hit:
+
+* **Static-flare mask R_DN inflation:** the H3-Res8 gate uses the
+  DAY/NIGHT DETECTION-ROW ratio; MODIS's ~2.5x lower nighttime F_min
+  (psi_CNT) inflates the row ratio to ~1.55x the true flux ndr, so twin
+  pyrome ndr must stay <= ~0.15 or year-round cells get R_DN > 0.30 and
+  are silently deleted as "static industrial".
+* **Isotonic w >= 0.90 snap cliff:** pooled corroboration ~0.83-0.90 makes
+  the w_i weighting flip between 1.0 and ~0.85, swinging every pass FRP
+  (and hence the harmonized level) by ~+-0.13 log units. Isolated 1-3-day
+  AR(1) detection blips are structurally uncorroborated; ~8-day fire
+  episodes push corroboration past the snap.
+* **Hurdle identifiability floor:** the zero-detection likelihood carries
+  no information below ln(F_event / lambda0); twin night states under
+  ~0.5 MW are censored and ride the prior (which is selection-biased
+  upward if built from detected days only, and crushed if every clear
+  non-detection day is folded in at a hard z_min -- both readings of spec
+  5.3.1 fail differently; the operative compromise is detected-day means
+  with dormant months at z_min).
+* **Pilot fixed-point coupling:** (lognorm, f_event, lambda0) estimates are
+  coupled through the w-deflated pass table; iterating them jointly from
+  bad initial values spirals the detection rates ~11x down. A joint fixed
+  point over the exact estimation window (RNG prefix property makes pilot
+  rows identical to the full run) is stable.
+* **mu-prior + k_miss(A_avg) consistency:** if the twin's MODIS view
+  geometry (pixel area) differs from the spec's PASS_GEOMETRY_AVG used in
+  the Hurdle k, the solver expects a different detection rate than the
+  twin generates and lifts the whole latent state.
+
+### Final verification on the adopted lineage (THIS sandbox, CPU-only)
+
+* `pytest tests/test_01..05` -> **112 passed**; `test_06+07` -> **37
+  passed + 4 CUDA-gated skips**; `test_08+09+10` -> **43 passed**. Total
+  **192 passed, 4 skipped (CUDA hardware-gated), 0 failed**.
+* Per-file collected counts vs spec:
+  28/22/14/20/28/23/18/15/14/14 = **196 >= 166** (all files >= spec).
+* Spec-tightened tolerances verified passing on this machine:
+  fixed-lag < 1e-3 (test_06 + test_08), ndr < 15% and spike 0.85-1.15
+  (test_07), Pettitt/MCD64CMQ (test_09).
+* All 4 `scripts/run_env*.py --help` exit 0; `src/webapp/server.py` and
+  every src module import cleanly; `build_wheels.sh` passes `bash -n`.
+* Largest tracked file: readme.md (159 KB); no file > 10 MB; no `ghp_`
+  tokens anywhere in the tree; readme.md md5
+  `33a1d4c455711ef55f0e59e30320e616` (never modified).
+* Not executed here (environment limits): real UMD/FIRMS/Portolan
+  acquisition (no raw-TCP egress), CUDA parity tests (no GPU), real
+  Kaggle/Colab runs.
+
+---
+
+## Handoff update — first real UMD run (Colab) failed on every MCD14ML file
+
+Symptom (user's Colab log): `UMD file data/MODIS/C6/MCD14ML/MCD14ML.200011.006.03.txt.gz
+failed: could not convert string to float: 'lat'` for every month. Root cause:
+the real archives start with a header line (`YYYYMMDD HHMM sat lat lon T21
+T31 sample FRP conf type dn`) and the positional parser treated it as data;
+one bad line discarded the whole file. Fixed in the codebase:
+* `normalize_dedup.parse_umd_text`: header-driven column mapping (aliases for
+  MCD14ML C6/C6.1 and VIIRS C1/C2 layouts incl. Line/T4/T5/no-Sat), comma or
+  whitespace, pandas C engine (~7 s / 1e6 lines), malformed lines skipped and
+  counted (`df.attrs`), rows with extra trailing fields stay aligned.
+* `download_data`: `select_latest_collections` keeps ONE file per product and
+  month (C6.1 over C6, C2 over C1 -- both live on UMD; ingesting both would
+  double count); per-file parse stats in the provenance manifest; files with
+  > 5% bad lines fail; fail-fast after the first 3 files of a product all
+  fail; `read_hdf4_sds(..., required=...)` tolerates absent optional SDS
+  (only MeanCloudFraction / BurnedArea required; error lists actual layers).
+* CMG grids now stored with 3-decimal centres; the MCD64CMQ validation join
+  uses integer bin ids (2-decimal rounding -29.125 -> -29.12 made the old
+  coordinate join match nothing on real data).
+* Not yet verified against the real archive from this sandbox (UMD is not
+  reachable here); the parse statistics in data_provenance_manifest.json of
+  the next Colab run are the check.
+* Follow-up (same day): the Colab run then sat silent > 20 min after the
+  SFTP login -- `walk_umd_tree` listed every directory of the UMD server
+  (up to 5,000 SFTP round-trips, incl. MCD64A1 tile trees) with no logging.
+  Now pruned to the root, structural dirs (data/MODIS/VIIRS/Cnn/years/...)
+  and product-named dirs; 900 s / 2,000-listing budget; progress + pruned
+  names logged; per-file `UMD [k/N]` download/parse progress lines.
+* Follow-up 2 (same day): the pruned walk found `MOD14C8Q: 0, MYD14C8Q: 0`
+  because the live UMD archive keeps the 0.25 deg cloud grids under
+  `data/MODIS/C6/Mx14CMQ/` (directory name matches no file pattern) -- the
+  run would have downloaded for hours and then aborted on "no cloud grid".
+  Fixed: `_UMD_PRODUCT_DIRS` (`M[OXY]D?14C(8|M)Q`) is descended; files are
+  still matched as MOD14CMQ / MYD14CMQ (monthly, `period_kind='month'`; UMD
+  has no 0.25 deg 8-day grid -- the 8-day CMG is 0.5 deg C8H). Ancillary
+  grids (cloud, MCD64CMQ) are now staged FIRST (`UMD_KEY_ORDER`) so reader
+  problems surface in minutes; `.hdf.gz` grids are gunzipped before pyhdf;
+  an unparseable CMG file name is a failure (counts toward fail-fast), not a
+  silent skip; the walk logs data files in descended dirs that match no
+  product and warns for products with zero files. Already-staged
+  `umd_*.parquet` active-fire files are reused on rerun.
+* Follow-up 3: with `USE_GOOGLE_DRIVE = True` the notebook-1 clone cell
+  failed `the clone has local modifications` -- Google Drive does not keep
+  POSIX mode bits, so git saw every executable script as modified. The cell
+  now sets `core.fileMode false` / `core.autocrlf false`, does
+  `reset --hard FETCH_HEAD`, and treats only TRACKED-content changes as
+  dirty (untracked files are irrelevant: the package uses `git archive
+  <commit>`); if anything remains it lists the files. Verified on a
+  simulated Drive clone (chmod-flipped scripts + stray file + edited readme).
+* Follow-up 4: the live C6 `Mx14CMQ` grids have NO `MeanCloudFraction`;
+  their layers are `CloudCorrFirePix, CorrFirePix, LandCloudPix, MeanFRP,
+  MeanLandCloudFraction, NumFRP, RawFirePix, TotalPix` (fail-fast stopped
+  the Colab run after 3 files / 32 s, as designed). `read_cloud_cmg_sds`
+  now accepts `MeanCloudFraction` (C5) or `MeanLandCloudFraction` (C6);
+  `parse_cloud_cmg` masks `valid_range`/`_FillValue`/negatives/>100,
+  divides by 100 when `units` say percent or any valid value > 1. The
+  layer name, HDF attrs and raw stats of the first file per product are
+  logged + written to the manifest (`<key>_cloud_layer`), each file logs
+  cells/mean, and a grid with no valid value inside the target boxes is a
+  failure. Tested on real HDF4 files written with pyhdf (uint8 percent with
+  fill 255, float fraction with -1 water). Units of the live layer still to
+  be confirmed from that manifest entry on the next run.

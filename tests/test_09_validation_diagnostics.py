@@ -95,6 +95,11 @@ def test_09_mcd64cmq_burned_area_correlation():
                            month=mth, burned_area_km2=burned))
     res = mcd64cmq_correlation(pd.DataFrame(rows), pd.DataFrame(ba))
     assert res["n"] == len(rows)
+    # staged grids store centres rounded to 2 decimals (-29.125 -> -29.12):
+    # the bin-id join must still match every month
+    ba2 = pd.DataFrame(ba).assign(lat_025=lambda f: f["lat_025"].round(2),
+                                  lon_025=lambda f: f["lon_025"].round(2))
+    assert mcd64cmq_correlation(pd.DataFrame(rows), ba2)["n"] == len(rows)
     assert res["harmonized_fre"] > res["raw_counts"]
     assert res["harmonized_fre"] > 0.9
 

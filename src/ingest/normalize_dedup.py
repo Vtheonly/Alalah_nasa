@@ -91,81 +91,160 @@ def _empty_canonical(n: int = 0) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # MCD14ML: space-delimited .txt.gz  (YYYYMMDD HHMM sat lat lon T21 T31 sample FRP conf type dn)
 # ---------------------------------------------------------------------------
+# Column aliases of the UMD text archives, matched case-insensitively against
+# the header line (MCD14ML C6 / C6.1: "YYYYMMDD HHMM sat lat lon T21 T31
+# sample FRP conf type dn"; VNP14IMGML / VJ114IMGML / VJ214IMGML C1 / C2:
+# comma-separated with Sat/Lat/Lon/T_I4|T4/T_I5|T5/Sample/[Line]/[Pixarea]/
+# FRP/Conf/Type...).  Unknown header columns are ignored.
+UMD_COLUMN_ALIASES = {
+    "ymd": ("yyyymmdd", "date", "acq_date", "yyyy-mm-dd"),
+    "hhmm": ("hhmm", "time", "acq_time"),
+    "sat": ("sat", "satellite"),
+    "lat": ("lat", "latitude"),
+    "lon": ("lon", "longitude"),
+    "t_mir": ("t21", "t_i4", "t4", "ti4", "bright_ti4", "brightness",
+              "t_i4_k", "fire_t4"),
+    "t_tir": ("t31", "t_i5", "t5", "ti5", "bright_ti5", "bright_t31",
+              "t_i5_k"),
+    "sample": ("sample", "samp"),
+    "pixarea": ("pixarea", "pix_area", "area", "pixelarea"),
+    "frp": ("frp", "frp_mw"),
+    "conf": ("conf", "confidence"),
+    "type": ("type",),
+    "dn": ("dn", "daynight", "day_night"),
+}
+_MCD14ML_POSITIONAL = ["ymd", "hhmm", "sat", "lat", "lon", "t_mir", "t_tir",
+                       "sample", "frp", "conf", "type", "dn"]
+_VXX_POSITIONAL = ["ymd", "hhmm", "sat", "lat", "lon", "t_mir", "t_tir",
+                   "sample", "pixarea", "frp", "conf", "type"]
+
+
+def _header_mapping(tokens: list[str]) -> dict[str, int] | None:
+    """Canonical field -> column index from a header line, or None when the
+    line is data (no recognisable date + lat + lon header names)."""
+    norm = [t.strip().strip('"').lower().replace(" ", "_") for t in tokens]
+    mapping: dict[str, int] = {}
+    for field, aliases in UMD_COLUMN_ALIASES.items():
+        for i, name in enumerate(norm):
+            if name in aliases:
+                mapping[field] = i
+                break
+    if {"ymd", "lat", "lon"} <= set(mapping):
+        return mapping
+    return None
+
+
+def parse_umd_text(rows: list[str], product: str, data_tier: str = "ML_SCIENCE",
+                   platform_hint: str | None = None,
+                   version_raw: str | None = None) -> pd.DataFrame:
+    """Vectorized parser of UMD ``MCD14ML`` / ``Vxx14IMGML`` text archives.
+
+    * The column layout is read from the HEADER line when present (any
+      collection: C6, C6.1, VIIRS C1, C2); header-less files fall back to the
+      documented positional layout (MCD14ML version 1 without ``dn`` is
+      accepted).  Whitespace or comma delimiters are detected.
+    * Malformed lines are skipped and COUNTED (``df.attrs['n_bad_lines']``,
+      ``df.attrs['n_lines']``) instead of discarding the whole file.
+    * Platform from the ``sat`` column, else ``platform_hint`` (VIIRS file
+      name: VNP -> SNPP, VJ1 -> NOAA-20, VJ2 -> NOAA-21).
+    """
+    import io
+    product = product.upper()
+    lines = [ln for ln in (r.rstrip("\r\n") for r in rows) if ln.strip()]
+    empty = pd.DataFrame(columns=CANONICAL_COLUMNS + ["dn_source"])
+    empty.attrs.update(n_lines=0, n_bad_lines=0, header=None)
+    if not lines:
+        return empty
+    sep = "," if "," in lines[0] else None
+    first = [t for t in (lines[0].split(",") if sep else lines[0].split())]
+    mapping = _header_mapping(first)
+    body = lines[1:] if mapping is not None else lines
+    if mapping is None:
+        names = _MCD14ML_POSITIONAL if product.startswith("MCD14ML") \
+            else _VXX_POSITIONAL
+        mapping = {f: i for i, f in enumerate(names)}
+    width = max(mapping.values()) + 1
+    # generous spare columns + index_col=False: rows with extra trailing
+    # fields (or trailing delimiters) keep their leading fields aligned
+    # instead of being shifted into an implicit index
+    raw = pd.read_csv(io.StringIO("\n".join(body)),
+                      sep="," if sep else r"\s+", header=None, dtype=str,
+                      index_col=False, on_bad_lines="skip",
+                      skipinitialspace=True,
+                      names=range(max(width, len(first)) + 16))
+    n_lines = len(body)
+
+    def col(field):
+        i = mapping.get(field)
+        if i is None or i >= raw.shape[1]:
+            return pd.Series(np.nan, index=raw.index, dtype=object)
+        v = raw[i].astype(str).str.strip()
+        return v.where(~v.isin(["", "nan", "None", "NaN"]), None)
+
+    num = lambda f: pd.to_numeric(col(f).str.rstrip("."), errors="coerce")  # noqa: E731
+    ymd = col("ymd").str.replace("-", "", regex=False)
+    lat, lon, frp = num("lat"), num("lon"), num("frp")
+    hhmm = pd.to_numeric(col("hhmm"), errors="coerce")
+    good = (ymd.str.fullmatch(r"\d{8}", na=False) & lat.between(-90, 90)
+            & lon.between(-180, 180) & hhmm.between(0, 2359) & frp.notna())
+    plat = col("sat").map(lambda v: normalize_platform(v) if isinstance(v, str)
+                          else None)
+    if platform_hint:
+        plat = plat.where(plat.notna(), platform_hint)
+    good &= plat.notna()
+    n_bad = int(n_lines - good.sum())
+    r = good.to_numpy()
+    if not r.any():
+        empty.attrs.update(n_lines=n_lines, n_bad_lines=n_bad,
+                           header=first if _header_mapping(first) else None)
+        return empty
+    conf = [normalize_confidence(v) for v in col("conf")[r].tolist()]
+    typ = pd.to_numeric(col("type"), errors="coerce")[r]
+    plat_r = plat[r]
+    out = pd.DataFrame({
+        "country_iso": None,
+        "sensor_family": plat_r.map(sensor_family_of).to_numpy(),
+        "platform": plat_r.to_numpy(), "data_tier": data_tier,
+        "latitude": lat[r].to_numpy(dtype=float),
+        "longitude": lon[r].to_numpy(dtype=float),
+        "acq_date": (ymd[r].str[:4] + "-" + ymd[r].str[4:6] + "-"
+                     + ymd[r].str[6:8]).to_numpy(),
+        "acq_hhmm": hhmm[r].astype(int).to_numpy(),
+        "t_mir_k": num("t_mir")[r].to_numpy(dtype=float),
+        "t_tir_k": num("t_tir")[r].to_numpy(dtype=float),
+        "scan_km": np.nan, "track_km": np.nan,
+        "sample_idx": num("sample")[r].to_numpy(dtype=float),
+        "pixarea_km2": num("pixarea")[r].to_numpy(dtype=float),
+        "frp_mw": frp[r].to_numpy(dtype=float),
+        "conf_raw": [c[0] for c in conf],
+        "conf_num": np.array([c[1] for c in conf], dtype=float),
+        "type_raw": typ.fillna(-1).astype(int).to_numpy(),
+        "version_raw": version_raw or ("C6" if product.startswith("MCD14ML")
+                                       else "C2"),
+        "ingest_ts": _ingest_ts_now(),
+        "dn_source": col("dn")[r].to_numpy(),
+    })
+    out = out[CANONICAL_COLUMNS + ["dn_source"]].reset_index(drop=True)
+    out.attrs.update(n_lines=n_lines, n_bad_lines=n_bad,
+                     header=first if _header_mapping(first) else None)
+    return out
+
+
 def parse_mcd14ml_rows(rows: list[str], data_tier: str = "ML_SCIENCE",
                        version_raw: str = "C6") -> pd.DataFrame:
-    """Parse MCD14ML space-delimited lines (v1 omits trailing ``dn``; the
-    ``sample`` field may carry a trailing dot, e.g. ``681.``)."""
-    recs = []
-    for line in rows:
-        parts = line.split()
-        if len(parts) < 12:
-            if len(parts) == 11:      # version 1: no trailing dn flag
-                parts = parts + ["-1"]
-            else:
-                continue
-        ymd, hhmm, sat = parts[0], parts[1], parts[2]
-        lat, lon, t21, t31 = (float(x) for x in parts[3:7])
-        sample = parts[7].rstrip(".")
-        frp, conf = float(parts[8]), parts[9]
-        type_raw = int(parts[10]) if parts[10] not in (".", "") else -1
-        dn = parts[11]
-        platform = normalize_platform(sat)
-        if platform is None:
-            continue
-        conf_r, conf_n = normalize_confidence(conf)
-        recs.append({
-            "country_iso": None, "sensor_family": sensor_family_of(platform),
-            "platform": platform, "data_tier": data_tier,
-            "latitude": lat, "longitude": lon,
-            "acq_date": f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:8]}", "acq_hhmm": int(hhmm),
-            "t_mir_k": t21, "t_tir_k": t31, "scan_km": np.nan, "track_km": np.nan,
-            "sample_idx": float(sample), "pixarea_km2": np.nan,
-            "frp_mw": frp, "conf_raw": conf_r, "conf_num": conf_n,
-            "type_raw": type_raw, "version_raw": version_raw,
-            "ingest_ts": _ingest_ts_now(), "dn_source": dn,
-        })
-    return pd.DataFrame(recs, columns=CANONICAL_COLUMNS + ["dn_source"])
+    """MCD14ML space-delimited archive (header-aware; v1 without ``dn``;
+    trailing-dot ``sample`` such as ``681.``)."""
+    return parse_umd_text(rows, "MCD14ML", data_tier, None, version_raw)
 
 
 # ---------------------------------------------------------------------------
-# Vxx14IMGML: comma-separated .csv.gz
-# (YYYYMMDD, HHMM, Sat, Lat, Lon, T_I4, T_I5, Sample, Pixarea, FRP, Conf, Type)
+# Vxx14IMGML: comma-separated archives (header-aware; C1 and C2 layouts)
 # ---------------------------------------------------------------------------
 def parse_vxx14imgml_rows(rows: list[str], data_tier: str = "ML_SCIENCE",
                           platform_hint: str | None = None,
                           version_raw: str = "C2") -> pd.DataFrame:
-    recs = []
-    for line in rows:
-        line = line.strip()
-        if not line or line.upper().startswith(("YYYYMMDD", "SAT",)):
-            continue
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 12:
-            continue
-        ymd, hhmm, sat = parts[0], parts[1], parts[2]
-        lat, lon, ti4, ti5 = (float(x) for x in parts[3:7])
-        sample = parts[7].rstrip(".")
-        pixarea, frp, conf, typ = parts[8], parts[9], parts[10], parts[11]
-        platform = normalize_platform(sat)
-        if platform is None and platform_hint:
-            platform = platform_hint
-        if platform is None:
-            continue
-        conf_r, conf_n = normalize_confidence(conf)
-        recs.append({
-            "country_iso": None, "sensor_family": sensor_family_of(platform),
-            "platform": platform, "data_tier": data_tier,
-            "latitude": lat, "longitude": lon,
-            "acq_date": f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:8]}", "acq_hhmm": int(hhmm),
-            "t_mir_k": ti4, "t_tir_k": ti5, "scan_km": np.nan, "track_km": np.nan,
-            "sample_idx": float(sample) if sample else np.nan,
-            "pixarea_km2": float(pixarea) if pixarea else np.nan,
-            "frp_mw": float(frp), "conf_raw": conf_r, "conf_num": conf_n,
-            "type_raw": int(typ) if typ not in ("", ".") else -1,
-            "version_raw": version_raw, "ingest_ts": _ingest_ts_now(),
-            "dn_source": None,
-        })
-    return pd.DataFrame(recs, columns=CANONICAL_COLUMNS + ["dn_source"])
+    return parse_umd_text(rows, "VNP14IMGML", data_tier, platform_hint,
+                          version_raw)
 
 
 def platform_from_vxx_filename(filename: str) -> str | None:
@@ -553,65 +632,129 @@ def coverage_audit(df: pd.DataFrame) -> dict:
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
+def _merge_audits(parts: list[dict]) -> dict:
+    """Combine per-month :func:`coverage_audit` results into the audit of
+    the union (sums for counts, max for last dates, OR for coverage)."""
+    if not parts:
+        return coverage_audit(_empty_canonical())
+    out = {"chilecito_jul_aug_2026_detections":
+           sum(p["chilecito_jul_aug_2026_detections"] for p in parts)}
+    lasts = [p["snpp_last_acq_date"] for p in parts if p["snpp_last_acq_date"]]
+    out["snpp_last_acq_date"] = max(lasts) if lasts else None
+    out["snpp_ended_by_2026_11_02"] = (
+        out["snpp_last_acq_date"] is None
+        or out["snpp_last_acq_date"] <= "2026-11-02")
+    for p in ("NOAA-20", "NOAA-21"):
+        out[f"{p}_through_2026_11_14"] = any(x[f"{p}_through_2026_11_14"]
+                                             for x in parts)
+    out["dza_type2_flares_preserved"] = sum(p["dza_type2_flares_preserved"]
+                                            for p in parts)
+    out["n_rows"] = sum(p["n_rows"] for p in parts)
+    out["platforms_present"] = sorted(set().union(
+        *[set(p["platforms_present"]) for p in parts]))
+    return out
+
+
+def _iter_staged_frames(raw_dir: Path):
+    """Yield (name, canonical frame) for every Env 1 staged chunk, one file
+    at a time (bounded memory)."""
+    import gzip as _gzip
+    for p in sorted(raw_dir.glob("*.parquet")):
+        if p.name.startswith("umd_"):
+            yield p.name, pd.read_parquet(p)              # canonical (Env 1)
+        elif p.name.startswith("portolan_"):
+            yield p.name, parse_portolan_frame(pd.read_parquet(p))
+        elif p.name.startswith("firms_nrt_"):
+            nrt = pd.read_parquet(p)
+            yield p.name, (nrt if set(CANONICAL_COLUMNS) <= set(nrt.columns)
+                           else parse_firms_api_frame(nrt, "NRT"))
+    for p in sorted(raw_dir.glob("firms_nrt_*.csv")):
+        yield p.name, parse_firms_api_csv(p.read_text(), "NRT")
+    for p in sorted(raw_dir.glob("*.gz")):
+        with _gzip.open(p, "rt", errors="replace") as fh:
+            text = fh.read().splitlines()
+        if p.name.startswith("MCD14ML"):
+            yield p.name, parse_mcd14ml_rows(text)
+        else:
+            yield p.name, parse_vxx14imgml_rows(
+                text, platform_hint=platform_from_vxx_filename(p.name))
+
+
 def run_normalization(paths, staged_frames: list[pd.DataFrame] | None = None
                       ) -> dict:
     """Parse -> clip -> dedup -> platform_active_day -> partitioned Parquet.
 
+    Streams with bounded memory (real 6-country archives are tens of
+    millions of rows): pass 1 parses ONE staged file at a time, clips it to
+    the country polygons and spools it by acquisition month; pass 2 runs the
+    Science-tier dominance dedup per month (its keys are
+    ``(platform, acq_date)``, so a month holds every competing row), writes
+    the ``(country_iso, year)`` partitions, and accumulates
+    ``platform_active_day`` and the coverage audit.
+
     ``staged_frames`` allows tests / the synthetic twin to inject canonical
     frames directly; production reads ``staged_raw/`` chunks from Env 1.
     """
-    if staged_frames is None:
-        frames = []
-        raw_dir = Path(paths.raw_stage_dir)
-        if raw_dir and raw_dir.is_dir():
-            for p in sorted(raw_dir.glob("*.parquet")):
-                if p.name.startswith("umd_"):
-                    frames.append(pd.read_parquet(p))   # canonical (Env 1)
-                elif p.name.startswith("portolan_"):
-                    frames.append(parse_portolan_frame(pd.read_parquet(p)))
-                elif p.name.startswith("firms_nrt_"):
-                    nrt = pd.read_parquet(p)
-                    if set(CANONICAL_COLUMNS) <= set(nrt.columns):
-                        frames.append(nrt)          # already canonical
-                    else:
-                        frames.append(parse_firms_api_frame(nrt, "NRT"))
-            for p in sorted(raw_dir.glob("firms_nrt_*.csv")):
-                frames.append(parse_firms_api_csv(p.read_text(), "NRT"))
-            # .txt.gz / .csv.gz chunks
-            for p in sorted(raw_dir.glob("*.gz")):
-                import gzip as _gzip
-                with _gzip.open(p, "rt", errors="replace") as fh:
-                    text = fh.read().splitlines()
-                if p.name.startswith("MCD14ML"):
-                    frames.append(parse_mcd14ml_rows(text))
-                else:
-                    frames.append(parse_vxx14imgml_rows(
-                        text, platform_hint=platform_from_vxx_filename(p.name)))
-        staged_frames = frames
+    import shutil
+    import tempfile
 
-    df = (pd.concat(staged_frames, ignore_index=True)
-          if staged_frames else _empty_canonical())
     polygons = load_country_polygons(paths.country_polygons_parquet)
-    df = clip_to_countries(df, polygons)
-    df = science_tier_dominance_dedup(df)
-    audit = coverage_audit(df)
-    active_days = compute_platform_active_day(df)
-
     out_root = Path(paths.active_fires_dir)
     out_root.mkdir(parents=True, exist_ok=True)
-    if len(df):
-        df = df.drop(columns=["dn_source"], errors="ignore")
-        df["year"] = pd.to_datetime(df["acq_date"]).dt.year.astype(int)
-        for (iso, year), grp in df.groupby(["country_iso", "year"]):
-            part = out_root / f"country_iso={iso}" / f"year={year}"
-            part.mkdir(parents=True, exist_ok=True)
-            (grp.drop(columns=["year"])
-                 .to_parquet(part / "part.parquet", index=False,
-                             compression="zstd"))
-    report = {"audit": audit,
-              "platform_active_day": active_days,
-              "n_rows": int(len(df)),
-              "n_countries": int(df["country_iso"].nunique())}
+    for old in out_root.glob("country_iso=*"):
+        shutil.rmtree(old)                  # idempotent re-normalization
+    if staged_frames is None:
+        raw_dir = Path(paths.raw_stage_dir)
+        source = (_iter_staged_frames(raw_dir) if raw_dir.is_dir() else iter(()))
+    else:
+        source = ((f"frame_{i}", f) for i, f in enumerate(staged_frames))
+
+    spool = Path(tempfile.mkdtemp(prefix="fh_norm_spool_",
+                                  dir=str(out_root.parent)))
+    n_in = 0
+    try:
+        for k, (name, df) in enumerate(source):
+            n_in += len(df)
+            if not len(df):
+                continue
+            df = clip_to_countries(df, polygons)
+            if not len(df):
+                continue
+            df = df.drop(columns=["dn_source"], errors="ignore")
+            ym = df["acq_date"].astype(str).str[:7]
+            for key, grp in df.groupby(ym):
+                d = spool / f"ym={key}"
+                d.mkdir(exist_ok=True)
+                grp.to_parquet(d / f"part_{k:06d}.parquet", index=False)
+        audits, active = [], {p: [] for p in S.PLATFORM_INDEX}
+        n_out = 0
+        countries = set()
+        for d in sorted(spool.glob("ym=*")):
+            df = pd.concat([pd.read_parquet(f) for f in sorted(d.glob("*.parquet"))],
+                           ignore_index=True)
+            df = science_tier_dominance_dedup(df)
+            audits.append(coverage_audit(df))
+            for p, days in compute_platform_active_day(df).items():
+                active.setdefault(p, []).extend(days)
+            n_out += len(df)
+            countries |= set(df["country_iso"].dropna().unique())
+            df["year"] = pd.to_datetime(df["acq_date"]).dt.year.astype(int)
+            month = d.name.split("=")[1]
+            for (iso, year), grp in df.groupby(["country_iso", "year"]):
+                part = out_root / f"country_iso={iso}" / f"year={year}"
+                part.mkdir(parents=True, exist_ok=True)
+                (grp.drop(columns=["year"])
+                    .to_parquet(part / f"part_{month}.parquet", index=False,
+                                compression="zstd"))
+    finally:
+        shutil.rmtree(spool, ignore_errors=True)
+    for p in active:
+        active[p] = sorted(set(active[p]))
+    audit = _merge_audits(audits)
+    report = {"audit": audit, "platform_active_day": active,
+              "n_rows": int(n_out), "n_rows_parsed": int(n_in),
+              "n_countries": int(len(countries))}
     (out_root / "ingestion_audit.json").write_text(json.dumps(
-        {"audit": audit, "n_rows": int(len(df))}, indent=2, default=str))
+        {"audit": audit, "n_rows": int(n_out), "n_rows_parsed": int(n_in)},
+        indent=2, default=str))
     return report

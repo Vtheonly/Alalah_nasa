@@ -11,6 +11,7 @@ and solar-date midnight rollover across +-180 degrees.
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -451,3 +452,306 @@ def test_01_cloud_cmg_parse_scales_percent_without_nanmax_initial():
     assert len(df) == 1
     assert df.iloc[0]["cloud_frac"] == pytest.approx(0.40)
     assert df.iloc[0]["period_kind"] == "8d"
+
+
+def test_01_streaming_normalization_dedups_across_files(paths, frame_builder):
+    """Bounded-memory normalization: Science and NRT rows for the same
+    (platform, acq_date) arriving in DIFFERENT staged files are still
+    deduplicated (NRT dropped), and months are partitioned separately."""
+    from src.ingest.normalize_dedup import run_normalization
+    sci = frame_builder([dict(platform="SNPP", sensor_family="VIIRS",
+                              data_tier="SP_SCIENCE", acq_date="2021-08-14",
+                              latitude=-29.16 - 0.01 * i) for i in range(5)]
+                        + [dict(platform="SNPP", sensor_family="VIIRS",
+                                data_tier="SP_SCIENCE", acq_date="2021-09-02",
+                                latitude=-29.20)])
+    nrt = frame_builder([dict(platform="SNPP", sensor_family="VIIRS",
+                              data_tier="NRT", acq_date="2021-08-14",
+                              latitude=-29.1601 - 0.01 * i) for i in range(5)])
+    rep = run_normalization(paths, staged_frames=[sci, nrt])
+    assert rep["n_rows_parsed"] == 11 and rep["n_rows"] == 6
+    parts = sorted(p.name for p in paths.active_fires_dir.rglob("*.parquet"))
+    assert parts == ["part_2021-08.parquet", "part_2021-09.parquet"]
+    assert rep["platform_active_day"]["SNPP"] == ["2021-08-14"]
+
+
+def test_01_portolan_wkb_vectorized_decoder():
+    """The PyArrow Portolan failover decodes GeoParquet WKB POINTs
+    vectorially (little- and big-endian) identically to the scalar reader."""
+    import struct
+
+    import pyarrow as pa
+    from src.ingest.download_data import _wkb_points_xy
+    from src.ingest.normalize_dedup import _wkb_point
+    pts = [(-67.5, -29.16), (4.65, 36.85), (-150.25, 65.5)]
+    wkb = [b"\x01" + struct.pack("<I", 1) + struct.pack("<dd", *pts[0]),
+           b"\x00" + struct.pack(">I", 1) + struct.pack(">dd", *pts[1]),
+           b"\x01" + struct.pack("<I", 1) + struct.pack("<dd", *pts[2])]
+    x, y = _wkb_points_xy(pa.chunked_array([pa.array(wkb[:2], pa.binary()),
+                                            pa.array(wkb[2:], pa.binary())]))
+    for i, (px, py) in enumerate(pts):
+        assert (x[i], y[i]) == (px, py) == _wkb_point(wkb[i])
+
+
+# ---------------------------------------------------------------- UMD archives
+MCD14ML_HEADER = "YYYYMMDD HHMM sat lat lon T21 T31 sample FRP conf type dn"
+
+
+def test_01_mcd14ml_header_line_is_skipped():
+    """Real UMD MCD14ML files start with a header line; it must be read as a
+    header (the Colab run failed every file on float('lat'))."""
+    rows = [MCD14ML_HEADER,
+            "20001101 0040 T  -29.160  -67.500  330.5  295.1   681.  25.3  74 0 D",
+            "20001101 0040 T  -29.170  -67.510  320.0  294.0  1200   10.0  50 0 N"]
+    df = parse_mcd14ml_rows(rows)
+    assert len(df) == 2 and df.attrs["n_bad_lines"] == 0
+    assert df.attrs["header"][:3] == ["YYYYMMDD", "HHMM", "sat"]
+    assert df.iloc[0]["platform"] == "Terra" and df.iloc[0]["acq_hhmm"] == 40
+    assert df.iloc[0]["sample_idx"] == 681.0 and df.iloc[1]["dn_source"] == "N"
+    assert df.iloc[0]["t_mir_k"] == 330.5 and df.iloc[0]["conf_num"] == 74.0
+
+
+def test_01_viirs_header_mapping_any_column_order_and_bad_lines():
+    """VIIRS archives are parsed by header names (C1/C2 layouts differ:
+    Line/Sample/T4/T5, no Sat column -> platform from the file name);
+    malformed lines are skipped and counted, not fatal."""
+    rows = ["YYYYMMDD,HHMM,Line,Sample,Lat,Lon,T4,T5,FRP,Conf,Type,Pixarea",
+            "20210814,1335,512,3200,-29.16,-67.50,331.2,290.4,6.2,n,0,0.21",
+            "20210814,1335,513,3201,-29.17,-67.49,320.1,289.0,3.1,h,2,0.22",
+            "garbage line without fields",
+            "20210814,1336,514,3202,not_a_lat,-67.48,320.1,289.0,3.1,l,0,0.22"]
+    from src.ingest.normalize_dedup import parse_umd_text
+    df = parse_umd_text(rows, "VJ114IMGML", platform_hint="NOAA-20")
+    assert len(df) == 2 and df.attrs["n_bad_lines"] == 2
+    r = df.iloc[0]
+    assert r["platform"] == "NOAA-20" and r["latitude"] == -29.16
+    assert r["t_mir_k"] == 331.2 and r["t_tir_k"] == 290.4
+    assert r["sample_idx"] == 3200.0 and r["pixarea_km2"] == 0.21
+    assert df.iloc[1]["type_raw"] == 2 and df.iloc[1]["conf_num"] == 95.0
+
+
+def test_01_umd_latest_collection_selected_once_per_month():
+    """C6 and C6.1 (and VIIRS C1 and C2) of the same month are never both
+    ingested -- that would double-count every detection."""
+    from src.ingest.download_data import collection_rank, select_latest_collections
+    files = {"MCD14ML": ["data/MODIS/C6/MCD14ML/MCD14ML.200011.006.03.txt.gz",
+                         "data/MODIS/C61/MCD14ML/MCD14ML.200011.061.01.txt.gz",
+                         "data/MODIS/C6/MCD14ML/MCD14ML.200012.006.03.txt.gz"],
+             "VNP14IMGML": ["data/VIIRS/C1/VNP14IMGML/VNP14IMGML.201201.C1.05.txt.gz",
+                            "data/VIIRS/C2/VNP14IMGML/VNP14IMGML.201201.C2.01.txt.gz"]}
+    assert collection_rank(files["MCD14ML"][1]) == (6, 1)
+    assert collection_rank(files["MCD14ML"][0]) == (6, 0)
+    sel, sup = select_latest_collections(files)
+    assert set(sel["MCD14ML"]) == {files["MCD14ML"][1], files["MCD14ML"][2]}
+    assert sel["VNP14IMGML"] == [files["VNP14IMGML"][1]]
+    assert len(sup) == 2
+
+
+class _FakeUMD:
+    """In-memory stand-in for UMDSession (no network)."""
+    method = "sftp"
+
+    def __init__(self, tree):
+        self.tree = tree                       # {remote_path: bytes}
+
+    def listdir(self, path):
+        pre = "" if path in (".", "") else path.rstrip("/") + "/"
+        kids = {}
+        for p in self.tree:
+            if p.startswith(pre):
+                head = p[len(pre):].split("/", 1)
+                kids[head[0]] = len(head) > 1
+        return sorted(kids.items())
+
+    def download(self, remote, dest):
+        Path(dest).write_bytes(self.tree[remote])
+        return dest
+
+    def close(self):
+        pass
+
+
+def test_01_fetch_umd_history_parses_headed_files_and_fails_fast(paths):
+    import gzip
+    from src.ingest import download_data as d
+    body = "\n".join([MCD14ML_HEADER,
+                      "20001101 0040 T -29.160 -67.500 330.5 295.1 681. 25.3 74 0 D",
+                      "20001101 0040 T 10.000 10.000 330.5 295.1 681. 25.3 74 0 D"])
+    tree = {f"data/MODIS/C61/MCD14ML/MCD14ML.2000{m:02d}.061.01.txt.gz":
+            gzip.compress(body.encode()) for m in (11, 12)}
+    man = d.ProvenanceManifest(paths.provenance_manifest)
+    res = d.fetch_umd_history(paths, [2000], man, session=_FakeUMD(tree))
+    assert len(res["fires"]) == 2
+    staged = pd.read_parquet(res["fires"][0])
+    assert len(staged) == 1                    # (10, 10) outside every box
+    assert any(e["product"] == "MCD14ML_parsed" for e in man.entries)
+    # every file unparseable -> abort after UMD_FAIL_FAST files
+    bad = {f"data/MODIS/C61/MCD14ML/MCD14ML.2001{m:02d}.061.01.txt.gz":
+           gzip.compress(b"this is not\nan MCD14ML file at all\n") for m in range(1, 13)}
+    with pytest.raises(RuntimeError, match="all failed"):
+        d.fetch_umd_history(paths, [2001], d.ProvenanceManifest(
+            paths.provenance_manifest), session=_FakeUMD(bad))
+
+
+def test_01_umd_rows_with_extra_trailing_fields_stay_aligned():
+    """Extra trailing fields / trailing delimiters must not shift columns."""
+    from src.ingest.normalize_dedup import parse_umd_text
+    rows = ["YYYYMMDD,HHMM,Sat,Lat,Lon,T_I4,T_I5,Sample,Pixarea,FRP,Conf,Type",
+            "20210814,1335,N,-29.1,-67.5,330,290,3200,0.2,7.5,n,0,EXTRA,MORE",
+            "junk",
+            "20210814,1336,N,-29.2,-67.6,331,291,3201,0.2,8.5,h,0,"]
+    df = parse_umd_text(rows, "VNP14IMGML")
+    assert len(df) == 2 and df.attrs["n_bad_lines"] == 1
+    assert df["latitude"].tolist() == [-29.1, -29.2]
+    assert df["frp_mw"].tolist() == [7.5, 8.5]
+
+
+def test_01_umd_walk_is_pruned_and_finds_products():
+    """The UMD walk lists only structural/product directories: a large
+    irrelevant tree (MCD64A1 500 m tiles) is never traversed."""
+    from src.ingest.download_data import walk_umd_tree
+    tree = {}
+    for m in (11, 12):
+        tree[f"data/MODIS/C61/MCD14ML/MCD14ML.2000{m:02d}.061.01.txt.gz"] = b""
+    tree["data/VIIRS/C2/VNP14IMGML/VNP14IMGML.201201.C2.01.txt.gz"] = b""
+    tree["data/MODIS/C61/MOD14C8Q/MOD14C8Q.A2015009.061.hdf"] = b""
+    tree["data/MODIS/C61/MCD64CMQ/2015/MCD64CMQ.A2015213.061.hdf"] = b""
+    for h in range(36):                     # 36 x 18 x 3 = 1944 irrelevant dirs
+        for v in range(18):
+            for y in (2001, 2002, 2003):
+                tree[f"data/MODIS/C61/MCD64A1/h{h:02d}v{v:02d}/{y}/x.hdf"] = b""
+    sess = _FakeUMD(tree)
+    calls = []
+    orig = sess.listdir
+    sess.listdir = lambda p: (calls.append(p), orig(p))[1]
+    found = walk_umd_tree(sess)
+    assert set(found) == {"MCD14ML", "VNP14IMGML", "MOD14C8Q", "MCD64CMQ"}
+    assert len(found["MCD14ML"]) == 2
+    assert not any("MCD64A1" in c for c in calls)
+    assert len(calls) < 15
+
+
+def test_01_umd_walk_descends_mx14cmq_and_stages_cloud_first(paths, monkeypatch):
+    """Live UMD layout: the MOD14CMQ / MYD14CMQ cloud grids sit under
+    ``data/MODIS/C6/Mx14CMQ`` (a directory name no file pattern matches).
+    They must be discovered, staged BEFORE the active-fire text files, and
+    ``.hdf.gz`` grids must be decompressed before pyhdf reads them."""
+    import gzip
+    import numpy as np
+    from src.ingest import download_data as d
+    tree = {
+        "data/MODIS/C6/Mx14CMQ/MOD14CMQ.200011.006.01.hdf": b"HDF",
+        "data/MODIS/C6/Mx14CMQ/MYD14CMQ.200211.006.01.hdf.gz":
+            gzip.compress(b"HDF"),
+        "data/MODIS/C6/Mx14CMQ/README.MOD14CMQ.txt": b"doc",
+        "data/MODIS/C61/MCD14ML/MCD14ML.200011.061.01.txt.gz": gzip.compress(
+            (MCD14ML_HEADER + "\n20001101 0040 T -29.160 -67.500 330.5 "
+             "295.1 681. 25.3 74 0 D").encode()),
+    }
+    found = d.walk_umd_tree(_FakeUMD(tree))
+    assert len(found["MOD14C8Q"]) == 1 and len(found["MYD14C8Q"]) == 1
+    order, read_paths = [], []
+
+    def fake_read(path, layers, required=None):
+        read_paths.append(Path(path))
+        assert Path(path).read_bytes() == b"HDF"     # gz was decompressed
+        order.append("cloud")
+        return {"MeanCloudFraction": ({}, np.full((720, 1440), 40.0))}
+
+    monkeypatch.setattr(d, "read_hdf4_sds", fake_read)
+    from src.ingest import normalize_dedup as nd
+    real = nd.parse_umd_text
+
+    def spy(*a, **k):
+        order.append("fires")
+        return real(*a, **k)
+
+    monkeypatch.setattr(nd, "parse_umd_text", spy)
+    res = d.fetch_umd_history(paths, [2000, 2002], d.ProvenanceManifest(
+        paths.provenance_manifest), session=_FakeUMD(tree))
+    assert order == ["cloud", "cloud", "fires"]
+    cloud = pd.concat(res["cloud"])
+    assert set(cloud["platform"]) == {"MOD", "MYD"}
+    assert set(cloud["period_kind"]) == {"month"}
+    assert set(zip(cloud["year"], cloud["period"])) == {(2000, 11), (2002, 11)}
+    assert np.allclose(cloud["cloud_frac"], 0.4)
+    assert not any(p.exists() for p in read_paths)   # temp files deleted
+
+
+def test_01_unparseable_cmg_name_is_a_failure_not_a_silent_skip(paths,
+                                                                monkeypatch):
+    import numpy as np
+    from src.ingest import download_data as d
+    monkeypatch.setattr(d, "read_hdf4_sds", lambda *a, **k: {
+        "MeanCloudFraction": ({}, np.zeros((720, 1440)))})
+    tree = {f"data/MODIS/C6/Mx14CMQ/MOD14CMQ.weird{i}.2001.hdf": b"x"
+            for i in range(5)}
+    with pytest.raises(RuntimeError, match="all failed"):
+        d.fetch_umd_history(paths, [2001], d.ProvenanceManifest(
+            paths.provenance_manifest), session=_FakeUMD(tree))
+
+
+def _write_c6_cmq(path, cloud, dtype_code, attrs):
+    """Real HDF4 file with the layer set of the live C6 Mx14CMQ grids."""
+    from pyhdf.SD import SD, SDC
+    import numpy as np
+    sd = SD(str(path), SDC.WRITE | SDC.CREATE)
+    layers = {"CloudCorrFirePix": np.zeros((720, 1440)),
+              "CorrFirePix": np.zeros((720, 1440)),
+              "LandCloudPix": np.zeros((720, 1440)),
+              "MeanFRP": np.zeros((720, 1440)), "NumFRP": np.zeros((720, 1440)),
+              "RawFirePix": np.zeros((720, 1440)),
+              "TotalPix": np.zeros((720, 1440))}
+    for name, arr in layers.items():
+        v = sd.create(name, SDC.FLOAT32, arr.shape)
+        v[:] = arr.astype(np.float32)
+        v.endaccess()
+    v = sd.create("MeanLandCloudFraction", dtype_code, cloud.shape)
+    for k, val in attrs.items():
+        setattr(v, k, val)
+    v[:] = cloud
+    v.endaccess()
+    sd.end()
+
+
+@pytest.mark.parametrize("variant", ["percent_uint8_fill255", "fraction_float"])
+def test_01_c6_cmq_mean_land_cloud_fraction_real_hdf(paths, tmp_path, variant):
+    """Live C6 Mx14CMQ grids have MeanLandCloudFraction (no
+    MeanCloudFraction): read it from a real HDF4 file, mask fill/water and
+    normalize to [0,1]."""
+    pyhdf_sd = pytest.importorskip("pyhdf.SD")
+    import numpy as np
+    from src.ingest import download_data as d
+    lats, lons = d.cmg_grid_centers()
+    land = (np.abs(lats[:, None]) < 60) & np.ones((1, 1440), bool)
+    if variant == "percent_uint8_fill255":
+        cloud = np.where(land, 35, 255).astype(np.uint8)
+        attrs = {"_FillValue": np.uint8(255), "units": "percent"}
+        code = pyhdf_sd.SDC.UINT8
+    else:
+        cloud = np.where(land, 0.35, -1.0).astype(np.float32)
+        attrs = {}
+        code = pyhdf_sd.SDC.FLOAT32
+    f = tmp_path / "MOD14CMQ.200011.006.01.hdf"
+    _write_c6_cmq(f, cloud, code, attrs)
+    tree = {"data/MODIS/C6/Mx14CMQ/MOD14CMQ.200011.006.01.hdf": f.read_bytes()}
+    man = d.ProvenanceManifest(paths.provenance_manifest)
+    res = d.fetch_umd_history(paths, [2000], man, session=_FakeUMD(tree))
+    cloud_df = pd.concat(res["cloud"])
+    assert len(cloud_df) > 1000
+    assert np.allclose(cloud_df["cloud_frac"], 0.35, atol=1e-6)
+    assert any(e["product"] == "MOD14C8Q_cloud_layer" and
+               "MeanLandCloudFraction" in e["detail"] for e in man.entries)
+
+
+def test_01_cmq_without_any_cloud_layer_fails_with_layer_list(tmp_path):
+    pytest.importorskip("pyhdf.SD")
+    from pyhdf.SD import SD, SDC
+    import numpy as np
+    from src.ingest import download_data as d
+    f = tmp_path / "MOD14CMQ.200011.006.01.hdf"
+    sd = SD(str(f), SDC.WRITE | SDC.CREATE)
+    v = sd.create("TotalPix", SDC.FLOAT32, (4, 4)); v[:] = np.zeros((4, 4), np.float32)
+    v.endaccess(); sd.end()
+    with pytest.raises(KeyError, match="TotalPix"):
+        d.read_cloud_cmg_sds(f)
