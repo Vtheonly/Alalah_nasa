@@ -553,65 +553,129 @@ def coverage_audit(df: pd.DataFrame) -> dict:
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
+def _merge_audits(parts: list[dict]) -> dict:
+    """Combine per-month :func:`coverage_audit` results into the audit of
+    the union (sums for counts, max for last dates, OR for coverage)."""
+    if not parts:
+        return coverage_audit(_empty_canonical())
+    out = {"chilecito_jul_aug_2026_detections":
+           sum(p["chilecito_jul_aug_2026_detections"] for p in parts)}
+    lasts = [p["snpp_last_acq_date"] for p in parts if p["snpp_last_acq_date"]]
+    out["snpp_last_acq_date"] = max(lasts) if lasts else None
+    out["snpp_ended_by_2026_11_02"] = (
+        out["snpp_last_acq_date"] is None
+        or out["snpp_last_acq_date"] <= "2026-11-02")
+    for p in ("NOAA-20", "NOAA-21"):
+        out[f"{p}_through_2026_11_14"] = any(x[f"{p}_through_2026_11_14"]
+                                             for x in parts)
+    out["dza_type2_flares_preserved"] = sum(p["dza_type2_flares_preserved"]
+                                            for p in parts)
+    out["n_rows"] = sum(p["n_rows"] for p in parts)
+    out["platforms_present"] = sorted(set().union(
+        *[set(p["platforms_present"]) for p in parts]))
+    return out
+
+
+def _iter_staged_frames(raw_dir: Path):
+    """Yield (name, canonical frame) for every Env 1 staged chunk, one file
+    at a time (bounded memory)."""
+    import gzip as _gzip
+    for p in sorted(raw_dir.glob("*.parquet")):
+        if p.name.startswith("umd_"):
+            yield p.name, pd.read_parquet(p)              # canonical (Env 1)
+        elif p.name.startswith("portolan_"):
+            yield p.name, parse_portolan_frame(pd.read_parquet(p))
+        elif p.name.startswith("firms_nrt_"):
+            nrt = pd.read_parquet(p)
+            yield p.name, (nrt if set(CANONICAL_COLUMNS) <= set(nrt.columns)
+                           else parse_firms_api_frame(nrt, "NRT"))
+    for p in sorted(raw_dir.glob("firms_nrt_*.csv")):
+        yield p.name, parse_firms_api_csv(p.read_text(), "NRT")
+    for p in sorted(raw_dir.glob("*.gz")):
+        with _gzip.open(p, "rt", errors="replace") as fh:
+            text = fh.read().splitlines()
+        if p.name.startswith("MCD14ML"):
+            yield p.name, parse_mcd14ml_rows(text)
+        else:
+            yield p.name, parse_vxx14imgml_rows(
+                text, platform_hint=platform_from_vxx_filename(p.name))
+
+
 def run_normalization(paths, staged_frames: list[pd.DataFrame] | None = None
                       ) -> dict:
     """Parse -> clip -> dedup -> platform_active_day -> partitioned Parquet.
 
+    Streams with bounded memory (real 6-country archives are tens of
+    millions of rows): pass 1 parses ONE staged file at a time, clips it to
+    the country polygons and spools it by acquisition month; pass 2 runs the
+    Science-tier dominance dedup per month (its keys are
+    ``(platform, acq_date)``, so a month holds every competing row), writes
+    the ``(country_iso, year)`` partitions, and accumulates
+    ``platform_active_day`` and the coverage audit.
+
     ``staged_frames`` allows tests / the synthetic twin to inject canonical
     frames directly; production reads ``staged_raw/`` chunks from Env 1.
     """
-    if staged_frames is None:
-        frames = []
-        raw_dir = Path(paths.raw_stage_dir)
-        if raw_dir and raw_dir.is_dir():
-            for p in sorted(raw_dir.glob("*.parquet")):
-                if p.name.startswith("umd_"):
-                    frames.append(pd.read_parquet(p))   # canonical (Env 1)
-                elif p.name.startswith("portolan_"):
-                    frames.append(parse_portolan_frame(pd.read_parquet(p)))
-                elif p.name.startswith("firms_nrt_"):
-                    nrt = pd.read_parquet(p)
-                    if set(CANONICAL_COLUMNS) <= set(nrt.columns):
-                        frames.append(nrt)          # already canonical
-                    else:
-                        frames.append(parse_firms_api_frame(nrt, "NRT"))
-            for p in sorted(raw_dir.glob("firms_nrt_*.csv")):
-                frames.append(parse_firms_api_csv(p.read_text(), "NRT"))
-            # .txt.gz / .csv.gz chunks
-            for p in sorted(raw_dir.glob("*.gz")):
-                import gzip as _gzip
-                with _gzip.open(p, "rt", errors="replace") as fh:
-                    text = fh.read().splitlines()
-                if p.name.startswith("MCD14ML"):
-                    frames.append(parse_mcd14ml_rows(text))
-                else:
-                    frames.append(parse_vxx14imgml_rows(
-                        text, platform_hint=platform_from_vxx_filename(p.name)))
-        staged_frames = frames
+    import shutil
+    import tempfile
 
-    df = (pd.concat(staged_frames, ignore_index=True)
-          if staged_frames else _empty_canonical())
     polygons = load_country_polygons(paths.country_polygons_parquet)
-    df = clip_to_countries(df, polygons)
-    df = science_tier_dominance_dedup(df)
-    audit = coverage_audit(df)
-    active_days = compute_platform_active_day(df)
-
     out_root = Path(paths.active_fires_dir)
     out_root.mkdir(parents=True, exist_ok=True)
-    if len(df):
-        df = df.drop(columns=["dn_source"], errors="ignore")
-        df["year"] = pd.to_datetime(df["acq_date"]).dt.year.astype(int)
-        for (iso, year), grp in df.groupby(["country_iso", "year"]):
-            part = out_root / f"country_iso={iso}" / f"year={year}"
-            part.mkdir(parents=True, exist_ok=True)
-            (grp.drop(columns=["year"])
-                 .to_parquet(part / "part.parquet", index=False,
-                             compression="zstd"))
-    report = {"audit": audit,
-              "platform_active_day": active_days,
-              "n_rows": int(len(df)),
-              "n_countries": int(df["country_iso"].nunique())}
+    for old in out_root.glob("country_iso=*"):
+        shutil.rmtree(old)                  # idempotent re-normalization
+    if staged_frames is None:
+        raw_dir = Path(paths.raw_stage_dir)
+        source = (_iter_staged_frames(raw_dir) if raw_dir.is_dir() else iter(()))
+    else:
+        source = ((f"frame_{i}", f) for i, f in enumerate(staged_frames))
+
+    spool = Path(tempfile.mkdtemp(prefix="fh_norm_spool_",
+                                  dir=str(out_root.parent)))
+    n_in = 0
+    try:
+        for k, (name, df) in enumerate(source):
+            n_in += len(df)
+            if not len(df):
+                continue
+            df = clip_to_countries(df, polygons)
+            if not len(df):
+                continue
+            df = df.drop(columns=["dn_source"], errors="ignore")
+            ym = df["acq_date"].astype(str).str[:7]
+            for key, grp in df.groupby(ym):
+                d = spool / f"ym={key}"
+                d.mkdir(exist_ok=True)
+                grp.to_parquet(d / f"part_{k:06d}.parquet", index=False)
+        audits, active = [], {p: [] for p in S.PLATFORM_INDEX}
+        n_out = 0
+        countries = set()
+        for d in sorted(spool.glob("ym=*")):
+            df = pd.concat([pd.read_parquet(f) for f in sorted(d.glob("*.parquet"))],
+                           ignore_index=True)
+            df = science_tier_dominance_dedup(df)
+            audits.append(coverage_audit(df))
+            for p, days in compute_platform_active_day(df).items():
+                active.setdefault(p, []).extend(days)
+            n_out += len(df)
+            countries |= set(df["country_iso"].dropna().unique())
+            df["year"] = pd.to_datetime(df["acq_date"]).dt.year.astype(int)
+            month = d.name.split("=")[1]
+            for (iso, year), grp in df.groupby(["country_iso", "year"]):
+                part = out_root / f"country_iso={iso}" / f"year={year}"
+                part.mkdir(parents=True, exist_ok=True)
+                (grp.drop(columns=["year"])
+                    .to_parquet(part / f"part_{month}.parquet", index=False,
+                                compression="zstd"))
+    finally:
+        shutil.rmtree(spool, ignore_errors=True)
+    for p in active:
+        active[p] = sorted(set(active[p]))
+    audit = _merge_audits(audits)
+    report = {"audit": audit, "platform_active_day": active,
+              "n_rows": int(n_out), "n_rows_parsed": int(n_in),
+              "n_countries": int(len(countries))}
     (out_root / "ingestion_audit.json").write_text(json.dumps(
-        {"audit": audit, "n_rows": int(len(df))}, indent=2, default=str))
+        {"audit": audit, "n_rows": int(n_out), "n_rows_parsed": int(n_in)},
+        indent=2, default=str))
     return report

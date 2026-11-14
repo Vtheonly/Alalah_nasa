@@ -315,7 +315,7 @@ def _in_boxes(lat, lon, bboxes) -> np.ndarray:
 def fetch_umd_history(paths: DataPaths, years: list[int],
                       manifest: ProvenanceManifest | None = None,
                       bboxes: list[tuple] | None = None,
-                      session=None) -> dict:
+                      session=None, originals_dir: Path | None = None) -> dict:
     """Stream UMD files ONE AT A TIME through a temp file (deleted
     immediately) and stage compact outputs:
 
@@ -323,6 +323,11 @@ def fetch_umd_history(paths: DataPaths, years: list[int],
       (bbox-prefiltered; exact polygon clipping happens in normalization);
     * cloud CMG (8-day + monthly, Terra + Aqua) and MCD64CMQ -> bbox-pruned
       tidy frames returned to the caller (written once as Parquet).
+
+    Every original file's size + SHA-256 is logged in the provenance
+    manifest.  With ``originals_dir`` the untouched original is MOVED there
+    instead of being deleted (and an existing original is reused instead of
+    re-downloaded -- resumable acquisition).
     """
     import tempfile
 
@@ -363,8 +368,19 @@ def fetch_umd_history(paths: DataPaths, years: list[int],
                             result["fires"].append(dest)
                             continue
                     tmp_path = Path(tmp) / name
+                    kept = (Path(originals_dir) / key / name) if originals_dir \
+                        else None
                     try:
-                        session.download(rel, tmp_path)
+                        if kept is not None and kept.exists() and \
+                                kept.stat().st_size > 0:
+                            import shutil as _sh
+                            _sh.copyfile(kept, tmp_path)
+                        else:
+                            session.download(rel, tmp_path)
+                            _record_original(manifest, key, tmp_path,
+                                             f"{session.method}://"
+                                             f"{S.UMD_FTP_HOST}/{rel}",
+                                             session.method)
                         if key == "MCD14ML" or key.startswith("V"):
                             with gzip.open(tmp_path, "rt", errors="replace") as fh:
                                 lines = fh.read().splitlines()
@@ -404,11 +420,96 @@ def fetch_umd_history(paths: DataPaths, years: list[int],
                             manifest.log(key, rel, session.method,
                                          detail=str(exc), status="FAIL")
                     finally:
+                        if kept is not None and tmp_path.exists() and \
+                                not kept.exists():
+                            kept.parent.mkdir(parents=True, exist_ok=True)
+                            import shutil as _sh
+                            _sh.move(str(tmp_path), str(kept))
                         tmp_path.unlink(missing_ok=True)   # delete immediately
     finally:
         if own:
             session.close()
     return result
+
+
+def file_sha256(path, chunk: int = 1 << 22) -> str:
+    """SHA-256 of a file (streamed)."""
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while True:
+            b = fh.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def _record_original(manifest, product: str, path: Path, remote: str,
+                     method: str) -> dict:
+    """Log an original downloaded file (size + SHA-256) in the manifest."""
+    info = {"file": Path(path).name, "bytes": Path(path).stat().st_size,
+            "sha256": file_sha256(path), "remote": remote}
+    if manifest is not None:
+        manifest.log(product, remote, method, detail=json.dumps(info))
+    return info
+
+
+def probe_sources(firms_map_key: str | None = None,
+                  timeout_s: float = 20.0) -> list[dict]:
+    """Readme Phase 1 "Minute 15" connectivity check of every Env 1 source.
+
+    Returns one dict per source: ``{source, endpoint, reachable, detail}``.
+    ``reachable`` means the endpoint answered as the product is served
+    (e.g. FIRMS answers 401 without a valid MAP_KEY: the endpoint is live
+    but a key is required).  No data is fabricated or cached.
+    """
+    results: list[dict] = []
+
+    def http(source, url, ok_codes=(200,), method="GET", key_note=None):
+        try:
+            r = requests.request(method, url, timeout=timeout_s,
+                                 stream=True, allow_redirects=True)
+            code = r.status_code
+            r.close()
+            ok = code in ok_codes
+            detail = f"HTTP {code}" + (f" ({key_note})" if key_note and
+                                        code in (401, 403) else "")
+        except Exception as exc:  # noqa: BLE001
+            ok, detail = False, f"{type(exc).__name__}: {exc}"[:200]
+        results.append({"source": source, "endpoint": url.replace(
+            firms_map_key or "\0", "<MAP_KEY>"), "reachable": ok,
+            "detail": detail})
+
+    def tcp(source, host, port):
+        try:
+            with socket.create_connection((host, port), timeout=timeout_s):
+                ok, detail = True, f"TCP {port} open"
+        except Exception as exc:  # noqa: BLE001
+            ok, detail = False, f"TCP {port}: {type(exc).__name__}: {exc}"[:200]
+        results.append({"source": source, "endpoint": f"{host}:{port}",
+                        "reachable": ok, "detail": detail})
+
+    tcp("UMD archive SFTP (MCD14ML, Vxx14IMGML, Mx14C8Q/CMQ, MCD64CMQ)",
+        S.UMD_FTP_HOST, 22)
+    tcp("UMD archive FTP fallback", S.UMD_FTP_HOST, 21)
+    http("Portolan STAC catalog (active-fire failover)", S.PORTOLAN_CATALOG_URL)
+    http("Portolan year partition (HEAD, 2012)",
+         f"{S.PORTOLAN_BASE}/detections/year=2012/detections.parquet",
+         method="HEAD")
+    key = firms_map_key or "INVALID_KEY_PROBE"
+    http("FIRMS API data_availability (NRT gap-fill)",
+         f"{S.FIRMS_API_BASE}/data_availability/csv/{key}/ALL",
+         ok_codes=(200,) if firms_map_key else (200, 400, 401, 403),
+         key_note="endpoint live; valid MAP_KEY required")
+    http("Natural Earth 50m Admin-0 GeoJSON", S.NATURAL_EARTH_URL,
+         method="HEAD")
+    http("GeoBoundaries polygon fallback", S.GEOBOUNDARIES_URL.format(ISO3="ARG"))
+    http("NASA CMR search (granule discovery)",
+         f"{S.NASA_CMR_URL}?short_name=MCD64A1&page_size=1")
+    http("DuckDB extension repository (httpfs/spatial for Portolan)",
+         "http://extensions.duckdb.org/", ok_codes=(200, 301, 302, 403, 404))
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -427,18 +528,81 @@ def _duckdb_con():
 
 def inspect_portolan_catalog(con=None) -> dict:
     """Read the Portolan STAC catalog and follow child links dynamically."""
-    own = con is None
-    if own:
-        con = _duckdb_con()
-    try:
-        catalog = json.loads(requests.get(S.PORTOLAN_CATALOG_URL,
-                                          timeout=HTTP_TIMEOUT_S).text)
-        children = [c.get("href") for c in catalog.get("links", [])
-                    if c.get("rel") == "child"]
-        return {"root": S.PORTOLAN_CATALOG_URL, "children": children}
-    finally:
-        if own:
-            con.close()
+    catalog = json.loads(requests.get(S.PORTOLAN_CATALOG_URL,
+                                      timeout=HTTP_TIMEOUT_S).text)
+    children = [c.get("href") for c in catalog.get("links", [])
+                if c.get("rel") == "child"]
+    return {"root": S.PORTOLAN_CATALOG_URL, "children": children}
+
+
+def _wkb_points_xy(col) -> tuple[np.ndarray, np.ndarray]:
+    """Vectorized lon/lat from a GeoParquet WKB POINT column (pyarrow)."""
+    import pyarrow as pa
+    arr = col.combine_chunks() if hasattr(col, "combine_chunks") else col
+    if isinstance(arr, pa.ChunkedArray):
+        arr = pa.concat_arrays(arr.chunks)
+    offsets = np.frombuffer(arr.buffers()[1], dtype=np.int32)[
+        arr.offset:arr.offset + len(arr) + 1]
+    data = np.frombuffer(arr.buffers()[2], dtype=np.uint8)
+    lens = np.diff(offsets)
+    x = np.full(len(arr), np.nan)
+    y = np.full(len(arr), np.nan)
+    ok = lens >= 21
+    starts = offsets[:-1][ok]
+    le = data[starts] == 1
+    raw = np.stack([data[starts + 5 + k] for k in range(16)], axis=1)
+    for big in (False, True):
+        sel = (~le) if big else le
+        if sel.any():
+            buf = raw[sel].copy()
+            if big:
+                buf[:, :8] = buf[:, 7::-1]
+                buf[:, 8:] = buf[:, :7:-1]
+            xy = buf.view(np.float64).reshape(-1, 2)
+            idx = np.nonzero(ok)[0][sel]
+            x[idx], y[idx] = xy[:, 0], xy[:, 1]
+    return x, y
+
+
+def fetch_portolan_year_arrow(year: int, bboxes: list[tuple], out_path: Path,
+                              tmp_dir: Path | None = None) -> Path:
+    """Failover for :func:`fetch_portolan_year` when DuckDB's httpfs /
+    spatial extensions cannot be installed: stream the year partition over
+    HTTPS to a temp file, scan it row group by row group with PyArrow,
+    decode the WKB points vectorially and keep rows inside ``bboxes``."""
+    import tempfile
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    url = f"{S.PORTOLAN_BASE}/detections/year={year}/detections.parquet"
+    cols = ["acq_datetime", "acq_date", "sensor", "satellite", "quality",
+            "version", "brightness", "bright_t31", "bright_ti4", "bright_ti5",
+            "scan", "track", "frp", "daynight", "confidence", "confidence_pct",
+            "type"]
+    with tempfile.TemporaryDirectory(dir=tmp_dir) as td:
+        local = Path(td) / f"portolan_{year}_full.parquet"
+        with requests.get(url, timeout=HTTP_TIMEOUT_S, stream=True) as r:
+            r.raise_for_status()
+            with open(local, "wb") as fh:
+                for chunk in r.iter_content(1 << 22):
+                    fh.write(chunk)
+        pf = pq.ParquetFile(local)
+        have = [c for c in cols if c in pf.schema_arrow.names]
+        parts = []
+        for rg in range(pf.num_row_groups):
+            t = pf.read_row_group(rg, columns=have + ["geometry"])
+            lon, lat = _wkb_points_xy(t.column("geometry"))
+            keep = _in_boxes(lat, lon, bboxes)
+            if keep.any():
+                sub = t.drop(["geometry"]).filter(pa.array(keep)).to_pandas()
+                sub.insert(0, "latitude", lat[keep])
+                sub.insert(0, "longitude", lon[keep])
+                parts.append(sub)
+    df = (pd.concat(parts, ignore_index=True) if parts
+          else pd.DataFrame(columns=["longitude", "latitude"] + cols))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(out_path, index=False)
+    return out_path
 
 
 def fetch_portolan_year(year: int, bboxes: list[tuple], out_path: Path,
@@ -821,7 +985,8 @@ def finalize_cloud_table(parts: list[pd.DataFrame]) -> pd.DataFrame:
 def download_all(paths: DataPaths, years: list[int] | None = None,
                  firms_map_key: str | None = None,
                  bboxes: list[tuple] | None = None,
-                 earthdata_token: str | None = None) -> dict:
+                 earthdata_token: str | None = None,
+                 originals_dir: str | Path | None = None) -> dict:
     """Run the full Env 1 acquisition with autonomous failover.
 
     Returns a summary dict; every resolved source is written to
@@ -844,12 +1009,18 @@ def download_all(paths: DataPaths, years: list[int] | None = None,
     download_country_polygons(paths, manifest)
 
     # 2) Historical active fires + CMG grids: UMD primary (SFTP -> FTP).
-    umd = fetch_umd_history(paths, years, manifest, bboxes)
+    umd = fetch_umd_history(paths, years, manifest, bboxes,
+                            originals_dir=originals_dir)
     summary["umd_method"] = umd["method"]
     summary["umd_fire_files"] = len(umd["fires"])
     if not umd["fires"]:
         # Portolan GeoParquet failover for active fires (readme 6.2.2)
-        con = _duckdb_con()
+        try:
+            con = _duckdb_con()
+        except Exception as exc:  # noqa: BLE001 - extensions not installable
+            logger.warning("DuckDB httpfs/spatial unavailable (%s); Portolan "
+                           "via PyArrow streaming failover.", exc)
+            con = None
         try:
             try:
                 catalog = inspect_portolan_catalog(con)
@@ -861,10 +1032,26 @@ def download_all(paths: DataPaths, years: list[int] | None = None,
             n_ok = 0
             for year in years:
                 dest = Path(paths.raw_stage_dir) / f"portolan_{year}.parquet"
+                if dest.exists() and dest.stat().st_size > 0:
+                    n_ok += 1                       # resume: already staged
+                    continue
                 try:
-                    fetch_portolan_year(year, bboxes, dest, con)
-                    manifest.log(f"active_fires_{year}", str(dest),
-                                 "portolan_httpfs")
+                    if con is not None:
+                        try:
+                            fetch_portolan_year(year, bboxes, dest, con)
+                            method = "portolan_duckdb_httpfs"
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("Portolan httpfs %d failed (%s); "
+                                           "PyArrow failover.", year, exc)
+                            fetch_portolan_year_arrow(year, bboxes, dest)
+                            method = "portolan_pyarrow_stream"
+                    else:
+                        fetch_portolan_year_arrow(year, bboxes, dest)
+                        method = "portolan_pyarrow_stream"
+                    _record_original(
+                        manifest, f"active_fires_{year}", dest,
+                        f"{S.PORTOLAN_BASE}/detections/year={year}/"
+                        "detections.parquet", method)
                     n_ok += 1
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Portolan year %d failed: %s", year, exc)
@@ -874,7 +1061,8 @@ def download_all(paths: DataPaths, years: list[int] | None = None,
                 manifest.critical("active_fires",
                                   "UMD and Portolan both unreachable")
         finally:
-            con.close()
+            if con is not None:
+                con.close()
 
     # 3) Trailing NRT gap-fill: 5-day windows from the last Science date of
     #    each platform through DATE_END (DAY_RANGE <= 5 strictly).

@@ -38,6 +38,12 @@ def main(argv=None) -> int:
                     help="Python minor version of the Env 2 runtime the "
                          "offline wheels target (default 3.13; Kaggle 4x L4 "
                          "image runs 3.13)")
+    ap.add_argument("--originals-dir", default=None,
+                    help="keep every original downloaded UMD file here "
+                         "(otherwise deleted after parsing; size + SHA-256 "
+                         "are always logged in data_provenance_manifest.json)")
+    ap.add_argument("--probe-only", action="store_true",
+                    help="only run the source connectivity probe and exit")
     ap.add_argument("--skip-wheels", action="store_true")
     ap.add_argument("--dry-run", action="store_true",
                     help="Skip network work; only verify the layout")
@@ -50,11 +56,18 @@ def main(argv=None) -> int:
     if args.dry_run:
         logger.info("dry-run: layout OK (%s)", paths.root)
         return 0
+    if args.probe_only:
+        import json as _json
+        import os as _os
+        res = download_data.probe_sources(_os.environ.get("FIRMS_MAP_KEY"))
+        print(_json.dumps(res, indent=2))
+        return 0
 
     years = args.years or list(range(2000, 2027))
     import os
     map_key = args.firms_map_key or os.environ.get("FIRMS_MAP_KEY")
-    download_data.download_all(paths, years=years, firms_map_key=map_key)
+    download_data.download_all(paths, years=years, firms_map_key=map_key,
+                               originals_dir=args.originals_dir)
     report = normalize_dedup.run_normalization(paths)
     logger.info("Ingestion audit: %s", report["audit"])
 

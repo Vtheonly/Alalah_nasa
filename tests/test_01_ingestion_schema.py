@@ -451,3 +451,42 @@ def test_01_cloud_cmg_parse_scales_percent_without_nanmax_initial():
     assert len(df) == 1
     assert df.iloc[0]["cloud_frac"] == pytest.approx(0.40)
     assert df.iloc[0]["period_kind"] == "8d"
+
+
+def test_01_streaming_normalization_dedups_across_files(paths, frame_builder):
+    """Bounded-memory normalization: Science and NRT rows for the same
+    (platform, acq_date) arriving in DIFFERENT staged files are still
+    deduplicated (NRT dropped), and months are partitioned separately."""
+    from src.ingest.normalize_dedup import run_normalization
+    sci = frame_builder([dict(platform="SNPP", sensor_family="VIIRS",
+                              data_tier="SP_SCIENCE", acq_date="2021-08-14",
+                              latitude=-29.16 - 0.01 * i) for i in range(5)]
+                        + [dict(platform="SNPP", sensor_family="VIIRS",
+                                data_tier="SP_SCIENCE", acq_date="2021-09-02",
+                                latitude=-29.20)])
+    nrt = frame_builder([dict(platform="SNPP", sensor_family="VIIRS",
+                              data_tier="NRT", acq_date="2021-08-14",
+                              latitude=-29.1601 - 0.01 * i) for i in range(5)])
+    rep = run_normalization(paths, staged_frames=[sci, nrt])
+    assert rep["n_rows_parsed"] == 11 and rep["n_rows"] == 6
+    parts = sorted(p.name for p in paths.active_fires_dir.rglob("*.parquet"))
+    assert parts == ["part_2021-08.parquet", "part_2021-09.parquet"]
+    assert rep["platform_active_day"]["SNPP"] == ["2021-08-14"]
+
+
+def test_01_portolan_wkb_vectorized_decoder():
+    """The PyArrow Portolan failover decodes GeoParquet WKB POINTs
+    vectorially (little- and big-endian) identically to the scalar reader."""
+    import struct
+
+    import pyarrow as pa
+    from src.ingest.download_data import _wkb_points_xy
+    from src.ingest.normalize_dedup import _wkb_point
+    pts = [(-67.5, -29.16), (4.65, 36.85), (-150.25, 65.5)]
+    wkb = [b"\x01" + struct.pack("<I", 1) + struct.pack("<dd", *pts[0]),
+           b"\x00" + struct.pack(">I", 1) + struct.pack(">dd", *pts[1]),
+           b"\x01" + struct.pack("<I", 1) + struct.pack("<dd", *pts[2])]
+    x, y = _wkb_points_xy(pa.chunked_array([pa.array(wkb[:2], pa.binary()),
+                                            pa.array(wkb[2:], pa.binary())]))
+    for i, (px, py) in enumerate(pts):
+        assert (x[i], y[i]) == (px, py) == _wkb_point(wkb[i])
