@@ -75,3 +75,65 @@ def country_polygons() -> pd.DataFrame:
 @pytest.fixture(scope="session")
 def repo_root() -> Path:
     return REPO_ROOT
+
+
+# --------------------------------------------------------------------------- #
+# Session-scoped synthetic digital twin + solved results (shared by
+# test_07 / test_08 / test_09; one ~1-2 minute solve for the whole suite).
+# --------------------------------------------------------------------------- #
+@pytest.fixture(scope="session")
+def twin():
+    """Deterministic 26-year digital twin (known ground truth)."""
+    from src.validation import synthetic_twin as st
+
+    return st.generate_twin(n_cells=5, T=9510, seed=42)
+
+
+@pytest.fixture(scope="session")
+def twin_solved(twin):
+    """Full-batch MAP-Laplace solve of the twin with joint sampling."""
+    from src.engine import solver as sv
+
+    return sv.solve_all_chunks(
+        lambda cells, dev: twin_helpers_build(twin, cells, dev),
+        len(twin["cells"]),
+        batch_size=1000,
+        sweeps=6,
+        newton_steps=15,
+        mc_samples=100,
+        sample_subbatch=5,
+    )
+
+
+@pytest.fixture(scope="session")
+def twin_ablation_solved(twin):
+    """2019-2021 VIIRS-masked ablation solve (MODIS-only reconstruction)."""
+    from src.engine import solver as sv
+    from src.validation.synthetic_twin import build_chunk_problem
+
+    t_lo = (pd.Timestamp("2019-01-01") - pd.Timestamp("2000-11-01")).days
+    t_hi = (pd.Timestamp("2021-12-31") - pd.Timestamp("2000-11-01")).days
+    viirs = ("SNPP", "NOAA-20", "NOAA-21")
+
+    def build(cells, dev):
+        df = twin["pass_df"]
+        inside = (
+            (df["t_index"] >= t_lo) & (df["t_index"] <= t_hi)
+            & df["platform"].isin(viirs)
+        )
+        masked = build_chunk_problem(
+            {**twin, "pass_df": df[~inside].reset_index(drop=True)},
+            cells, dev,
+        )
+        return masked
+
+    return sv.solve_all_chunks(
+        build, len(twin["cells"]), batch_size=1000, sweeps=6,
+        newton_steps=15, sample=False,
+    )
+
+
+def twin_helpers_build(twin, cells, dev):
+    from src.validation.synthetic_twin import build_chunk_problem
+
+    return build_chunk_problem(twin, cells, dev)
