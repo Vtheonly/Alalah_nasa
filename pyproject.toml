@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fire_harmonizer"
+version = "1.0.0"
+description = "MODIS-VIIRS physics-informed Bayesian harmonization engine & Burning Activity Calendar (NASA Space Apps 2026)"
+requires-python = ">=3.10,<3.13"
+readme = "readme.md"
+
+[project.optional-dependencies]
+ingest = [
+    "requests",
+    "paramiko",
+    "beautifulsoup4",
+    "lxml",
+    "pyhdf",
+    "duckdb",
+    "polars",
+    "shapely",
+    "pyarrow",
+]
+engine = [
+    "torch",
+    "numpy",
+    "scipy",
+    "pandas",
+    "pyarrow",
+    "duckdb",
+    "polars",
+    "h3",
+    "scikit-learn",
+    "lightgbm",
+    "shapely",
+]
+webapp = [
+    "fastapi",
+    "uvicorn",
+    "duckdb",
+    "h3",
+    "pydantic",
+]
+dev = [
+    "pytest",
+    "httpx",
+]
+
+[tool.setuptools]
+packages = [
+    "src",
+    "src.config",
+    "src.ingest",
+    "src.geometry",
+    "src.calibration",
+    "src.engine",
+    "src.products",
+    "src.validation",
+    "src.webapp",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

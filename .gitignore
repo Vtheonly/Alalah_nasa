@@ -1,0 +1,48 @@
+# --- Python caches & build artifacts ---
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+*.egg-info/
+.eggs/
+dist/
+build/
+*.so
+*.o
+
+# --- Environment & secrets ---
+.env
+.env.*
+*key*
+*token*
+*.pem
+.secrets/
+credentials*
+
+# --- Data, model & binary artifacts (never commit large runtime outputs) ---
+data/
+staged_data/
+staged_raw/
+offline_wheels/
+output/
+*.parquet
+*.duckdb
+*.duckdb.*
+*.hdf
+*.hdf4
+*.gz
+*.zip
+*.whl
+*.pkl
+*.pt
+*.pth
+*.csv
+*.tif
+*.nc
+
+# --- OS / editor noise ---
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
