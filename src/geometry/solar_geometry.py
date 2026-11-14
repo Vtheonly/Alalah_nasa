@@ -320,19 +320,24 @@ def resolve_pixel_geometry(
     Returns ``(scan_km, track_km, vza_deg, area_km2)``.
     """
     fam = sensor_family.upper()
-    if sample_idx is not None and not (
+    if fam == "VIIRS":
+        # VIIRS priority (readme.md 5.1.2): Pixarea (Vxx14IMGML) first, then
+        # the zone-aware sample mapping, then scan x track.
+        if pixarea_km2 is not None and not (
+            np.ndim(pixarea_km2) == 0 and np.isnan(pixarea_km2)
+        ):
+            area = float(np.clip(pixarea_km2, *S.VIIRS_PIXAREA_CLIP))
+            side = float(np.sqrt(area))
+            return side, side, area_to_vza_deg(area, fam), area
+        if sample_idx is not None and not (
+            np.ndim(sample_idx) == 0 and np.isnan(sample_idx)
+        ):
+            return viirs_sample_to_geometry(sample_idx)
+    elif sample_idx is not None and not (
         np.ndim(sample_idx) == 0 and np.isnan(sample_idx)
     ):
-        if fam == "MODIS":
-            return modis_sample_to_geometry(sample_idx)
-        if fam == "VIIRS":
-            return viirs_sample_to_geometry(sample_idx)
-    if pixarea_km2 is not None and not (
-        np.ndim(pixarea_km2) == 0 and np.isnan(pixarea_km2)
-    ):
-        area = float(np.clip(pixarea_km2, *S.VIIRS_PIXAREA_CLIP))
-        side = float(np.sqrt(area))
-        return side, side, area_to_vza_deg(area, fam), area
+        # MODIS priority: exact spherical geometry from the sample index.
+        return modis_sample_to_geometry(sample_idx)
     if scan_km is not None and track_km is not None and not (
         np.ndim(scan_km) == 0 and np.isnan(scan_km)
     ):
