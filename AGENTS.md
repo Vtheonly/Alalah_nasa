@@ -445,3 +445,11 @@ one bad line discarded the whole file. Fixed in the codebase:
   silent skip; the walk logs data files in descended dirs that match no
   product and warns for products with zero files. Already-staged
   `umd_*.parquet` active-fire files are reused on rerun.
+* Follow-up 3: with `USE_GOOGLE_DRIVE = True` the notebook-1 clone cell
+  failed `the clone has local modifications` -- Google Drive does not keep
+  POSIX mode bits, so git saw every executable script as modified. The cell
+  now sets `core.fileMode false` / `core.autocrlf false`, does
+  `reset --hard FETCH_HEAD`, and treats only TRACKED-content changes as
+  dirty (untracked files are irrelevant: the package uses `git archive
+  <commit>`); if anything remains it lists the files. Verified on a
+  simulated Drive clone (chmod-flipped scripts + stray file + edited readme).
