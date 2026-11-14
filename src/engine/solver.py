@@ -431,7 +431,10 @@ def solve_chunk(
     T_full = pr.obs["D"]["y"].shape[1]
     T_win = T_full - t_start
 
-    mu_all = {"D": pr.mu_day, "N": pr.mu_night}
+    mu_all = {
+        "D": torch.from_numpy(pr.mu_day.astype(np.float64)).to(device),
+        "N": torch.from_numpy(pr.mu_night.astype(np.float64)).to(device),
+    }
     rho = torch.from_numpy(pr.rho.astype(np.float64)).to(device)
     omega = torch.from_numpy(pr.omega.astype(np.float64)).to(device)
     eta = torch.from_numpy(pr.eta_dn.astype(np.float64)).to(device)
@@ -446,20 +449,19 @@ def solve_chunk(
         for dn in _DN:
             key = "z_day" if dn == "D" else "z_night"
             z_all[dn][:, :t_start] = torch.from_numpy(
-                anchor_state[key][:, :t_start]
+                anchor_state[key][:, :t_start].astype(np.float64)
             ).to(device)
+            anchor_mu = mu_all[dn][:, t_start - 1].clone()
             anchor_delta[dn] = (
                 torch.from_numpy(
                     anchor_state[key][:, t_start - 1].astype(np.float64)
                 ).to(device)
-                - mu_all[dn][:, t_start - 1]
+                - anchor_mu
             )
     else:
         # Warm start at the prior (climatological) mean.
         for dn in _DN:
-            z_all[dn].copy_(
-                torch.from_numpy(mu_all[dn].astype(np.float64)).to(device)
-            )
+            z_all[dn].copy_(mu_all[dn])
 
     nb_idx = torch.from_numpy(pr.neighbor_indices.astype(np.int64)).to(device)
     nb_ptr = torch.from_numpy(pr.neighbor_indptr.astype(np.int64)).to(device)
@@ -504,7 +506,10 @@ def solve_chunk(
                 z_new, _ = solve_block_newton(
                     z, mu, rho[cells_t], omega[cells_t], eta[cells_t],
                     beta[cells_t], obs_block, nb_sum, nb_deg, delta_opp,
-                    anchor_delta=anchor_delta[dn],
+                    anchor_delta=(
+                        anchor_delta[dn][cells_t]
+                        if anchor_delta[dn] is not None else None
+                    ),
                     newton_steps=newton_steps,
                 )
                 z_all[dn][cells_t, t_start:] = z_new
