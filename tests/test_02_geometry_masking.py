@@ -308,3 +308,21 @@ def test_02_pixel_area_clip_from_scan_track():
         np.array([np.nan]), np.array([np.nan]),
         np.array([50.0]), np.array([50.0]), "MODIS")    # clip to 12.0
     assert area3[0] == 12.0
+
+
+def test_02_sza_day_of_year_jan1_is_doy1():
+    """Spencer Gamma uses doy - 1: Jan 1 must map to doy = 1 (no +1 shift).
+    At the June solstice local noon on the Tropic of Cancer the sun is
+    ~overhead (SZA < 1 deg); a +1-day DOY shift would not break that, so we
+    also pin Jan 1 noon at the equator to SZA = |declination(doy=1)|."""
+    from src.geometry.solar_geometry import (compute_solar_time_and_sza,
+                                             spencer_solar_position)
+    d = np.array(["2021-01-01"], dtype="datetime64[D]")
+    _h, _sd, _dn, sza = compute_solar_time_and_sza(d, np.array([1200]),
+                                                   np.array([0.0]),
+                                                   np.array([0.0]))
+    decl1, et1 = spencer_solar_position(np.array([1.0]))
+    # hour angle at 12:00 UTC on lon 0 = 15 * (E_t / 60) degrees
+    omega = np.deg2rad(15.0 * et1[0] / 60.0)
+    expect = np.rad2deg(np.arccos(np.cos(decl1[0]) * np.cos(omega)))
+    assert sza[0] == pytest.approx(expect, abs=1e-9)

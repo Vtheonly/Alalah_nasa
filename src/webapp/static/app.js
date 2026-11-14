@@ -99,22 +99,40 @@ async function refresh() {
   const ts = await fetch(`/api/timeseries?${params}`).then((r) => r.json());
   const marks = ts.constellation_events.filter((ev) => ts.months.includes(ev.month))
     .map((ev) => ({ xAxis: ev.month, label: { formatter: ev.label.split(" ")[0], fontSize: 9 }, lineStyle: { color: "#ff5d8f", type: "dashed" } }));
+  // Conformal 90% CI ribbon: an invisible q05 base + stacked (q95 - q05)
+  // band.  Linear 'value' axes (log axes break on zero-flux months).
+  const lower = ts.q05.map((v) => (v == null ? null : Math.max(0, v)));
+  const band = ts.q95.map((v, i) => (v == null || lower[i] == null ? null : Math.max(0, v - lower[i])));
   tsChart.setOption({
     title: { text: "Harmonized vs raw monthly series (conformal 90% CI)", textStyle: { color: "#e8eaf6", fontSize: 13 } },
-    tooltip: { trigger: "axis" },
-    legend: { data: ["Harmonized Phi (MW)", "Raw counts"], textStyle: { color: "#9aa2c0" }, top: 24 },
-    grid: { left: 52, right: 20, top: 56, bottom: 34 },
+    tooltip: {
+      trigger: "axis",
+      formatter: (items) => {
+        const i = items[0].dataIndex;
+        const f = (x) => (x == null ? "-" : Number(x).toFixed(2));
+        return `${ts.months[i]}<br/>Phi q50: ${f(ts.values[i])} MW` +
+          `<br/>90% CI: [${f(ts.q05[i])}, ${f(ts.q95[i])}] MW` +
+          `<br/>2003-2020 median: ${f(ts.hist_median[i])} MW` +
+          `<br/>raw detections: ${f(ts.raw_counts[i])}`;
+      },
+    },
+    legend: { data: ["Harmonized Phi (MW)", "90% CI", "Raw counts"], textStyle: { color: "#9aa2c0" }, top: 24 },
+    grid: { left: 52, right: 52, top: 56, bottom: 34 },
     xAxis: { type: "category", data: ts.months, axisLabel: { color: "#9aa2c0", fontSize: 9 } },
-    yAxis: [{ type: "log", axisLabel: { color: "#9aa2c0" } },
-            { type: "log", axisLabel: { color: "#9aa2c0" } }],
+    yAxis: [{ type: "value", name: "MW", min: 0, axisLabel: { color: "#9aa2c0" } },
+            { type: "value", name: "count", min: 0, axisLabel: { color: "#9aa2c0" }, splitLine: { show: false } }],
     series: [
+      { name: "ci-base", type: "line", data: lower, stack: "ci", symbol: "none",
+        lineStyle: { opacity: 0 }, areaStyle: { opacity: 0 }, silent: true, tooltip: { show: false } },
+      { name: "90% CI", type: "line", data: band, stack: "ci", symbol: "none",
+        lineStyle: { opacity: 0 }, areaStyle: { color: "#ffb703", opacity: 0.22 }, silent: true },
       { name: "Harmonized Phi (MW)", type: "line", data: ts.values, showSymbol: false,
-        areaStyle: { opacity: 0.12 }, lineStyle: { color: "#ffb703", width: 2 },
+        lineStyle: { color: "#ffb703", width: 2 },
         markLine: { data: marks, symbol: "none", silent: true } },
       { name: "Raw counts", type: "line", yAxisIndex: 1, data: ts.raw_counts,
         showSymbol: false, lineStyle: { color: "#5d8fff", width: 1.4, opacity: 0.8 } },
     ],
-  });
+  }, true);
   refreshMap();
 }
 

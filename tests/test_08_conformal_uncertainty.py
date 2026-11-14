@@ -166,8 +166,9 @@ def test_08_bitmask_encoding():
 # ---------------------------------------------------------------- fixed lag
 def test_08_fixed_lag_update_matches_full_batch(full_twin):
     """run_fixed_lag_update(window_days=14) anchored on the saved state
-    tracks the full-batch MAP (< 0.75 log-units) across active
-    transitions, and the anchor row is held exactly."""
+    matches the full-batch MAP (< 1e-3, readme 7.8) on a 26-year twin
+    chunk across active fire transitions, and every state before the window
+    (incl. the t_start - 1 anchor) is held exactly."""
     from src.engine.solver import GMRFSolver
     solver = full_twin["solver_results"][0]["solver"]
     z_full = solver.z.clone()
@@ -180,9 +181,9 @@ def test_08_fixed_lag_update_matches_full_batch(full_twin):
     z_lag = fresh.solve_fixed_lag(window_days=14)
     w = min(14, data.t_days)
     diff = float((z_lag[:, -w:, :] - z_full[:, -w:, :]).abs().max())
-    assert diff < 0.75
+    assert diff < 1e-3
     t_start = data.t_days - w
-    assert torch_equal(z_lag[:, t_start - 1, :], z_full[:, t_start - 1, :])
+    assert torch_equal(z_lag[:, :t_start, :], z_full[:, :t_start, :])
 
 
 def torch_equal(a, b):

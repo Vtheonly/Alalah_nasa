@@ -195,82 +195,136 @@ FIRMS_API_FIELDS = {
 }
 
 
+def _col(df: pd.DataFrame, name: str) -> pd.Series:
+    return df[name] if name in df.columns else pd.Series(np.nan, index=df.index)
+
+
+def _num_series(sr: pd.Series) -> pd.Series:
+    return pd.to_numeric(sr, errors="coerce")
+
+
+def _platforms_from(df: pd.DataFrame) -> pd.Series:
+    """Canonical platform per row from ``satellite`` (+ instrument/sensor)."""
+    sat = _col(df, "satellite").astype(object)
+    inst = _col(df, "instrument").fillna(_col(df, "sensor")).astype(str) \
+        .str.upper()
+    key = sat.astype(str).str.strip().str.upper()
+    plat = key.map(S.SATELLITE_ALIASES)
+    # bare VIIRS satellite codes from the FIRMS API ('N', '1', '2')
+    viirs_code = {"N": "SNPP", "1": "NOAA-20", "2": "NOAA-21"}
+    is_v = inst.str.startswith("VIIRS")
+    plat = plat.where(~(plat.isna() & is_v), key.map(viirs_code))
+    return plat
+
+
+def _firms_like_to_canonical(df: pd.DataFrame, data_tier, lat, lon,
+                             acq_date: pd.Series, acq_hhmm: pd.Series,
+                             version_default: str) -> pd.DataFrame:
+    """Shared FIRMS-schema -> canonical mapping (API CSV and Portolan).
+
+    Brightness/thermal columns are chosen PER SENSOR (VIIRS: bright_ti4 /
+    bright_ti5; MODIS: brightness / bright_t31) so a present-but-NaN column
+    of the other sensor never masks the real value (INV-06: the two sensors'
+    temperatures are never mixed).  FIRMS ``scan`` / ``track`` are the pixel
+    dimensions in km.
+    """
+    plat = _platforms_from(df)
+    keep = plat.notna().to_numpy()
+    fam = plat.map(lambda p: sensor_family_of(p) if isinstance(p, str)
+                   else None)
+    is_v = (fam == "VIIRS").to_numpy()
+    t_mir = np.where(is_v, _num_series(_col(df, "bright_ti4")),
+                     _num_series(_col(df, "brightness")))
+    t_tir = np.where(is_v, _num_series(_col(df, "bright_ti5")),
+                     _num_series(_col(df, "bright_t31")))
+    conf_src = _col(df, "confidence_pct").where(
+        _col(df, "confidence_pct").notna(), _col(df, "confidence"))
+    conf = [normalize_confidence(v) for v in conf_src.tolist()]
+    typ = _num_series(_col(df, "type"))
+    frp = _num_series(_col(df, "frp")).fillna(0.0)
+    ver = _col(df, "version").astype(object).where(
+        _col(df, "version").notna(), version_default).astype(str)
+    out = pd.DataFrame({
+        "country_iso": None, "sensor_family": fam.to_numpy(),
+        "platform": plat.to_numpy(),
+        "data_tier": (data_tier.to_numpy() if isinstance(data_tier, pd.Series)
+                      else data_tier),
+        "latitude": np.asarray(lat, dtype=np.float64),
+        "longitude": np.asarray(lon, dtype=np.float64),
+        "acq_date": acq_date.to_numpy(), "acq_hhmm": acq_hhmm.to_numpy(),
+        "t_mir_k": t_mir.astype(float), "t_tir_k": t_tir.astype(float),
+        "scan_km": _num_series(_col(df, "scan")).to_numpy(dtype=float),
+        "track_km": _num_series(_col(df, "track")).to_numpy(dtype=float),
+        "sample_idx": np.nan, "pixarea_km2": np.nan,
+        "frp_mw": frp.to_numpy(dtype=float),
+        "conf_raw": [c[0] for c in conf],
+        "conf_num": np.array([c[1] for c in conf], dtype=float),
+        "type_raw": typ.fillna(-1).astype(int).to_numpy(),
+        "version_raw": ver.to_numpy(),
+        "ingest_ts": _ingest_ts_now(),
+        "dn_source": _col(df, "daynight").to_numpy(),
+    }, index=df.index)
+    return out[keep].reset_index(drop=True)[CANONICAL_COLUMNS + ["dn_source"]]
+
+
+def parse_firms_api_frame(df: pd.DataFrame, data_tier: str = "NRT"
+                          ) -> pd.DataFrame:
+    """FIRMS REST API rows (as a frame) -> canonical schema.
+
+    NRT feeds carry no ``type`` column (-> -1) and an orbit-node
+    ``daynight`` (kept only as provenance ``dn_source``; the pipeline
+    recomputes day/night from local solar time, readme 5.1.1).  FIRMS API
+    columns: ``bright_ti4``/``bright_ti5`` (VIIRS) or ``brightness``/
+    ``bright_t31`` (MODIS), ``scan``, ``track``, ``acq_time`` (HHMM).
+    """
+    df = df.copy()
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    if not len(df):
+        return _empty_canonical().assign(dn_source=pd.Series(dtype=object))
+    hhmm = _num_series(_col(df, "acq_time")).fillna(0).astype(int)
+    return _firms_like_to_canonical(
+        df, data_tier, _num_series(df["latitude"]),
+        _num_series(df["longitude"]), df["acq_date"].astype(str).str[:10],
+        hhmm, "NRT")
+
+
 def parse_firms_api_csv(text: str, data_tier: str = "NRT") -> pd.DataFrame:
-    """Parse FIRMS REST API CSV (NRT: type missing -> -1, orbit-node daynight)."""
-    df = pd.read_csv(pd.io.common.StringIO(text), dtype=str)
-    df.columns = [c.strip().lower() for c in df.columns]
-    recs = []
-    for _, r in df.iterrows():
-        sat = r.get("satellite")
-        platform = normalize_platform(sat)
-        if platform is None and r.get("instrument", "").upper().startswith("VIIRS"):
-            platform = {"N": "SNPP", "1": "NOAA-20", "2": "NOAA-21"}.get(str(sat))
-        if platform is None:
-            continue
-        conf_r, conf_n = normalize_confidence(r.get("confidence"))
-        hhmm_raw = str(r.get("acq_time", "")).strip() or "0"
-        hhmm = int(float(hhmm_raw))
-        type_raw = r.get("type")
-        recs.append({
-            "country_iso": None, "sensor_family": sensor_family_of(platform),
-            "platform": platform, "data_tier": data_tier,
-            "latitude": float(r["latitude"]), "longitude": float(r["longitude"]),
-            "acq_date": str(r["acq_date"]), "acq_hhmm": hhmm,
-            "t_mir_k": float(r["t_mir_k"]) if r.get("t_mir_k") else np.nan,
-            "t_tir_k": float(r["t_tir_k"]) if r.get("t_tir_k") else np.nan,
-            "scan_km": float(r["scan_km"]) if r.get("scan_km") else np.nan,
-            "track_km": float(r["track_km"]) if r.get("track_km") else np.nan,
-            "sample_idx": np.nan, "pixarea_km2": np.nan,
-            "frp_mw": float(r["frp"]) if r.get("frp") not in (None, "", "nan") else 0.0,
-            "conf_raw": conf_r, "conf_num": conf_n,
-            "type_raw": int(float(type_raw)) if type_raw not in (None, "", "nan")
-                       and str(type_raw).strip() != "" else -1,
-            "version_raw": str(r.get("version", "NRT")),
-            "ingest_ts": _ingest_ts_now(), "dn_source": r.get("daynight"),
-        })
-    return pd.DataFrame(recs, columns=CANONICAL_COLUMNS + ["dn_source"])
+    """Parse FIRMS REST API CSV text (see :func:`parse_firms_api_frame`)."""
+    from io import StringIO
+    return parse_firms_api_frame(pd.read_csv(StringIO(text), dtype=str),
+                                 data_tier)
 
 
 # ---------------------------------------------------------------------------
 # Portolan GeoParquet mirror (FIRMS schema, 2000-present)
 # ---------------------------------------------------------------------------
-def parse_portolan_frame(df: pd.DataFrame, data_tier: str = "ML_SCIENCE") -> pd.DataFrame:
-    """Parse a Portolan detections frame (geometry ST_Point or WKB bytes)."""
+def portolan_data_tier(df: pd.DataFrame) -> pd.Series:
+    """Processing tier per Portolan row from ``quality`` / ``version``:
+    any 'NRT' marker -> ``NRT``; otherwise the FIRMS archive's standard
+    (science) processing -> ``SP_SCIENCE`` (UMD ``*ML`` files are the only
+    ``ML_SCIENCE`` source)."""
+    q = _col(df, "quality").astype(str).str.upper()
+    v = _col(df, "version").astype(str).str.upper()
+    nrt = q.str.contains("NRT") | v.str.contains("NRT") | (q == "N")
+    return pd.Series(np.where(nrt, "NRT", "SP_SCIENCE"), index=df.index)
+
+
+def parse_portolan_frame(df: pd.DataFrame, data_tier: str | None = None
+                         ) -> pd.DataFrame:
+    """Parse a Portolan detections frame (geometry ST_Point / WKB bytes or
+    pre-extracted longitude/latitude).  ``data_tier=None`` derives the tier
+    per row from ``quality`` / ``version``."""
+    if not len(df):
+        return _empty_canonical().assign(dn_source=pd.Series(dtype=object))
     lon = _portolan_lonlat(df, 0)
     lat = _portolan_lonlat(df, 1)
-    sat_col = df["satellite"] if "satellite" in df.columns else pd.Series([None] * len(df))
-    recs = []
-    for i in range(len(df)):
-        r = df.iloc[i]
-        platform = normalize_platform(sat_col.iloc[i])
-        if platform is None and "sensor" in df.columns:
-            platform = {"MODIS": "Terra", "VIIRS": "SNPP"}.get(
-                str(r.get("sensor", "")).upper())
-        if platform is None:
-            continue
-        conf_r, conf_n = normalize_confidence(
-            r.get("confidence_pct", r.get("confidence")))
-        acq_dt = str(r.get("acq_datetime") or r.get("acq_date"))
-        # acq_datetime like '2026-08-14 13:42:00' (UTC)
-        date_part, time_part = _split_datetime(acq_dt)
-        recs.append({
-            "country_iso": None, "sensor_family": sensor_family_of(platform),
-            "platform": platform, "data_tier": data_tier,
-            "latitude": float(lat[i]), "longitude": float(lon[i]),
-            "acq_date": date_part, "acq_hhmm": time_part,
-            "t_mir_k": _num(r.get("bright_ti4", r.get("brightness"))),
-            "t_tir_k": _num(r.get("bright_ti5", r.get("bright_t31"))),
-            "scan_km": _num(r.get("scan")), "track_km": _num(r.get("track")),
-            "sample_idx": np.nan,
-            "pixarea_km2": np.nan,
-            "frp_mw": _num(r.get("frp")) or 0.0,
-            "conf_raw": conf_r, "conf_num": conf_n,
-            "type_raw": int(float(r["type"])) if _num(r.get("type")) is not None
-                       else -1,
-            "version_raw": str(r.get("version", "portolan")),
-            "ingest_ts": _ingest_ts_now(), "dn_source": r.get("daynight"),
-        })
-    return pd.DataFrame(recs, columns=CANONICAL_COLUMNS + ["dn_source"])
+    acq = _col(df, "acq_datetime").where(_col(df, "acq_datetime").notna(),
+                                         _col(df, "acq_date"))
+    parts = [_split_datetime(v) for v in acq.astype(str).tolist()]
+    tier = portolan_data_tier(df) if data_tier is None else data_tier
+    return _firms_like_to_canonical(
+        df, tier, lat, lon, pd.Series([p[0] for p in parts], index=df.index),
+        pd.Series([p[1] for p in parts], index=df.index), "portolan")
 
 
 def _num(v):
@@ -351,13 +405,17 @@ def clip_to_countries(df: pd.DataFrame, polygons: dict) -> pd.DataFrame:
         return df
     out_parts = []
     for iso, geom in polygons.items():
-        box = next((b for c in S.TARGET_COUNTRIES if c.iso3 == iso
-                    for b in c.prefilter_boxes), None)
-        m = pd.Series(True, index=df.index)
-        if box:
-            min_lon, min_lat, max_lon, max_lat = box
-            m &= (df["longitude"] >= min_lon) & (df["longitude"] <= max_lon)
-            m &= (df["latitude"] >= min_lat) & (df["latitude"] <= max_lat)
+        boxes = [b for c in S.TARGET_COUNTRIES if c.iso3 == iso
+                 for b in c.prefilter_boxes]
+        # OR over EVERY prefilter box (USA = CONUS box + Alaska box)
+        if boxes:
+            m = pd.Series(False, index=df.index)
+            for min_lon, min_lat, max_lon, max_lat in boxes:
+                m |= ((df["longitude"] >= min_lon) & (df["longitude"] <= max_lon)
+                      & (df["latitude"] >= min_lat)
+                      & (df["latitude"] <= max_lat))
+        else:
+            m = pd.Series(True, index=df.index)
         if not m.any():
             continue
         sub = df[m]
@@ -424,14 +482,13 @@ def compute_platform_active_day(df: pd.DataFrame) -> dict:
     keyed by platform -> sorted list of active UTC dates."""
     if df.empty:
         return {p: [] for p in S.PLATFORM_INDEX}
-    g = (df.groupby(["platform", "acq_date"]).size()
-           .reset_index(name="n"))
+    d = df.assign(acq_date=df["acq_date"].astype(str).str[:10])
+    g = d.groupby(["platform", "acq_date"]).size()
+    g = g[g >= 5]
     active = {p: [] for p in S.PLATFORM_INDEX}
-    for _, r in g.iterrows():
-        if r["platform"] in active and r["n"] >= 5:
-            active[r["platform"]].append(r["acq_date"])
-    for p in active:
-        active[p] = sorted(active[p])
+    for p, dates in g.reset_index().groupby("platform")["acq_date"]:
+        if p in active:
+            active[p] = sorted(dates.tolist())
     return active
 
 
@@ -508,10 +565,18 @@ def run_normalization(paths, staged_frames: list[pd.DataFrame] | None = None
         raw_dir = Path(paths.raw_stage_dir)
         if raw_dir and raw_dir.is_dir():
             for p in sorted(raw_dir.glob("*.parquet")):
-                if p.name.startswith("portolan_"):
+                if p.name.startswith("umd_"):
+                    frames.append(pd.read_parquet(p))   # canonical (Env 1)
+                elif p.name.startswith("portolan_"):
                     frames.append(parse_portolan_frame(pd.read_parquet(p)))
                 elif p.name.startswith("firms_nrt_"):
-                    frames.append(parse_firms_api_csv(p.read_text()))
+                    nrt = pd.read_parquet(p)
+                    if set(CANONICAL_COLUMNS) <= set(nrt.columns):
+                        frames.append(nrt)          # already canonical
+                    else:
+                        frames.append(parse_firms_api_frame(nrt, "NRT"))
+            for p in sorted(raw_dir.glob("firms_nrt_*.csv")):
+                frames.append(parse_firms_api_csv(p.read_text(), "NRT"))
             # .txt.gz / .csv.gz chunks
             for p in sorted(raw_dir.glob("*.gz")):
                 import gzip as _gzip

@@ -86,8 +86,9 @@ def compute_solar_time_and_sza(acq_date, acq_hhmm, lons, lats):
     dn = np.where((solar_hour >= S.DAY_WINDOW[0]) & (solar_hour < S.DAY_WINDOW[1]),
                   "D", "N")
 
-    doy = (dates - dates.astype("datetime64[Y]") +
-           np.timedelta64(1, "D")).astype(np.int64) + 1
+    # day-of-year of the UTC acquisition date: Jan 1 -> 1
+    doy = (dates - dates.astype("datetime64[Y]")).astype(
+        "timedelta64[D]").astype(np.int64) + 1
     sza = solar_zenith_angle(doy, lats, lons, solar_hour)
     return solar_hour, solar_date, dn, sza
 

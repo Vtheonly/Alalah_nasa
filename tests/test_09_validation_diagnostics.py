@@ -41,7 +41,7 @@ def test_09_pettitt_detects_change_point():
     res = pettitt_test(y)
     assert res["p"] < 0.05
     assert res["K"] > 3.0
-    assert 35 <= res["idx"] <= 100
+    assert 48 <= res["idx"] <= 52          # break located at t = 50
 
 
 def test_09_pettitt_stationary_control():
@@ -61,6 +61,40 @@ def test_09_chow_raw_2012_break_and_harmonized_pass(twin_diagnostics):
     # trends, so we compare break STRENGTH raw-vs-harmonized)
     assert sb["chow_harm_2012"]["F"] < 0.4 * sb["chow_raw_2012"]["F"]
     assert sb["chow_harm_2012"]["p"] > sb["chow_raw_2012"]["p"]
+
+
+def test_09_mcd64cmq_burned_area_correlation():
+    """MCD64CMQ cross-check joins H3 cells on the exact 0.25 deg CMG bin
+    centres (x.125/x.375/x.625/x.875) and the harmonized monthly FRE
+    correlates with burned area more strongly than raw counts when raw
+    counts carry a sensor step."""
+    from src.geometry.h3_utils import latlon_to_h3_int
+    from src.engine.priors import cmg_bin_centers
+    from src.validation.diagnostics import mcd64cmq_correlation
+    rng = np.random.default_rng(9)
+    from src.geometry.h3_utils import h3_cell_center
+    # bin semantics: edges at 90 - k/4 and -180 + k/4, centres half a bin in
+    la, lo = cmg_bin_centers(np.array([-29.16, -29.30]),
+                             np.array([-67.40, -67.60]))
+    assert np.allclose(la, [-29.125, -29.375])
+    assert np.allclose(lo, [-67.375, -67.625])
+    cell = int(latlon_to_h3_int([-29.16], [-67.40], 6)[0])
+    lat_c, lon_c = cmg_bin_centers(*h3_cell_center(cell))
+    rows, ba = [], []
+    for y in range(2005, 2021):
+        for mth in range(1, 13):
+            burned = float(np.exp(rng.normal(1.0, 1.0)))
+            fre = burned * float(np.exp(rng.normal(0.0, 0.2)))
+            raw = burned * (6.0 if y >= 2012 else 1.0) \
+                * float(np.exp(rng.normal(0.0, 0.2)))
+            rows.append(dict(h3_index=cell, year=y, month=mth,
+                             fre_tj_q50=fre, raw_count_sum=raw))
+            ba.append(dict(lat_025=float(lat_c), lon_025=float(lon_c), year=y,
+                           month=mth, burned_area_km2=burned))
+    res = mcd64cmq_correlation(pd.DataFrame(rows), pd.DataFrame(ba))
+    assert res["n"] == len(rows)
+    assert res["harmonized_fre"] > res["raw_counts"]
+    assert res["harmonized_fre"] > 0.9
 
 
 def test_09_chow_break_structure():

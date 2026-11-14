@@ -107,3 +107,115 @@ Burning Activity Calendar web app. `readme.md` was read in full (1111 lines,
 3. If real-data staging reveals schema drift, follow readme Section 6.2
    (Autonomous Discovery & Failover) — the manifest logger records every
    resolved source.
+
+---
+
+## Handoff update (2026-11-14, second agent) — Kaggle 4x L4 / Python 3.13 / real-scale readiness
+
+Context: the previous section was written for a CPU-only Python 3.12 sandbox
+and only the 11-cell synthetic twin. An external review (pasted by the user)
+listed showstoppers for the user's verified Kaggle runtime (4x NVIDIA L4,
+Python 3.13.16, torch 2.11+cu130, numpy 2.1.3, pandas 2.3.3, duckdb 1.3.2,
+polars 1.35.2, h3 MISSING, no internet). Every item was re-verified against
+the code and fixed below. The "ee47a50" commit mentioned in that review was
+never on `origin` — the tree started from `d42001e`.
+
+### Environment deviations from readme (deliberate, user-requested)
+* readme pins Env 2 to Python 3.12 / `requires-python <3.13`; the user's
+  Kaggle image is 3.13.16, so `pyproject` allows `<3.14` and
+  `build_wheels.sh` targets the Env 2 runtime (default 3.13, arg/env
+  `TARGET_PY_VER`). On that image only `h3` is missing:
+  `pip install --no-index --find-links=<offline-wheels> h3`.
+
+### Fixes (file -> what)
+* `src/ingest/build_wheels.sh`: missing `echo` syntax bug; cp313 target;
+  manylinux2014/2_17/2_28 tags; ABI check (bundle verified 77 MB).
+* `src/config/paths.py`: finds `staged-data` / `offline-wheels` at any depth
+  of `/kaggle/input` (new `datasets/<owner>/<slug>` layout), per-path env
+  overrides, read-only input tolerant.
+* `src/engine/cuda_kernels.py`: bindings from `functions=` + C++ prototypes
+  (the duplicate `PYBIND11_MODULE` made every nvcc build fail silently);
+  `c10::cuda::CUDAGuard`; outputs stay on the caller's `cuda:k` (no
+  hardcoded `"cuda"`/`.cpu()`); coalesced (T,B) layouts; thread-per-(cell,m)
+  sampler; new `thomas_factor_cuda`. VERIFIED: compiles for sm_89 with nvcc
+  13.2 on this CPU host (pip `nvidia-cuda-nvcc` + matching `nvidia-nvvm`).
+  NOT run on a GPU (none here) -> `test_06_cuda_*` stay hardware-gated.
+* `src/engine/solver.py`: vectorized tensor build; dense obs stay in host RAM
+  (est. 4.18 GiB VRAM/chunk); block-local Newton with EXACT objective
+  derivatives (day-night coupling gradient includes both terms; symmetric
+  edge weights `alpha_s (w_i+w_j)/2` = spec within a pyrome); intra-chunk
+  neighbour weights only; fixed-lag window = exact conditional system
+  (`< 1e-3`, was 0.75); posterior forms `0.5(Phi_D+Phi_N)` PER trajectory
+  before quantiles; monthly FRE = 0.0864 x monthly SUM; sparse daily filter
+  in-chunk (per-cell +-3 days); `torch.multiprocessing.spawn` over all GPUs
+  (`--workers-per-gpu`), picklable `PlatformMask`; per-chunk float32 state
+  checkpoints instead of a dense (N,T,2) array in RAM.
+* `src/engine/priors.py`: all estimators restricted to 2012-01-20..2021-12-31
+  and INV-04 operational passes; O(#detections) memory (no cell x platform x
+  day table); AR(1) uses `shift(1)` (was `s - 1`, pairing across gaps);
+  vectorized cloud matrix with `period_kind` separation (8d periods 1..46 no
+  longer collide with monthly 1..12); CMG bin-centre HALF-BIN BUG fixed
+  (`floor((90-lat)/.25)`, `floor((lon+180)/.25)`); per-day post-2022 swath
+  factor (was applied to the whole series).
+* `src/calibration/operators.py`: INV-03 freeze on gamma pairs, EQM anchors,
+  sigma OLS, area model, lognorm; lognorm on clear (<0.30) near-nadir (<20)
+  VIIRS clusters with REAL cluster VZA/cloud (was hardcoded vza=20 -> fell
+  back to all sensors/all years); `v_cloud` joined to passes (sigma model
+  used constant 1); vectorized reliability + diurnal pairs (Terra vs
+  Aqua/SNPP 2003-2021 + Aqua vs NOAA-20 2022-2025).
+* `src/calibration/pyromes.py`: GMM fit only on >=20-day cells; 3..19-day
+  cells nearest centroid; <3-day / outside-window cells country modal.
+* `src/engine/conformal.py`: `harmonize_and_calibrate` = THE single Env 2
+  path (twin and `run_env2_gpu_solve.py` share it); `finalize_monthly`
+  computes conformal (vectorized), climatology, raw baselines,
+  mean_cloud_frac, measured_fraction (P(>=1 clear operational pass)),
+  ABSTAIN (>=5 consecutive cloudy no-detection days incl. 1-ring),
+  CLIMATOLOGY fallback flag, bitmask, NRT gap-fill, attribution, hurdle
+  events with real per-pass v (was constant 0.9).
+* `src/products/export_duckdb.py`: spec filenames
+  (`obs_harmonized_provenance.parquet`, `state_reconstructed_*.parquet`,
+  `uncertainty_diagnostics.parquet`); no fabricated defaults (raises if the
+  monthly frame is not finalized); `hex_centers` + `diagnostics` tables.
+* `src/validation/diagnostics.py`: true Pettitt (rank form, locates the
+  break); MCD64CMQ joined on exact CMG bins; residual slopes on
+  `z_imp - z_hat` vs VZA and solar hour; real VIIRS-masked 2019-2021
+  ablation re-solve (validate script no longer compares the model with
+  itself).
+* `src/geometry/solar_geometry.py`: DOY off-by-one (+2 days) fixed.
+* `src/ingest/normalize_dedup.py` / `download_data.py`: Alaska box ORed;
+  FIRMS API + Portolan columns mapped per sensor (bright_ti4/ti5 vs
+  brightness/bright_t31, scan/track); Portolan tier from quality/version;
+  NRT `.parquet` read as parquet; `np.nanmax(initial=)` removed; one
+  SFTP-or-FTP session for walk+download, per-file temp deleted at once,
+  CMG filename -> (year, period, period_kind); NRT 5-day windows from the
+  last Science date; CMR discovery wired (EARTHDATA_TOKEN for downloads);
+  missing cloud grids abort Env 1 (no zero-cloud fabrication).
+* Scripts: `run_env2_cpu_prep.py` never normalizes from an empty
+  `staged_raw/` (recomputes platform_active_day from `active_fires/`);
+  `run_env2_gpu_solve.py` has a one-chunk timing gate (`--timing-gate-only`)
+  and exports finalized products; `run_env2_validate.py` runs the ablation.
+* Web: metric / color_by whitelists (SQL injection), `country_iso` really
+  filters, `hex_centers` index, ECharts linear axes + q05-q95 ribbon.
+
+### Synthetic twin realism fix (important for future agents)
+The twin placed every fire at 4 FIXED sub-cell slots and the forest pyrome
+burned year-round with true ndr 0.25. At H3-Res8 that is indistinguishable
+from a gas flare under readme 5.1.3 (Y>=3, D>=15 d/yr, R_DN>0.30): ~80% of
+forest-cell pixels were masked as static industrial, biasing forest Day
+flux by -30% (this is why the old tests had been loosened to ndr 45% and
+spike +-25%). Now: moving fire fronts (random separated positions per pass),
+a dry-season forest regime and forest ndr 0.20. Flares are still 100%
+flagged; wildfire cells keep >=85% of pixels (new test_07 test).
+Twin metrics now meet the readme tolerances: ndr max error 12.5% (<15%),
+spike recovery 0.90 (+-15%), 2012 step +2.5% (<+-10%), 3-sat within 3 pp,
+log corr 0.97, drift ratio 1.05.
+
+### Known remaining limitations
+* CUDA kernels compiled but never executed on a GPU in this sandbox; run
+  `python3 -m pytest tests/test_06_gpu_solver_math.py -m cuda` on Kaggle.
+* Env 1 live staging (UMD/Portolan/FIRMS/CMR) still not executed here (no
+  network to those hosts); helpers are unit-tested offline.
+* sigma^2 OLS still uses the diurnal pair residuals (Terra/Aqua/SNPP) rather
+  than separate SNPP-vs-NOAA-20 VIIRS pairs; window-frozen per INV-03.
+* Harmonized Chow test on the twin is asserted as a >60% F-drop vs raw (the
+  twin carries genuine climate trends, so p > 0.05 is not guaranteed).

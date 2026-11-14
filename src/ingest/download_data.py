@@ -161,134 +161,254 @@ def download_country_polygons(paths: DataPaths,
 # ---------------------------------------------------------------------------
 # UMD SFTP / FTP archive (primary historical source)
 # ---------------------------------------------------------------------------
-def _iter_remote_files(host: str, user: str, password: str,
-                       patterns: dict[str, re.Pattern]) -> dict[str, list[str]]:
-    """Walk the UMD archive tree over SFTP (fallback FTP), matching patterns."""
-    try:
-        import paramiko  # Env 1 dependency
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(host, port=22, username=user, password=password,
-                       timeout=FTP_TIMEOUT_S, allow_agent=False, look_for_keys=False)
-        sftp = client.open_sftp()
+class UMDSession:
+    """One authenticated UMD archive session: SFTP (port 22) first, FTP
+    (port 21) fallback -- the SAME transport is reused for the directory
+    walk and every download (readme 6.2.1)."""
 
-        def listdir(path):
-            return [(attr.filename, attr.st_mode) for attr in sftp.listdir_attr(path)]
+    def __init__(self, host: str = S.UMD_FTP_HOST, user: str = S.UMD_FTP_USER,
+                 password: str = S.UMD_FTP_PASS):
+        self.method = None
+        self._client = self._sftp = self._ftp = None
+        try:
+            import paramiko  # Env 1 dependency
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(host, port=22, username=user, password=password,
+                           timeout=FTP_TIMEOUT_S, allow_agent=False,
+                           look_for_keys=False)
+            self._client, self._sftp = client, client.open_sftp()
+            self.method = "sftp"
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("UMD SFTP failed (%s); trying FTP port 21.", exc)
+            import ftplib
+            ftp = ftplib.FTP()
+            ftp.connect(host, port=21, timeout=FTP_TIMEOUT_S)
+            ftp.login(user, password)
+            self._ftp = ftp
+            self.method = "ftp"
 
-        def read_file(path):
-            with sftp.open(path, "rb") as fh:
-                return fh.read()
-
-        def close():
-            sftp.close()
-            client.close()
-        return _walk_tree(listdir, read_file, close, patterns, "sftp")
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("UMD SFTP failed (%s); trying FTP port 21.", exc)
-
-    import ftplib
-    ftp = ftplib.FTP()
-    ftp.connect(host, port=21, timeout=FTP_TIMEOUT_S)
-    ftp.login(user, password)
-
-    def listdir_ftp(path):
+    def listdir(self, path: str):
+        if self.method == "sftp":
+            import stat
+            return [(a.filename, stat.S_ISDIR(a.st_mode))
+                    for a in self._sftp.listdir_attr(path)]
         entries = []
         try:
-            for name in ftp.nlst(path):
-                try:
-                    size = ftp.size(name)
-                    entries.append((name.split("/")[-1], 1 if size is not None else None))
-                except Exception:  # noqa: BLE001 - directories raise on SIZE
-                    entries.append((name.split("/")[-1], None))
-        except Exception:  # noqa: BLE001
-            pass
+            lines: list[str] = []
+            self._ftp.retrlines(f"LIST {path}", lines.append)
+            for ln in lines:
+                parts = ln.split(None, 8)
+                if len(parts) == 9:
+                    entries.append((parts[8], ln.startswith("d")))
+        except Exception:  # noqa: BLE001 - fall back to NLST
+            for name in self._ftp.nlst(path):
+                base = name.rstrip("/").split("/")[-1]
+                entries.append((base, "." not in base))
         return entries
 
-    def read_file_ftp(path):
-        buf = io.BytesIO()
-        ftp.retrbinary(f"RETR {path}", buf.write)
-        return buf.getvalue()
+    def download(self, remote: str, dest: Path) -> Path:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if self.method == "sftp":
+            self._sftp.get(remote, str(dest))
+        else:
+            with open(dest, "wb") as fh:
+                self._ftp.retrbinary(f"RETR {remote}", fh.write)
+        return dest
 
-    def close_ftp():
-        ftp.quit()
+    def close(self):
+        try:
+            if self._sftp is not None:
+                self._sftp.close()
+                self._client.close()
+            if self._ftp is not None:
+                self._ftp.quit()
+        except Exception:  # noqa: BLE001
+            pass
 
-    return _walk_tree(listdir_ftp, read_file_ftp, close_ftp, patterns, "ftp")
 
-
-def _walk_tree(listdir, read_file, close, patterns: dict, method: str):
-    """Recursive top-level traversal matching readme discovery patterns."""
+def walk_umd_tree(session, patterns: dict[str, re.Pattern] = _UMD_PATTERNS,
+                  max_dirs: int = 5000) -> dict[str, list[str]]:
+    """Breadth-first walk of the archive matching the readme regexes
+    (``MCD14ML``, ``V(NP|J1|J2)14IMGML``, ``M[OY]D14C(8|M)Q``, ``MCD64CMQ``)."""
     found: dict[str, list[str]] = {k: [] for k in patterns}
-    queue: list[str] = ["."]
-    seen: set[str] = set()
-    try:
-        while queue:
-            d = queue.pop(0)
-            if d in seen:
+    queue, seen = ["."], set()
+    while queue and len(seen) < max_dirs:
+        d = queue.pop(0)
+        if d in seen:
+            continue
+        seen.add(d)
+        try:
+            entries = session.listdir(d)
+        except Exception:  # noqa: BLE001
+            continue
+        for name, is_dir in entries:
+            full = name if d in (".", "", "/") else f"{d}/{name}"
+            if is_dir:
+                queue.append(full)
                 continue
-            seen.add(d)
-            try:
-                entries = listdir(d)
-            except Exception:  # noqa: BLE001
+            if not name.endswith((".gz", ".hdf")):
                 continue
-            for name, _mode in entries:
-                full = name if d in (".", "", "/") else f"{d}/{name}"
-                matched = False
-                for key, rx in patterns.items():
-                    if rx.search(name) and name.endswith((".gz", ".txt.gz", ".csv.gz", ".hdf")):
-                        found[key].append(full)
-                        matched = True
-                if not matched and not name.endswith((".gz", ".hdf", ".txt", ".csv")):
-                    queue.append(full)
-    finally:
-        close()
+            for key, rx in patterns.items():
+                if rx.search(name):
+                    found[key].append(full)
+                    break
     return {k: sorted(v) for k, v in found.items() if v}
 
 
+_A_DATE = re.compile(r"\.A(\d{4})(\d{3})\.")
+_YM = re.compile(r"[._](\d{4})[._]?(\d{2})[._]")
+
+
+def parse_cmg_filename(name: str) -> dict | None:
+    """Product, year and period of a CMG HDF4 file name.
+
+    * ``MOD14C8Q`` / ``MYD14C8Q`` (8-day): ``.AYYYYDDD.`` -> period
+      ``(DDD-1)//8 + 1`` (1..46), ``period_kind = '8d'``.
+    * ``MOD14CMQ`` / ``MYD14CMQ`` (monthly): ``.AYYYYDDD.`` or ``.YYYYMM.`` ->
+      month, ``period_kind = 'month'``.
+    * ``MCD64CMQ`` (monthly burned area): month from the same patterns.
+    """
+    base = Path(name).name
+    m = re.search(r"(MOD14C8Q|MYD14C8Q|MOD14CMQ|MYD14CMQ|MCD64CMQ)", base,
+                  re.IGNORECASE)
+    if not m:
+        return None
+    product = m.group(1).upper()
+    year = period = None
+    a = _A_DATE.search(base)
+    if a:
+        year, doy = int(a.group(1)), int(a.group(2))
+        if product.endswith("C8Q"):
+            period = (doy - 1) // 8 + 1
+        else:
+            period = int((pd.Timestamp(year, 1, 1)
+                          + pd.Timedelta(days=doy - 1)).month)
+    else:
+        ym = _YM.search(base)
+        if ym:
+            year, period = int(ym.group(1)), int(ym.group(2))
+    if year is None or period is None:
+        return None
+    kind = "8d" if product.endswith("C8Q") else "month"
+    return {"product": product, "year": year, "period": period,
+            "period_kind": kind}
+
+
+def _year_of_name(name: str) -> int | None:
+    a = _A_DATE.search(name)
+    if a:
+        return int(a.group(1))
+    m = re.search(r"(19|20)\d{2}", Path(name).name)
+    return int(m.group(0)) if m else None
+
+
+def _in_boxes(lat, lon, bboxes) -> np.ndarray:
+    lat = np.asarray(lat, dtype=float)
+    lon = np.asarray(lon, dtype=float)
+    keep = np.zeros(len(lat), dtype=bool)
+    for (w, so, e, n) in bboxes:
+        keep |= (lon >= w) & (lon <= e) & (lat >= so) & (lat <= n)
+    return keep
+
+
 def fetch_umd_history(paths: DataPaths, years: list[int],
-                      manifest: ProvenanceManifest | None = None) -> list[Path]:
-    """Stream MCD14ML + Vxx14IMGML monthly files from UMD into staged_raw/."""
+                      manifest: ProvenanceManifest | None = None,
+                      bboxes: list[tuple] | None = None,
+                      session=None) -> dict:
+    """Stream UMD files ONE AT A TIME through a temp file (deleted
+    immediately) and stage compact outputs:
+
+    * active fires -> canonical ``staged_raw/umd_<PRODUCT>_<file>.parquet``
+      (bbox-prefiltered; exact polygon clipping happens in normalization);
+    * cloud CMG (8-day + monthly, Terra + Aqua) and MCD64CMQ -> bbox-pruned
+      tidy frames returned to the caller (written once as Parquet).
+    """
+    import tempfile
+
+    from .normalize_dedup import (parse_mcd14ml_rows, parse_vxx14imgml_rows,
+                                  platform_from_vxx_filename)
+    bboxes = bboxes or [b for c in S.TARGET_COUNTRIES for b in c.prefilter_boxes]
     out_dir = Path(paths.raw_stage_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    written: list[Path] = []
+    result = {"fires": [], "cloud": [], "burned": [], "method": None}
+    own = session is None
     try:
-        files = _iter_remote_files(S.UMD_FTP_HOST, S.UMD_FTP_USER, S.UMD_FTP_PASS,
-                                   _UMD_PATTERNS)
+        session = session or UMDSession()
     except Exception as exc:  # noqa: BLE001
         logger.warning("UMD archive unreachable: %s", exc)
         if manifest:
-            manifest.log("umd_active_fires", S.UMD_FTP_HOST, "unreachable",
+            manifest.log("umd_archive", S.UMD_FTP_HOST, "unreachable",
                          detail=str(exc), status="FAIL")
-        return []
-    if manifest:
-        manifest.log("umd_active_fires", f"sftp/ftp://{S.UMD_FTP_HOST}",
-                     "remote_walk", detail=f"{sum(map(len, files.values()))} files")
-    # _iter_remote_files returns paths only; do a second pass to read them.
-    # (kept simple: re-connect and fetch the discovered file list)
-    import paramiko
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(S.UMD_FTP_HOST, port=22, username=S.UMD_FTP_USER,
-                   password=S.UMD_FTP_PASS, timeout=FTP_TIMEOUT_S,
-                   allow_agent=False, look_for_keys=False)
-    sftp = client.open_sftp()
+        return result
+    result["method"] = session.method
     try:
-        for key, plist in files.items():
-            for rel in plist:
-                if not any(str(y) in rel for y in years):
-                    continue
-                dest = out_dir / f"{key}__{Path(rel).name}"
-                if not dest.exists():
-                    with sftp.open(rel, "rb") as src, open(dest, "wb") as dst:
-                        while True:
-                            chunk = src.read(1 << 20)
-                            if not chunk:
-                                break
-                            dst.write(chunk)
-                written.append(dest)
+        files = walk_umd_tree(session)
+        if manifest:
+            manifest.log("umd_archive", f"{session.method}://{S.UMD_FTP_HOST}",
+                         "remote_walk",
+                         detail=json.dumps({k: len(v) for k, v in files.items()}))
+        years_set = set(int(y) for y in years)
+        with tempfile.TemporaryDirectory(prefix="umd_") as tmp:
+            for key, plist in files.items():
+                for rel in plist:
+                    y = _year_of_name(rel)
+                    if y is None or y not in years_set:
+                        continue
+                    name = Path(rel).name
+                    if key in ("MCD14ML", "VNP14IMGML", "VJ114IMGML",
+                               "VJ214IMGML"):
+                        dest = out_dir / f"umd_{key}_{name}.parquet"
+                        if dest.exists():
+                            result["fires"].append(dest)
+                            continue
+                    tmp_path = Path(tmp) / name
+                    try:
+                        session.download(rel, tmp_path)
+                        if key == "MCD14ML" or key.startswith("V"):
+                            with gzip.open(tmp_path, "rt", errors="replace") as fh:
+                                lines = fh.read().splitlines()
+                            df = (parse_mcd14ml_rows(lines) if key == "MCD14ML"
+                                  else parse_vxx14imgml_rows(
+                                      lines, platform_hint=(
+                                          platform_from_vxx_filename(name))))
+                            df = df[_in_boxes(df["latitude"], df["longitude"],
+                                              bboxes)]
+                            if schema_validation_gate(df, name) or not len(df):
+                                df.to_parquet(dest, index=False,
+                                              compression="zstd")
+                                result["fires"].append(dest)
+                        elif key in ("MOD14C8Q", "MYD14C8Q"):
+                            meta = parse_cmg_filename(name)
+                            if meta:
+                                sds = read_hdf4_sds(tmp_path, CMQ_CLOUD_LAYERS)
+                                f = parse_cloud_cmg(sds, meta["year"],
+                                                    meta["period"],
+                                                    meta["period_kind"])
+                                f["platform"] = meta["product"][:3]
+                                result["cloud"].append(
+                                    f[_in_boxes(f["lat_025"], f["lon_025"],
+                                                bboxes)])
+                        elif key == "MCD64CMQ":
+                            meta = parse_cmg_filename(name)
+                            if meta:
+                                sds = read_hdf4_sds(tmp_path, CMQ_BURN_LAYERS)
+                                f = parse_burned_area_cmg(sds, meta["year"],
+                                                          meta["period"])
+                                result["burned"].append(
+                                    f[_in_boxes(f["lat_025"], f["lon_025"],
+                                                bboxes)])
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("UMD file %s failed: %s", rel, exc)
+                        if manifest:
+                            manifest.log(key, rel, session.method,
+                                         detail=str(exc), status="FAIL")
+                    finally:
+                        tmp_path.unlink(missing_ok=True)   # delete immediately
     finally:
-        sftp.close()
-        client.close()
-    return written
+        if own:
+            session.close()
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -471,9 +591,8 @@ def parse_cloud_cmg(sds_layers: dict, year: int, period: int,
     attrs, cloud_raw = sds_layers["MeanCloudFraction"]
     cloud = apply_sds_scaling(attrs, cloud_raw)
     cloud = np.where(cloud > 100.0, np.nan, cloud)
-    cloud = cloud / 100.0 if np.nanmax(cloud, initial=0.0) > 1.0 else cloud
-    rows = 2160 if cloud.shape[0] == 720 else cloud.shape[0]
-    del rows
+    cmax = np.nanmax(cloud) if np.isfinite(cloud).any() else 0.0
+    cloud = cloud / 100.0 if cmax > 1.0 else cloud
     lat_g, lon_g = np.meshgrid(lats[: cloud.shape[0]], lons[: cloud.shape[1]],
                                indexing="ij")
     df = pd.DataFrame({
@@ -483,7 +602,6 @@ def parse_cloud_cmg(sds_layers: dict, year: int, period: int,
         "year": year,
         "period": period,
         "period_kind": period_kind,   # '8d' or 'month'
-        "platform": "MOD" if "MOD14" in str(sds_layers.get("_source", "MOD14")) else "MYD",
     })
     return df.dropna(subset=["cloud_frac"])
 
@@ -498,7 +616,8 @@ def parse_burned_area_cmg(sds_layers: dict, year: int, month: int) -> pd.DataFra
     qa = apply_sds_scaling(qa_attrs, qa_raw)
     um_attrs, um_raw = sds_layers["UnmappedFraction"]
     unmapped = apply_sds_scaling(um_attrs, um_raw)
-    unmapped = unmapped / 100.0 if np.nanmax(unmapped, initial=0.0) > 1.0 else unmapped
+    umax = np.nanmax(unmapped) if np.isfinite(unmapped).any() else 0.0
+    unmapped = unmapped / 100.0 if umax > 1.0 else unmapped
     lat_g, lon_g = np.meshgrid(lats[: burn.shape[0]], lons[: burn.shape[1]],
                                indexing="ij")
     df = pd.DataFrame({
@@ -521,9 +640,11 @@ def build_cloud_climatology_fallback(cloud_df: pd.DataFrame) -> pd.DataFrame:
     (cloud_source = 'CLIMATOLOGY_FALLBACK').
     """
     clim = (cloud_df[cloud_df["year"].between(2012, 2025)]
-            .assign(month=lambda d: np.where(d["period_kind"] == "month",
-                                             d["period"],
-                                             ((d["period"] - 1) * 8 // 30) + 1))
+            .assign(month=lambda d: np.where(
+                d["period_kind"] == "month", d["period"],
+                (pd.Timestamp("2001-01-01") + pd.to_timedelta(
+                    np.clip((d["period"].to_numpy(int) - 1) * 8 + 4, 1, 365)
+                    - 1, unit="D")).month))
             .groupby(["lat_025", "lon_025", "month"], as_index=False)["cloud_frac"]
             .mean())
     clim = clim.rename(columns={"cloud_frac": "cloud_frac_clim"})
@@ -577,103 +698,253 @@ def schema_validation_gate(df: pd.DataFrame, source_name: str) -> bool:
 # ---------------------------------------------------------------------------
 # Top-level Env 1 orchestrator
 # ---------------------------------------------------------------------------
+def nrt_windows(last_science: str, end: str = S.DATE_END,
+                max_range: int = 5) -> list[tuple[str, int]]:
+    """Consecutive FIRMS ``/api/area`` windows ``(start_date, day_range)``
+    covering ``last_science + 1 .. end`` with ``DAY_RANGE <= 5`` (the API
+    returns DAY_RANGE days starting at DATE)."""
+    start = pd.Timestamp(last_science) + pd.Timedelta(days=1)
+    stop = pd.Timestamp(end)
+    out = []
+    while start <= stop:
+        rng = int(min(max_range, (stop - start).days + 1))
+        out.append((start.strftime("%Y-%m-%d"), rng))
+        start += pd.Timedelta(days=rng)
+    return out
+
+
+def last_science_dates(raw_dir) -> dict:
+    """Latest staged Science (ML/SP) acq_date per platform."""
+    import duckdb
+    files = [str(p) for p in Path(raw_dir).glob("*.parquet")
+             if p.name.startswith(("umd_", "portolan_"))]
+    out: dict = {}
+    if not files:
+        return out
+    con = duckdb.connect()
+    try:
+        for f in files:
+            cols = [r[0] for r in con.execute(
+                "DESCRIBE SELECT * FROM read_parquet(?)", [f]).fetchall()]
+            if {"platform", "acq_date", "data_tier"} <= set(cols):
+                q = ("SELECT platform, MAX(acq_date) FROM read_parquet(?) "
+                     "WHERE data_tier <> 'NRT' GROUP BY platform")
+            elif {"satellite", "acq_date"} <= set(cols):
+                from .normalize_dedup import parse_portolan_frame
+                df = parse_portolan_frame(pd.read_parquet(f))
+                df = df[df["data_tier"] != "NRT"]
+                for p, d in df.groupby("platform")["acq_date"].max().items():
+                    out[p] = max(out.get(p, d), d)
+                continue
+            else:
+                continue
+            for p, d in con.execute(q, [f]).fetchall():
+                d = str(d)[:10]
+                out[p] = max(out.get(p, d), d)
+    finally:
+        con.close()
+    return out
+
+
+FIRMS_NRT_SOURCES = {"MODIS_NRT": ("Terra", "Aqua"),
+                     "VIIRS_SNPP_NRT": ("SNPP",),
+                     "VIIRS_NOAA20_NRT": ("NOAA-20",),
+                     "VIIRS_NOAA21_NRT": ("NOAA-21",)}
+
+
+def cmr_discover_cmg(manifest: ProvenanceManifest,
+                     short_names=("MOD14C8Q", "MYD14C8Q", "MOD14CMQ",
+                                  "MYD14CMQ", "MCD64CMQ")) -> dict:
+    """Readme 6.2.3: query NASA CMR for alternate CMG granule endpoints and
+    log every candidate download URL in the provenance manifest."""
+    found = {}
+    for sn in short_names:
+        try:
+            entries = cmr_search_granules(sn)
+            urls = [lk.get("href") for e in entries for lk in e.get("links", [])
+                    if str(lk.get("rel", "")).endswith("/data#")]
+            found[sn] = urls
+            manifest.log(f"cmr_{sn}", S.NASA_CMR_URL, "cmr_search",
+                         detail=f"{len(urls)} granule URLs")
+        except Exception as exc:  # noqa: BLE001
+            manifest.log(f"cmr_{sn}", S.NASA_CMR_URL, "cmr_search",
+                         detail=str(exc), status="FAIL")
+    return found
+
+
+def download_cmr_granules(urls: list[str], tmp_dir: Path, bboxes,
+                          years: set[int], token: str | None) -> dict:
+    """Download CMR-discovered CMG granules (Earthdata bearer token from
+    ``EARTHDATA_TOKEN``), parse with pyhdf, delete each file at once."""
+    out = {"cloud": [], "burned": []}
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    for url in urls:
+        meta = parse_cmg_filename(url)
+        if not meta or meta["year"] not in years:
+            continue
+        dest = Path(tmp_dir) / Path(urllib.parse.urlparse(url).path).name
+        try:
+            with requests.get(url, headers=headers, timeout=HTTP_TIMEOUT_S,
+                              stream=True) as r:
+                r.raise_for_status()
+                with open(dest, "wb") as fh:
+                    for chunk in r.iter_content(1 << 20):
+                        fh.write(chunk)
+            if meta["product"] == "MCD64CMQ":
+                f = parse_burned_area_cmg(read_hdf4_sds(dest, CMQ_BURN_LAYERS),
+                                          meta["year"], meta["period"])
+                out["burned"].append(f[_in_boxes(f["lat_025"], f["lon_025"],
+                                                 bboxes)])
+            else:
+                f = parse_cloud_cmg(read_hdf4_sds(dest, CMQ_CLOUD_LAYERS),
+                                    meta["year"], meta["period"],
+                                    meta["period_kind"])
+                f["platform"] = meta["product"][:3]
+                out["cloud"].append(f[_in_boxes(f["lat_025"], f["lon_025"],
+                                                bboxes)])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("CMR granule %s failed: %s", url, exc)
+        finally:
+            dest.unlink(missing_ok=True)
+    return out
+
+
+def finalize_cloud_table(parts: list[pd.DataFrame]) -> pd.DataFrame:
+    """Merge Terra (MOD) + Aqua (MYD) CMG cloud fractions: mean per
+    (0.25 deg bin, year, period, period_kind)."""
+    cloud = pd.concat(parts, ignore_index=True)
+    return (cloud.groupby(["lat_025", "lon_025", "year", "period",
+                           "period_kind"], as_index=False)["cloud_frac"]
+            .mean())
+
+
 def download_all(paths: DataPaths, years: list[int] | None = None,
                  firms_map_key: str | None = None,
-                 bboxes: list[tuple] | None = None) -> dict:
+                 bboxes: list[tuple] | None = None,
+                 earthdata_token: str | None = None) -> dict:
     """Run the full Env 1 acquisition with autonomous failover.
 
     Returns a summary dict; every resolved source is written to
     ``data_provenance_manifest.json``.  This function requires Internet and is
     executed ONLY in Environment 1.
     """
+    import os
+    import tempfile
+
     manifest = ProvenanceManifest(Path(paths.provenance_manifest))
     paths.ensure_output_dirs()
     if years is None:
         years = list(range(2000, 2027))
     if bboxes is None:
         bboxes = [box for c in S.TARGET_COUNTRIES for box in c.prefilter_boxes]
-
+    earthdata_token = earthdata_token or os.environ.get("EARTHDATA_TOKEN")
     summary: dict = {"years": years}
 
     # 1) Country polygons (needed for clipping everywhere downstream).
     download_country_polygons(paths, manifest)
 
-    # 2) Historical active fires: UMD primary, Portolan failover.
-    umd_files = fetch_umd_history(paths, years, manifest)
-    summary["umd_files"] = [str(p) for p in umd_files]
-    if not umd_files:
+    # 2) Historical active fires + CMG grids: UMD primary (SFTP -> FTP).
+    umd = fetch_umd_history(paths, years, manifest, bboxes)
+    summary["umd_method"] = umd["method"]
+    summary["umd_fire_files"] = len(umd["fires"])
+    if not umd["fires"]:
+        # Portolan GeoParquet failover for active fires (readme 6.2.2)
         con = _duckdb_con()
         try:
-            catalog = inspect_portolan_catalog(con)
-            manifest.log("portolan_catalog", S.PORTOLAN_CATALOG_URL, "stac",
-                         detail=f"{len(catalog['children'])} children")
+            try:
+                catalog = inspect_portolan_catalog(con)
+                manifest.log("portolan_catalog", S.PORTOLAN_CATALOG_URL,
+                             "stac", detail=f"{len(catalog['children'])} children")
+            except Exception as exc:  # noqa: BLE001
+                manifest.log("portolan_catalog", S.PORTOLAN_CATALOG_URL,
+                             "stac", detail=str(exc), status="FAIL")
+            n_ok = 0
             for year in years:
                 dest = Path(paths.raw_stage_dir) / f"portolan_{year}.parquet"
                 try:
                     fetch_portolan_year(year, bboxes, dest, con)
-                    manifest.log(f"active_fires_{year}", str(dest), "portolan_httpfs")
+                    manifest.log(f"active_fires_{year}", str(dest),
+                                 "portolan_httpfs")
+                    n_ok += 1
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Portolan year %d failed: %s", year, exc)
                     manifest.log(f"active_fires_{year}", "portolan", "httpfs",
                                  detail=str(exc), status="FAIL")
+            if n_ok == 0:
+                manifest.critical("active_fires",
+                                  "UMD and Portolan both unreachable")
         finally:
             con.close()
 
-    # 3) Trailing-2026 NRT gap-fill via FIRMS REST API (strictly trailing).
+    # 3) Trailing NRT gap-fill: 5-day windows from the last Science date of
+    #    each platform through DATE_END (DAY_RANGE <= 5 strictly).
     if firms_map_key:
-        for source in ("MODIS_NRT", "VIIRS_SNPP_NRT", "VIIRS_NOAA20_NRT",
-                       "VIIRS_NOAA21_NRT"):
-            for (west, south, east, north) in bboxes:
-                try:
-                    df = fetch_firms_nrt(firms_map_key, source,
-                                         (west, south, east, north), 5,
-                                         S.DATE_END)
-                    if len(df):
-                        dest = (Path(paths.raw_stage_dir) /
-                                f"firms_nrt_{source}_{west}_{south}.parquet")
-                        df.to_parquet(dest, index=False)
-                        manifest.log(f"nrt_{source}", str(dest), "firms_api")
-                except Exception as exc:  # noqa: BLE001
-                    manifest.log(f"nrt_{source}", "firms_api", "http",
-                                 detail=str(exc), status="FAIL")
+        last_sci = last_science_dates(paths.raw_stage_dir)
+        try:
+            avail = firms_data_availability(firms_map_key)
+            manifest.log("firms_data_availability", S.FIRMS_API_BASE, "http",
+                         detail=f"{len(avail)} sources")
+        except Exception as exc:  # noqa: BLE001
+            avail = None
+            manifest.log("firms_data_availability", S.FIRMS_API_BASE, "http",
+                         detail=str(exc), status="FAIL")
+        for source, plats in FIRMS_NRT_SOURCES.items():
+            known = [last_sci[p] for p in plats if p in last_sci]
+            start = min(known) if known else "2026-01-01"
+            end = S.DATE_END
+            if avail is not None and "data_id" in avail.columns:
+                row = avail[avail["data_id"] == source]
+                if len(row) and "max_date" in row.columns:
+                    end = min(end, str(row["max_date"].iloc[0])[:10])
+            for bi, box in enumerate(bboxes):
+                for day0, rng in nrt_windows(start, end):
+                    try:
+                        df = fetch_firms_nrt(firms_map_key, source, box, rng,
+                                             day0)
+                        if len(df):
+                            dest = (Path(paths.raw_stage_dir) /
+                                    f"firms_nrt_{source}_{bi}_{day0}.parquet")
+                            df.to_parquet(dest, index=False)
+                    except Exception as exc:  # noqa: BLE001
+                        manifest.log(f"nrt_{source}", "firms_api", "http",
+                                     detail=f"{day0}: {exc}", status="FAIL")
+            manifest.log(f"nrt_{source}", "firms_api", "area_csv",
+                         detail=f"from {start} to {end}")
 
-    # 4) Ancillary cloud + burned-area CMG grids.
-    try:
-        cloud_parts: list[pd.DataFrame] = []
-        burn_parts: list[pd.DataFrame] = []
-        for year in range(2000, 2027):
-            for month in range(1, 13):
-                for short in ("MOD14CMQ", "MYD14CMQ"):
-                    p = (Path(paths.raw_stage_dir) /
-                         f"{short}.{year}{month:02d}.hdf")
-                    if not p.exists():
-                        continue
-                    sds = read_hdf4_sds(p, CMQ_CLOUD_LAYERS)
-                    sds["_source"] = ({}, np.array([short]))
-                    cloud_parts.append(parse_cloud_cmg(sds, year, month, "month"))
-                p64 = Path(paths.raw_stage_dir) / f"MCD64CMQ.{year}{month:02d}.hdf"
-                if p64.exists():
-                    sds = read_hdf4_sds(p64, CMQ_BURN_LAYERS)
-                    burn_parts.append(parse_burned_area_cmg(sds, year, month))
-        if cloud_parts:
-            cloud = pd.concat(cloud_parts, ignore_index=True)
-            cloud.to_parquet(paths.cloud_parquet, index=False)
-            manifest.log("cloud_cmg", str(paths.cloud_parquet), "pyhdf")
-            build_cloud_climatology_fallback(cloud).to_parquet(
-                Path(paths.cloud_parquet).with_name("cloud_climatology.parquet"),
-                index=False)
-        else:
-            manifest.log("cloud_cmg", "none", "pyhdf",
-                         detail="No CMG HDF4 files staged (see Section 6.2 "
-                                "CMR discovery for alternates).", status="WARN")
-        if burn_parts:
-            pd.concat(burn_parts, ignore_index=True).to_parquet(
-                paths.burned_area_parquet, index=False)
-            manifest.log("burned_area_cmq", str(paths.burned_area_parquet), "pyhdf")
-    except Exception as exc:  # noqa: BLE001
-        manifest.log("ancillary_cmg", "pyhdf", "hdf4",
-                     detail=str(exc), status="FAIL")
-
+    # 4) Ancillary cloud + burned-area CMG grids (UMD -> CMR discovery).
+    cloud_parts, burn_parts = list(umd["cloud"]), list(umd["burned"])
+    if not cloud_parts or not burn_parts:
+        found = cmr_discover_cmg(manifest)
+        urls_c = [u for k, v in found.items() if k != "MCD64CMQ" for u in v]
+        urls_b = found.get("MCD64CMQ", [])
+        with tempfile.TemporaryDirectory(prefix="cmr_") as tmp:
+            got = download_cmr_granules(
+                (urls_c if not cloud_parts else []) +
+                (urls_b if not burn_parts else []), Path(tmp), bboxes,
+                set(int(y) for y in years), earthdata_token)
+        cloud_parts += got["cloud"]
+        burn_parts += got["burned"]
+    if cloud_parts:
+        cloud = finalize_cloud_table(cloud_parts)
+        cloud.to_parquet(paths.cloud_parquet, index=False)
+        manifest.log("cloud_cmg", str(paths.cloud_parquet), "pyhdf",
+                     detail=f"{len(cloud)} rows; kinds="
+                            f"{sorted(cloud['period_kind'].unique())}")
+        build_cloud_climatology_fallback(cloud).to_parquet(
+            Path(paths.cloud_parquet).with_name("cloud_climatology.parquet"),
+            index=False)
+    else:
+        manifest.critical("cloud_cmg", "no MOD14C8Q/MYD14C8Q/Mx14CMQ grid "
+                          "reachable via UMD or CMR (zero-cloud assumptions "
+                          "are never fabricated)")
+    if burn_parts:
+        pd.concat(burn_parts, ignore_index=True).to_parquet(
+            paths.burned_area_parquet, index=False)
+        manifest.log("burned_area_cmq", str(paths.burned_area_parquet), "pyhdf")
+    else:
+        manifest.log("burned_area_cmq", "none", "pyhdf",
+                     detail="MCD64CMQ unavailable: validation-only product",
+                     status="WARN")
     manifest.save()
     summary["manifest"] = str(manifest.path)
     return summary

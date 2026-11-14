@@ -355,3 +355,99 @@ def test_01_gz_chunk_roundtrip(tmp_path, paths):
     report = run_normalization(paths)
     assert report["n_rows"] == 2
     assert report["audit"]["platforms_present"] == ["SNPP", "Terra"]
+
+
+def test_01_alaska_second_prefilter_box_kept(paths):
+    """USA has TWO prefilter boxes (CONUS + Alaska); clipping ORs them so
+    the Alaska Boreal spotlight survives (the fixture USA polygon is an
+    Alaska square around (-150, 65))."""
+    from src.ingest.normalize_dedup import clip_to_countries, load_country_polygons
+    polys = load_country_polygons(paths.country_polygons_parquet)
+    df = pd.DataFrame({"latitude": [65.2, 10.0], "longitude": [-150.3, -150.0],
+                       "frp_mw": [3.0, 3.0]})
+    out = clip_to_countries(df, polys)
+    assert len(out) == 1 and out.iloc[0]["country_iso"] == "USA"
+
+
+def test_01_firms_api_sensor_specific_columns():
+    """FIRMS API: VIIRS rows map bright_ti4/ti5, MODIS rows brightness /
+    bright_t31; scan/track carried as pixel km (never NaN)."""
+    csv_text = (
+        "latitude,longitude,brightness,bright_ti4,scan,track,acq_date,acq_time,"
+        "satellite,instrument,confidence,version,bright_t31,bright_ti5,frp,daynight\n"
+        "-29.16,-67.50,,331.5,0.39,0.36,2026-11-10,1332,N20,VIIRS,h,2.0NRT,,290.1,7.4,D\n"
+        "-29.15,-67.48,345.2,,1.20,1.10,2026-11-10,1333,T,MODIS,77,6.1NRT,296.4,,30.0,D\n")
+    df = parse_firms_api_csv(csv_text)
+    v, m = df.iloc[0], df.iloc[1]
+    assert v["platform"] == "NOAA-20" and v["t_mir_k"] == 331.5
+    assert v["t_tir_k"] == 290.1 and v["scan_km"] == 0.39
+    assert v["track_km"] == 0.36
+    assert m["platform"] == "Terra" and m["t_mir_k"] == 345.2
+    assert m["t_tir_k"] == 296.4 and m["scan_km"] == 1.20
+    assert m["conf_num"] == 77.0 and (df["type_raw"] == -1).all()
+
+
+def test_01_portolan_modis_temperature_and_tier():
+    """A MODIS Portolan row with a present-but-NaN bright_ti4 column keeps
+    its MODIS brightness (MODIS saturation detection intact) and the tier
+    comes from quality/version (NRT vs standard processing)."""
+    df = pd.DataFrame({
+        "longitude": [-67.5, -67.4], "latitude": [-29.1, -29.2],
+        "acq_datetime": ["2015-08-14 13:35:00", "2026-11-12 14:00:00"],
+        "sensor": ["MODIS", "MODIS"], "satellite": ["Aqua", "Terra"],
+        "quality": ["standard", "nrt"], "version": ["6.1", "6.1NRT"],
+        "brightness": [499.0, 330.0], "bright_t31": [300.0, 299.0],
+        "bright_ti4": [np.nan, np.nan], "bright_ti5": [np.nan, np.nan],
+        "scan": [1.0, 1.1], "track": [1.0, 1.0], "frp": [250.0, 10.0],
+        "daynight": ["D", "D"], "confidence": [90, 60], "type": [0, np.nan]})
+    out = parse_portolan_frame(df)
+    assert out.iloc[0]["t_mir_k"] == 499.0 and out.iloc[0]["t_tir_k"] == 300.0
+    assert out.iloc[0]["data_tier"] == "SP_SCIENCE"
+    assert out.iloc[1]["data_tier"] == "NRT" and out.iloc[1]["type_raw"] == -1
+
+
+def test_01_nrt_parquet_chunk_ingested(paths):
+    """download_all stores NRT gap-fill as firms_nrt_*.parquet; normalization
+    reads it as Parquet (never as text) and tags it NRT."""
+    from src.ingest.normalize_dedup import run_normalization
+    raw_dir = paths.raw_stage_dir
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"latitude": [f"{-29.16 - 0.01 * i:.3f}" for i in range(6)],
+                  "longitude": ["-67.50"] * 6,
+                  "bright_ti4": ["320"] * 6, "scan": ["0.4"] * 6,
+                  "track": ["0.4"] * 6, "acq_date": ["2026-11-12"] * 6,
+                  "acq_time": ["1730"] * 6, "satellite": ["N21"] * 6,
+                  "instrument": ["VIIRS"] * 6, "confidence": ["n"] * 6,
+                  "version": ["2.0NRT"] * 6, "bright_ti5": ["290"] * 6,
+                  "frp": ["3.5"] * 6, "daynight": ["D"] * 6}).to_parquet(
+        raw_dir / "firms_nrt_VIIRS_NOAA21_NRT_ARG_2026-11-12.parquet")
+    rep = run_normalization(paths)
+    assert rep["n_rows"] == 6
+    assert rep["platform_active_day"]["NOAA-21"] == ["2026-11-12"]
+
+
+def test_01_cmg_filename_periods_and_nrt_windows():
+    """8-day vs monthly CMG periods never collide (period_kind), and NRT
+    gap-fill steps 5-day windows from the last Science date to the
+    reference date (DAY_RANGE <= 5)."""
+    from src.ingest import download_data as d
+    m8 = d.parse_cmg_filename("MOD14C8Q.A2015009.061.2018123.hdf")
+    mm = d.parse_cmg_filename("MYD14CMQ.A2015213.061.2019.hdf")
+    assert (m8["period"], m8["period_kind"]) == (2, "8d")
+    assert (mm["period"], mm["period_kind"]) == (8, "month")
+    w = d.nrt_windows("2026-10-31", "2026-11-14")
+    assert w == [("2026-11-01", 5), ("2026-11-06", 5), ("2026-11-11", 4)]
+    assert all(1 <= r <= 5 for _, r in d.nrt_windows("2026-07-01"))
+
+
+def test_01_cloud_cmg_parse_scales_percent_without_nanmax_initial():
+    """parse_cloud_cmg normalizes 0..100 MeanCloudFraction with dynamic
+    scale/fill attributes (no unsupported np.nanmax(initial=...))."""
+    from src.ingest import download_data as d
+    raw = np.full((720, 1440), 255.0)
+    raw[240, 450] = 40.0                     # one valid 40% cell
+    attrs = {"_FillValue": 255.0, "scale_factor": 1.0}
+    df = d.parse_cloud_cmg({"MeanCloudFraction": (attrs, raw)}, 2015, 2, "8d")
+    assert len(df) == 1
+    assert df.iloc[0]["cloud_frac"] == pytest.approx(0.40)
+    assert df.iloc[0]["period_kind"] == "8d"

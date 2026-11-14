@@ -104,10 +104,10 @@ def test_07_pyrome_levels_within_bounds(met):
 
 # ---------------------------------------------------------------- ndr
 def test_07_night_day_ratio_preserved(full_twin, met):
-    """night_day_ratio recovered within 45% per cell and NEVER collapses
-    toward 1.0 (the Day/Night states stay distinct)."""
+    """night_day_ratio recovered within 15% per cell (readme 7.7) and
+    NEVER collapses toward 1.0 (the Day/Night states stay distinct)."""
     assert met["ndr_never_collapsed"]
-    assert met["ndr_max_abs_err_pct"] < 45.0
+    assert met["ndr_max_abs_err_pct"] < 15.0
 
 
 def test_07_night_day_ratio_estimates(full_twin):
@@ -126,12 +126,28 @@ def test_07_night_day_ratio_estimates(full_twin):
     assert ndr_hat.std() > 0.02
 
 
+def test_07_wildfire_cells_not_masked_as_static_flares(full_twin):
+    """INV-08 separation on the twin: persistent gas-flare cells are masked
+    as static industrial sources while moving, seasonal wildfire cells stay
+    (>= 85% of their pixels) in the biomass record."""
+    prov = full_twin["prov"].copy()
+    roles = {int(r.h3_index): r.role for r in
+             full_twin["truth"].drop_duplicates("h3_index").itertuples()}
+    prov["role"] = prov["h3_index"].map(roles)
+    flare = prov[prov["role"] == "flare"]
+    fire = prov[prov["role"].isin(["normal", "chilecito", "offnadir"])]
+    assert flare["is_static_industrial"].mean() > 0.99
+    assert fire["is_biomass"].mean() > 0.85
+    per_role = fire.groupby("role")["is_biomass"].mean()
+    assert (per_role > 0.80).all(), per_role.to_dict()
+
+
 # ---------------------------------------------------------------- spike
 def test_07_drought_spike_preserved(met):
     """The 2015 5x drought fire spike is preserved (not oversmoothed)."""
     assert met["spike_true_x"] > 1.5
     assert met["spike_harm_x"] > 1.3
-    assert 0.75 < met["spike_recovery"] < 1.25
+    assert 0.85 < met["spike_recovery"] < 1.15         # readme: +-15%
 
 
 def test_07_chilecito_2026_spotlight(full_twin):

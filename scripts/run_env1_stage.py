@@ -32,7 +32,12 @@ def main(argv=None) -> int:
     ap.add_argument("--years", type=int, nargs="*", default=None,
                     help="Years to stage (default 2000..2026)")
     ap.add_argument("--firms-map-key", default=None,
-                    help="NASA FIRMS MAP_KEY for trailing-2026 NRT gap-fill")
+                    help="NASA FIRMS MAP_KEY for trailing-2026 NRT gap-fill "
+                         "(default: $FIRMS_MAP_KEY; never hardcode keys)")
+    ap.add_argument("--wheel-python", default=None,
+                    help="Python minor version of the Env 2 runtime the "
+                         "offline wheels target (default 3.13; Kaggle 4x L4 "
+                         "image runs 3.13)")
     ap.add_argument("--skip-wheels", action="store_true")
     ap.add_argument("--dry-run", action="store_true",
                     help="Skip network work; only verify the layout")
@@ -47,15 +52,18 @@ def main(argv=None) -> int:
         return 0
 
     years = args.years or list(range(2000, 2027))
-    download_data.download_all(paths, years=years,
-                               firms_map_key=args.firms_map_key)
+    import os
+    map_key = args.firms_map_key or os.environ.get("FIRMS_MAP_KEY")
+    download_data.download_all(paths, years=years, firms_map_key=map_key)
     report = normalize_dedup.run_normalization(paths)
     logger.info("Ingestion audit: %s", report["audit"])
 
     if not args.skip_wheels:
         wheels_script = REPO_ROOT / "src" / "ingest" / "build_wheels.sh"
-        subprocess.run(["bash", str(wheels_script), str(paths.wheels_dir)],
-                       check=True)
+        cmd = ["bash", str(wheels_script), str(paths.wheels_dir)]
+        if args.wheel_python:
+            cmd.append(args.wheel_python)
+        subprocess.run(cmd, check=True)
     logger.info("Env 1 staging complete.")
     return 0
 

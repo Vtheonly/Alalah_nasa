@@ -162,3 +162,37 @@ def test_10_single_gpu_chunk_vram_under_6gb():
                                     n_platforms=S.N_PLATFORMS,
                                     m_samples=S.MC_SAMPLES, sub_batch=32)
     assert est < 6 * 1024 ** 3
+
+
+# ---------------------------------------------------------------- security
+def test_10_metric_sql_injection_rejected(client):
+    """``metric`` is checked against a strict column whitelist -- an
+    injection payload never reaches SQL (422, not 500, not data)."""
+    bad = "phi_q50_mw) FROM uncertainty_diagnostics; DROP TABLE hex_centers; --"
+    r = client.get("/api/calendar", params=dict(
+        min_lon=-69.0, min_lat=-31.5, max_lon=-66.0, max_lat=-28.5,
+        metric=bad))
+    assert r.status_code == 422
+    r2 = client.get("/api/map_hex", params=dict(
+        min_lon=-69.0, min_lat=-31.5, max_lon=-66.0, max_lat=-28.5,
+        color_by="1; DROP TABLE x"))
+    assert r2.status_code == 422
+    ok = client.get("/api/calendar", params=dict(
+        min_lon=-69.0, min_lat=-31.5, max_lon=-66.0, max_lat=-28.5,
+        metric="fre_tj_q50"))
+    assert ok.status_code == 200 and ok.json()["cells"]
+
+
+def test_10_country_iso_filters_cells(client):
+    """country_iso lifts the 25 deg span cap AND actually filters by
+    country: a world bbox with ARG returns the twin's ARG cells; with USA
+    (no twin cells) returns nothing; unknown ISO is rejected."""
+    world = dict(min_lon=-179.0, min_lat=-80.0, max_lon=179.0, max_lat=80.0)
+    arg = client.get("/api/calendar", params=dict(world, country_iso="ARG"))
+    assert arg.status_code == 200
+    assert arg.json()["meta"]["country_iso"] == "ARG"
+    assert len(arg.json()["cells"]) > 0
+    usa = client.get("/api/calendar", params=dict(world, country_iso="usa"))
+    assert usa.status_code == 200 and usa.json()["cells"] == []
+    assert client.get("/api/calendar", params=dict(
+        world, country_iso="XXX")).status_code == 422

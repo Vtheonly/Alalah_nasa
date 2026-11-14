@@ -224,3 +224,39 @@ def test_03_static_and_type_rows_excluded_from_biomass():
     assert prov["is_biomass"].sum() == 1
     assert len(prov) == 4                            # all kept in Product 1
     assert prov[prov["type_raw"] == 2]["is_static_industrial"].all()
+
+
+def test_03_pass_aggregation_weighted_sum_invariants():
+    """Pass aggregation (readme 5.1.3.4) on a mixed MODIS pass: two
+    overlapping bow-tie edge pixels (one event, weights 0.5) plus a distant
+    separate fire (second event, weight 1):
+    y = sum(w_bt * frp), raw_event_count = #distinct clusters,
+    det_footprint = sum(w_bt * A_i), n_pixels = raw pixel count."""
+    rows = [
+        dict(sensor_family="MODIS", platform="Terra", sample_idx=1300.0,
+             latitude=-29.10, longitude=-67.40, frp_mw=40.0, acq_hhmm=1330,
+             scan_km=np.nan, track_km=np.nan, pixarea_km2=np.nan),
+        dict(sensor_family="MODIS", platform="Terra", sample_idx=1310.0,
+             latitude=-29.10, longitude=-67.40 - 0.010, frp_mw=40.0,
+             acq_hhmm=1331, scan_km=np.nan, track_km=np.nan,
+             pixarea_km2=np.nan),
+        dict(sensor_family="MODIS", platform="Terra", sample_idx=1300.0,
+             latitude=-29.13, longitude=-67.43, frp_mw=12.0, acq_hhmm=1331,
+             scan_km=np.nan, track_km=np.nan, pixarea_km2=np.nan),
+    ]
+    prov, pas = preprocess_observations(_detections(rows))
+    bio = prov[prov["is_biomass"]]
+    assert bio["event_cluster_id"].nunique() == 2          # pair + lone fire
+    assert sorted(bio["bowtie_weight"].tolist()) == [0.5, 0.5, 1.0]
+    # every pass row equals the weighted sums over ITS (cell, platform, dn)
+    assert len(pas) == bio.groupby(["h3_index", "platform", "dn_flag"]).ngroups
+    for r in pas.itertuples():
+        g = bio[(bio["h3_index"] == r.h3_index) & (bio["dn_flag"] == r.dn_flag)]
+        w = g["bowtie_weight"].to_numpy()
+        assert r.y_frp_mw == pytest.approx(float((w * g["frp_mw"]).sum()))
+        assert r.det_footprint_km2 == pytest.approx(
+            float((w * g["pixel_area_km2"]).sum()))
+        assert int(r.raw_event_count) == g["event_cluster_id"].nunique()
+        assert int(r.n_pixels) == len(g)
+    # FRP conservation across the whole pass: 2 x 40 MW overlap -> 40, + 12
+    assert pas["y_frp_mw"].sum() == pytest.approx(52.0, abs=1e-6)
