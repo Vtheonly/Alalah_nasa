@@ -604,3 +604,28 @@ def test_01_umd_rows_with_extra_trailing_fields_stay_aligned():
     assert len(df) == 2 and df.attrs["n_bad_lines"] == 1
     assert df["latitude"].tolist() == [-29.1, -29.2]
     assert df["frp_mw"].tolist() == [7.5, 8.5]
+
+
+def test_01_umd_walk_is_pruned_and_finds_products():
+    """The UMD walk lists only structural/product directories: a large
+    irrelevant tree (MCD64A1 500 m tiles) is never traversed."""
+    from src.ingest.download_data import walk_umd_tree
+    tree = {}
+    for m in (11, 12):
+        tree[f"data/MODIS/C61/MCD14ML/MCD14ML.2000{m:02d}.061.01.txt.gz"] = b""
+    tree["data/VIIRS/C2/VNP14IMGML/VNP14IMGML.201201.C2.01.txt.gz"] = b""
+    tree["data/MODIS/C61/MOD14C8Q/MOD14C8Q.A2015009.061.hdf"] = b""
+    tree["data/MODIS/C61/MCD64CMQ/2015/MCD64CMQ.A2015213.061.hdf"] = b""
+    for h in range(36):                     # 36 x 18 x 3 = 1944 irrelevant dirs
+        for v in range(18):
+            for y in (2001, 2002, 2003):
+                tree[f"data/MODIS/C61/MCD64A1/h{h:02d}v{v:02d}/{y}/x.hdf"] = b""
+    sess = _FakeUMD(tree)
+    calls = []
+    orig = sess.listdir
+    sess.listdir = lambda p: (calls.append(p), orig(p))[1]
+    found = walk_umd_tree(sess)
+    assert set(found) == {"MCD14ML", "VNP14IMGML", "MOD14C8Q", "MCD64CMQ"}
+    assert len(found["MCD14ML"]) == 2
+    assert not any("MCD64A1" in c for c in calls)
+    assert len(calls) < 15

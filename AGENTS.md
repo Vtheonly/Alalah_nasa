@@ -426,3 +426,9 @@ one bad line discarded the whole file. Fixed in the codebase:
 * Not yet verified against the real archive from this sandbox (UMD is not
   reachable here); the parse statistics in data_provenance_manifest.json of
   the next Colab run are the check.
+* Follow-up (same day): the Colab run then sat silent > 20 min after the
+  SFTP login -- `walk_umd_tree` listed every directory of the UMD server
+  (up to 5,000 SFTP round-trips, incl. MCD64A1 tile trees) with no logging.
+  Now pruned to the root, structural dirs (data/MODIS/VIIRS/Cnn/years/...)
+  and product-named dirs; 900 s / 2,000-listing budget; progress + pruned
+  names logged; per-file `UMD [k/N]` download/parse progress lines.

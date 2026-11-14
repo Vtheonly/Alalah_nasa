@@ -227,25 +227,55 @@ class UMDSession:
             pass
 
 
+# Directory names worth descending into while searching the UMD archive.
+# Anything else (e.g. MCD64A1 500 m tiles h12v09/..., shapefile trees, other
+# products) is pruned: the archive is large and every listing is one SFTP
+# round-trip, so an unpruned walk takes tens of minutes.
+_UMD_STRUCTURAL_DIRS = re.compile(
+    r"^(data|modis|viirs|cmg|fire|active_?fires?|burned_?area|"
+    r"c\d+(\.\d+)?|v\d+(\.\d+)?|\d{4}|monthly|8[-_]?day)$", re.IGNORECASE)
+
+
 def walk_umd_tree(session, patterns: dict[str, re.Pattern] = _UMD_PATTERNS,
-                  max_dirs: int = 5000) -> dict[str, list[str]]:
-    """Breadth-first walk of the archive matching the readme regexes
-    (``MCD14ML``, ``V(NP|J1|J2)14IMGML``, ``M[OY]D14C(8|M)Q``, ``MCD64CMQ``)."""
+                  max_dirs: int = 2000, max_seconds: float = 900.0,
+                  progress_every: int = 20) -> dict[str, list[str]]:
+    """Pruned breadth-first discovery of the readme products (``MCD14ML``,
+    ``V(NP|J1|J2)14IMGML``, ``M[OY]D14C(8|M)Q``, ``MCD64CMQ``).
+
+    Only the root, structural directories (``data``, ``MODIS``, ``VIIRS``,
+    collection ``C6``/``C61``/``C2``, years, ...) and directories whose name
+    matches a product pattern are listed.  Progress is logged; the walk
+    stops after ``max_dirs`` listings or ``max_seconds``.  Pruned directory
+    names near the root are logged so layout changes are diagnosable.
+    """
+    t0 = time.time()
     found: dict[str, list[str]] = {k: [] for k in patterns}
-    queue, seen = ["."], set()
-    while queue and len(seen) < max_dirs:
-        d = queue.pop(0)
+    queue: list[tuple[str, int]] = [(".", 0)]
+    seen: set[str] = set()
+    pruned: list[str] = []
+    while queue:
+        if len(seen) >= max_dirs or time.time() - t0 > max_seconds:
+            logger.warning("UMD walk stopped after %d listings / %.0fs "
+                           "(%d directories left unvisited)", len(seen),
+                           time.time() - t0, len(queue))
+            break
+        d, depth = queue.pop(0)
         if d in seen:
             continue
         seen.add(d)
         try:
             entries = session.listdir(d)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("UMD walk: cannot list %s: %s", d, exc)
             continue
         for name, is_dir in entries:
             full = name if d in (".", "", "/") else f"{d}/{name}"
             if is_dir:
-                queue.append(full)
+                if (depth == 0 or _UMD_STRUCTURAL_DIRS.match(name)
+                        or any(rx.search(name) for rx in patterns.values())):
+                    queue.append((full, depth + 1))
+                elif depth <= 3:
+                    pruned.append(full)
                 continue
             if not name.endswith((".gz", ".hdf")):
                 continue
@@ -253,6 +283,16 @@ def walk_umd_tree(session, patterns: dict[str, re.Pattern] = _UMD_PATTERNS,
                 if rx.search(name):
                     found[key].append(full)
                     break
+        if len(seen) % progress_every == 0:
+            logger.info("UMD walk: %d directories listed in %.0fs; files so "
+                        "far %s", len(seen), time.time() - t0,
+                        {k: len(v) for k, v in found.items() if v})
+    logger.info("UMD walk done: %d directories in %.0fs; found %s",
+                len(seen), time.time() - t0,
+                {k: len(v) for k, v in found.items()})
+    if pruned:
+        logger.info("UMD walk pruned (not product/structural): %s%s",
+                    pruned[:60], " ..." if len(pruned) > 60 else "")
     return {k: sorted(v) for k, v in found.items() if v}
 
 
@@ -429,13 +469,24 @@ def fetch_umd_history(paths: DataPaths, years: list[int],
         attempts: dict[str, int] = {}
         failures: dict[str, list[str]] = {}
         years_set = set(int(y) for y in years)
+        todo = [(k, r) for k, pl in files.items() for r in pl
+                if _year_of_name(r) in years_set]
+        logger.info("UMD: %d files to stage for years %s..%s %s", len(todo),
+                    min(years_set), max(years_set),
+                    {k: sum(1 for kk, _ in todo if kk == k) for k in files})
+        n_done = 0
+        t_start = time.time()
         with tempfile.TemporaryDirectory(prefix="umd_") as tmp:
             for key, plist in files.items():
                 for rel in plist:
                     y = _year_of_name(rel)
                     if y is None or y not in years_set:
                         continue
+                    n_done += 1
                     name = Path(rel).name
+                    t_file = time.time()
+                    logger.info("UMD [%d/%d] %s (elapsed %.0f min)", n_done,
+                                len(todo), rel, (time.time() - t_start) / 60)
                     if key in ("MCD14ML", "VNP14IMGML", "VJ114IMGML",
                                "VJ214IMGML"):
                         dest = out_dir / f"umd_{key}_{name}.parquet"
@@ -490,6 +541,10 @@ def fetch_umd_history(paths: DataPaths, years: list[int],
                                                  "lines": n_lines,
                                                  "bad_lines": n_bad,
                                                  "rows_in_target_boxes": len(df)}))
+                            logger.info("UMD [%d/%d] parsed %d lines (%d bad), "
+                                        "%d rows in target boxes, %.0fs",
+                                        n_done, len(todo), n_lines, n_bad,
+                                        len(df), time.time() - t_file)
                         elif key in ("MOD14C8Q", "MYD14C8Q"):
                             meta = parse_cmg_filename(name)
                             if meta:
