@@ -183,24 +183,27 @@ def mcd64cmq_correlation(monthly: pd.DataFrame,
     """Harmonized monthly FRE vs raw counts correlation with independent
     MCD64CMQ burned area, joined on the EXACT 0.25 deg CMG bin centres
     (x.125 / x.375 / x.625 / x.875) of each H3 cell centre."""
-    from ..engine.priors import cmg_bin_centers
+    from ..engine.priors import _bin_id, cmg_bin_centers
     from ..geometry.h3_utils import h3_cell_center
     if burned_area is None or not len(burned_area):
         return None
     cells = np.unique(monthly["h3_index"].to_numpy(np.int64))
     ll = np.array([h3_cell_center(int(c)) for c in cells])
     lat_c, lon_c = cmg_bin_centers(ll[:, 0], ll[:, 1])
-    cmg = pd.DataFrame({"h3_index": cells, "lat_025": np.round(lat_c, 3),
-                        "lon_025": np.round(lon_c, 3)})
+    # join on the integer CMG bin id (robust to how the staged grid rounded
+    # its centre coordinates, e.g. -29.125 stored as -29.12)
+    cmg = pd.DataFrame({"h3_index": cells, "bin": _bin_id(lat_c, lon_c)})
     ba = burned_area.copy()
-    ba["lat_025"] = ba["lat_025"].astype(float).round(3)
-    ba["lon_025"] = ba["lon_025"].astype(float).round(3)
+    ba["bin"] = _bin_id(ba["lat_025"].to_numpy(dtype=float),
+                        ba["lon_025"].to_numpy(dtype=float))
+    ba = ba.groupby(["bin", "year", "month"], as_index=False)[
+        "burned_area_km2"].sum()
     # aggregate H3 cells to their CMG bin (both sides on the same support)
     mm = monthly.merge(cmg, on="h3_index", how="left")
-    agg = mm.groupby(["lat_025", "lon_025", "year", "month"],
+    agg = mm.groupby(["bin", "year", "month"],
                      as_index=False).agg(fre=("fre_tj_q50", "sum"),
                                          raw=("raw_count_sum", "sum"))
-    j = agg.merge(ba, on=["lat_025", "lon_025", "year", "month"], how="inner")
+    j = agg.merge(ba, on=["bin", "year", "month"], how="inner")
     j = j[np.isfinite(j["burned_area_km2"])]
     if len(j) < 3:
         return {"n": int(len(j))}

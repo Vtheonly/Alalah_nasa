@@ -400,3 +400,29 @@ explain several knife-edge behaviours any future agent will hit:
 * Not executed here (environment limits): real UMD/FIRMS/Portolan
   acquisition (no raw-TCP egress), CUDA parity tests (no GPU), real
   Kaggle/Colab runs.
+
+---
+
+## Handoff update — first real UMD run (Colab) failed on every MCD14ML file
+
+Symptom (user's Colab log): `UMD file data/MODIS/C6/MCD14ML/MCD14ML.200011.006.03.txt.gz
+failed: could not convert string to float: 'lat'` for every month. Root cause:
+the real archives start with a header line (`YYYYMMDD HHMM sat lat lon T21
+T31 sample FRP conf type dn`) and the positional parser treated it as data;
+one bad line discarded the whole file. Fixed in the codebase:
+* `normalize_dedup.parse_umd_text`: header-driven column mapping (aliases for
+  MCD14ML C6/C6.1 and VIIRS C1/C2 layouts incl. Line/T4/T5/no-Sat), comma or
+  whitespace, pandas C engine (~7 s / 1e6 lines), malformed lines skipped and
+  counted (`df.attrs`), rows with extra trailing fields stay aligned.
+* `download_data`: `select_latest_collections` keeps ONE file per product and
+  month (C6.1 over C6, C2 over C1 -- both live on UMD; ingesting both would
+  double count); per-file parse stats in the provenance manifest; files with
+  > 5% bad lines fail; fail-fast after the first 3 files of a product all
+  fail; `read_hdf4_sds(..., required=...)` tolerates absent optional SDS
+  (only MeanCloudFraction / BurnedArea required; error lists actual layers).
+* CMG grids now stored with 3-decimal centres; the MCD64CMQ validation join
+  uses integer bin ids (2-decimal rounding -29.125 -> -29.12 made the old
+  coordinate join match nothing on real data).
+* Not yet verified against the real archive from this sandbox (UMD is not
+  reachable here); the parse statistics in data_provenance_manifest.json of
+  the next Colab run are the check.

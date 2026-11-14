@@ -312,6 +312,69 @@ def _in_boxes(lat, lon, bboxes) -> np.ndarray:
     return keep
 
 
+_COLL_DIR = re.compile(r"(?:^|[/.])C(\d)(\d?)(?=[/.]|$)", re.IGNORECASE)
+_COLL_VER = re.compile(r"\.0(\d)(\d)\.")
+
+
+def collection_rank(rel: str) -> tuple[int, int]:
+    """(major, minor) processing collection of a UMD archive path:
+    ``.../C61/...`` or ``*.061.*`` -> (6, 1); ``C6`` / ``.006.`` -> (6, 0);
+    VIIRS ``C2`` -> (2, 0).  (0, 0) when unknown."""
+    best = (0, 0)
+    for m in _COLL_DIR.finditer(rel):
+        best = max(best, (int(m.group(1)), int(m.group(2) or 0)))
+    m = _COLL_VER.search(Path(rel).name)
+    if m:
+        best = max(best, (int(m.group(1)), int(m.group(2))))
+    return best
+
+
+def umd_period_key(key: str, rel: str) -> str | None:
+    """Product + acquisition period of an archive file (one month for the
+    active-fire text files, one CMG period for HDF4 grids)."""
+    name = Path(rel).name
+    meta = parse_cmg_filename(name)
+    if meta:
+        return f"{meta['product']}:{meta['year']}:{meta['period_kind']}:{meta['period']}"
+    m = re.search(r"\.(\d{4})(\d{2})\.", name)
+    if m:
+        return f"{key}:{m.group(1)}{m.group(2)}"
+    a = _A_DATE.search(name)
+    if a:
+        return f"{key}:{a.group(1)}{a.group(2)}"
+    return None
+
+
+def select_latest_collections(files: dict[str, list[str]]) -> tuple[dict, list]:
+    """Keep ONE file per (product, period): the newest processing collection
+    (C6.1 over C6, VIIRS C2 over C1).  Ingesting both collections of the
+    same month would double-count every detection.  Returns
+    ``(selected, superseded)``."""
+    selected: dict[str, list[str]] = {}
+    superseded: list[str] = []
+    for key, plist in files.items():
+        best: dict[str, str] = {}
+        loose: list[str] = []
+        for rel in plist:
+            pk = umd_period_key(key, rel)
+            if pk is None:
+                loose.append(rel)
+                continue
+            cur = best.get(pk)
+            if cur is None or collection_rank(rel) > collection_rank(cur):
+                if cur is not None:
+                    superseded.append(cur)
+                best[pk] = rel
+            else:
+                superseded.append(rel)
+        selected[key] = sorted(best.values()) + sorted(loose)
+    return selected, superseded
+
+
+UMD_FAIL_FAST = 3          # abort a product after its first N files all fail
+UMD_MAX_BAD_LINE_FRACTION = 0.05
+
+
 def fetch_umd_history(paths: DataPaths, years: list[int],
                       manifest: ProvenanceManifest | None = None,
                       bboxes: list[tuple] | None = None,
@@ -337,8 +400,7 @@ def fetch_umd_history(paths: DataPaths, years: list[int],
         raise ValueError("keep_originals must be 'all' or 'ancillary'")
     import tempfile
 
-    from .normalize_dedup import (parse_mcd14ml_rows, parse_vxx14imgml_rows,
-                                  platform_from_vxx_filename)
+    from .normalize_dedup import parse_umd_text, platform_from_vxx_filename
     bboxes = bboxes or [b for c in S.TARGET_COUNTRIES for b in c.prefilter_boxes]
     out_dir = Path(paths.raw_stage_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -354,11 +416,18 @@ def fetch_umd_history(paths: DataPaths, years: list[int],
         return result
     result["method"] = session.method
     try:
-        files = walk_umd_tree(session)
+        files_all = walk_umd_tree(session)
+        files, superseded = select_latest_collections(files_all)
         if manifest:
             manifest.log("umd_archive", f"{session.method}://{S.UMD_FTP_HOST}",
                          "remote_walk",
-                         detail=json.dumps({k: len(v) for k, v in files.items()}))
+                         detail=json.dumps({
+                             "found": {k: len(v) for k, v in files_all.items()},
+                             "selected_latest_collection":
+                                 {k: len(v) for k, v in files.items()},
+                             "superseded_older_collection": len(superseded)}))
+        attempts: dict[str, int] = {}
+        failures: dict[str, list[str]] = {}
         years_set = set(int(y) for y in years)
         with tempfile.TemporaryDirectory(prefix="umd_") as tmp:
             for key, plist in files.items():
@@ -390,23 +459,42 @@ def fetch_umd_history(paths: DataPaths, years: list[int],
                                              f"{session.method}://"
                                              f"{S.UMD_FTP_HOST}/{rel}",
                                              session.method)
+                        attempts[key] = attempts.get(key, 0) + 1
                         if key == "MCD14ML" or key.startswith("V"):
-                            with gzip.open(tmp_path, "rt", errors="replace") as fh:
+                            opener = gzip.open if name.endswith(".gz") else open
+                            with opener(tmp_path, "rt", errors="replace") as fh:
                                 lines = fh.read().splitlines()
-                            df = (parse_mcd14ml_rows(lines) if key == "MCD14ML"
-                                  else parse_vxx14imgml_rows(
-                                      lines, platform_hint=(
-                                          platform_from_vxx_filename(name))))
+                            coll = collection_rank(rel)
+                            df = parse_umd_text(
+                                lines, key, platform_hint=(
+                                    None if key == "MCD14ML"
+                                    else platform_from_vxx_filename(name)),
+                                version_raw=(f"C{coll[0]}{coll[1] or ''}"
+                                             if coll != (0, 0) else None))
+                            n_lines = df.attrs.get("n_lines", 0)
+                            n_bad = df.attrs.get("n_bad_lines", 0)
+                            if n_lines and n_bad > UMD_MAX_BAD_LINE_FRACTION * n_lines:
+                                raise ValueError(
+                                    f"{n_bad}/{n_lines} unparseable lines; header="
+                                    f"{df.attrs.get('header')}; first line="
+                                    f"{lines[0][:160] if lines else ''!r}")
                             df = df[_in_boxes(df["latitude"], df["longitude"],
                                               bboxes)]
-                            if schema_validation_gate(df, name) or not len(df):
-                                df.to_parquet(dest, index=False,
-                                              compression="zstd")
-                                result["fires"].append(dest)
+                            if len(df) and not schema_validation_gate(df, name):
+                                raise ValueError("schema validation gate failed")
+                            df.to_parquet(dest, index=False, compression="zstd")
+                            result["fires"].append(dest)
+                            if manifest:
+                                manifest.log(f"{key}_parsed", rel, "parse",
+                                             detail=json.dumps({
+                                                 "lines": n_lines,
+                                                 "bad_lines": n_bad,
+                                                 "rows_in_target_boxes": len(df)}))
                         elif key in ("MOD14C8Q", "MYD14C8Q"):
                             meta = parse_cmg_filename(name)
                             if meta:
-                                sds = read_hdf4_sds(tmp_path, CMQ_CLOUD_LAYERS)
+                                sds = read_hdf4_sds(tmp_path, CMQ_CLOUD_LAYERS,
+                                                    required=("MeanCloudFraction",))
                                 f = parse_cloud_cmg(sds, meta["year"],
                                                     meta["period"],
                                                     meta["period_kind"])
@@ -417,7 +505,8 @@ def fetch_umd_history(paths: DataPaths, years: list[int],
                         elif key == "MCD64CMQ":
                             meta = parse_cmg_filename(name)
                             if meta:
-                                sds = read_hdf4_sds(tmp_path, CMQ_BURN_LAYERS)
+                                sds = read_hdf4_sds(tmp_path, CMQ_BURN_LAYERS,
+                                                    required=("BurnedArea",))
                                 f = parse_burned_area_cmg(sds, meta["year"],
                                                           meta["period"])
                                 result["burned"].append(
@@ -425,9 +514,18 @@ def fetch_umd_history(paths: DataPaths, years: list[int],
                                                 bboxes)])
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("UMD file %s failed: %s", rel, exc)
+                        failures.setdefault(key, []).append(f"{rel}: {exc}")
                         if manifest:
                             manifest.log(key, rel, session.method,
-                                         detail=str(exc), status="FAIL")
+                                         detail=str(exc)[:2000], status="FAIL")
+                        if (attempts.get(key, 0) >= UMD_FAIL_FAST
+                                and len(failures[key]) >= attempts[key]):
+                            msg = (f"first {attempts[key]} {key} files all failed "
+                                   "-- aborting instead of downloading the rest: "
+                                   + " | ".join(failures[key][:3]))
+                            if manifest:
+                                manifest.critical(key, msg)
+                            raise RuntimeError(msg) from exc
                     finally:
                         if kept is not None and tmp_path.exists() and \
                                 not kept.exists():
@@ -708,8 +806,13 @@ CMQ_CLOUD_LAYERS = ("MeanCloudFraction", "CorrFirePix", "CloudCorrFirePix", "Raw
 CMQ_BURN_LAYERS = ("BurnedArea", "QA", "UnmappedFraction")
 
 
-def read_hdf4_sds(path: str | Path, layer_names: tuple[str, ...]) -> dict:
-    """Read named SDS layers + attributes via pyhdf (lazy import, Env 1 only)."""
+def read_hdf4_sds(path: str | Path, layer_names: tuple[str, ...],
+                  required: tuple[str, ...] | None = None) -> dict:
+    """Read named SDS layers + attributes via pyhdf (lazy import, Env 1 only).
+
+    Layers not present in the file are skipped unless listed in
+    ``required`` (default: all), which raises with the file's actual layer
+    names so schema drift is diagnosable."""
     try:
         from pyhdf.SD import SD, SDC  # noqa: F401  (Env 1 only)
     except ImportError as exc:  # pragma: no cover - depends on Env 1 image
@@ -719,8 +822,16 @@ def read_hdf4_sds(path: str | Path, layer_names: tuple[str, ...]) -> dict:
         ) from exc
     sd = SD(str(path), SDC.READ)
     out: dict[str, tuple[dict, np.ndarray]] = {}
+    required = tuple(layer_names) if required is None else tuple(required)
     try:
+        available = set(sd.datasets().keys())
+        missing = [n for n in required if n not in available]
+        if missing:
+            raise KeyError(f"{Path(path).name}: missing SDS {missing}; "
+                           f"available {sorted(available)}")
         for name in layer_names:
+            if name not in available:
+                continue
             sds = sd.select(name)
             try:
                 attrs = {k: sds.attributes()[k] for k in sds.attributes()}
@@ -769,8 +880,8 @@ def parse_cloud_cmg(sds_layers: dict, year: int, period: int,
     lat_g, lon_g = np.meshgrid(lats[: cloud.shape[0]], lons[: cloud.shape[1]],
                                indexing="ij")
     df = pd.DataFrame({
-        "lat_025": lat_g.ravel().round(2),
-        "lon_025": lon_g.ravel().round(2),
+        "lat_025": lat_g.ravel().round(3),
+        "lon_025": lon_g.ravel().round(3),
         "cloud_frac": np.clip(cloud.ravel(), 0.0, 1.0),
         "year": year,
         "period": period,
@@ -785,17 +896,23 @@ def parse_burned_area_cmg(sds_layers: dict, year: int, month: int) -> pd.DataFra
     attrs, burn_raw = sds_layers["BurnedArea"]
     burn = apply_sds_scaling(attrs, burn_raw)      # scaled -> hectares
     burn_km2 = burn * 0.01                          # ha -> km^2 (readme 6.1.1)
-    qa_attrs, qa_raw = sds_layers["QA"]
-    qa = apply_sds_scaling(qa_attrs, qa_raw)
-    um_attrs, um_raw = sds_layers["UnmappedFraction"]
-    unmapped = apply_sds_scaling(um_attrs, um_raw)
-    umax = np.nanmax(unmapped) if np.isfinite(unmapped).any() else 0.0
-    unmapped = unmapped / 100.0 if umax > 1.0 else unmapped
+    if "QA" in sds_layers:
+        qa_attrs, qa_raw = sds_layers["QA"]
+        qa = apply_sds_scaling(qa_attrs, qa_raw)
+    else:                                           # optional layer
+        qa = np.full(burn.shape, np.nan)
+    if "UnmappedFraction" in sds_layers:
+        um_attrs, um_raw = sds_layers["UnmappedFraction"]
+        unmapped = apply_sds_scaling(um_attrs, um_raw)
+        umax = np.nanmax(unmapped) if np.isfinite(unmapped).any() else 0.0
+        unmapped = unmapped / 100.0 if umax > 1.0 else unmapped
+    else:
+        unmapped = np.full(burn.shape, np.nan)
     lat_g, lon_g = np.meshgrid(lats[: burn.shape[0]], lons[: burn.shape[1]],
                                indexing="ij")
     df = pd.DataFrame({
-        "lat_025": lat_g.ravel().round(2),
-        "lon_025": lon_g.ravel().round(2),
+        "lat_025": lat_g.ravel().round(3),
+        "lon_025": lon_g.ravel().round(3),
         "burned_area_km2": np.clip(burn_km2.ravel(), 0.0, None),
         "qa": qa.ravel(),
         "unmapped_fraction": np.clip(unmapped.ravel(), 0.0, 1.0),
@@ -964,12 +1081,14 @@ def download_cmr_granules(urls: list[str], tmp_dir: Path, bboxes,
                     for chunk in r.iter_content(1 << 20):
                         fh.write(chunk)
             if meta["product"] == "MCD64CMQ":
-                f = parse_burned_area_cmg(read_hdf4_sds(dest, CMQ_BURN_LAYERS),
+                f = parse_burned_area_cmg(read_hdf4_sds(dest, CMQ_BURN_LAYERS,
+                                                            required=("BurnedArea",)),
                                           meta["year"], meta["period"])
                 out["burned"].append(f[_in_boxes(f["lat_025"], f["lon_025"],
                                                  bboxes)])
             else:
-                f = parse_cloud_cmg(read_hdf4_sds(dest, CMQ_CLOUD_LAYERS),
+                f = parse_cloud_cmg(read_hdf4_sds(dest, CMQ_CLOUD_LAYERS,
+                                                  required=("MeanCloudFraction",)),
                                     meta["year"], meta["period"],
                                     meta["period_kind"])
                 f["platform"] = meta["product"][:3]

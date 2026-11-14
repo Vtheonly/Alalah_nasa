@@ -11,6 +11,7 @@ and solar-date midnight rollover across +-180 degrees.
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -490,3 +491,116 @@ def test_01_portolan_wkb_vectorized_decoder():
                                             pa.array(wkb[2:], pa.binary())]))
     for i, (px, py) in enumerate(pts):
         assert (x[i], y[i]) == (px, py) == _wkb_point(wkb[i])
+
+
+# ---------------------------------------------------------------- UMD archives
+MCD14ML_HEADER = "YYYYMMDD HHMM sat lat lon T21 T31 sample FRP conf type dn"
+
+
+def test_01_mcd14ml_header_line_is_skipped():
+    """Real UMD MCD14ML files start with a header line; it must be read as a
+    header (the Colab run failed every file on float('lat'))."""
+    rows = [MCD14ML_HEADER,
+            "20001101 0040 T  -29.160  -67.500  330.5  295.1   681.  25.3  74 0 D",
+            "20001101 0040 T  -29.170  -67.510  320.0  294.0  1200   10.0  50 0 N"]
+    df = parse_mcd14ml_rows(rows)
+    assert len(df) == 2 and df.attrs["n_bad_lines"] == 0
+    assert df.attrs["header"][:3] == ["YYYYMMDD", "HHMM", "sat"]
+    assert df.iloc[0]["platform"] == "Terra" and df.iloc[0]["acq_hhmm"] == 40
+    assert df.iloc[0]["sample_idx"] == 681.0 and df.iloc[1]["dn_source"] == "N"
+    assert df.iloc[0]["t_mir_k"] == 330.5 and df.iloc[0]["conf_num"] == 74.0
+
+
+def test_01_viirs_header_mapping_any_column_order_and_bad_lines():
+    """VIIRS archives are parsed by header names (C1/C2 layouts differ:
+    Line/Sample/T4/T5, no Sat column -> platform from the file name);
+    malformed lines are skipped and counted, not fatal."""
+    rows = ["YYYYMMDD,HHMM,Line,Sample,Lat,Lon,T4,T5,FRP,Conf,Type,Pixarea",
+            "20210814,1335,512,3200,-29.16,-67.50,331.2,290.4,6.2,n,0,0.21",
+            "20210814,1335,513,3201,-29.17,-67.49,320.1,289.0,3.1,h,2,0.22",
+            "garbage line without fields",
+            "20210814,1336,514,3202,not_a_lat,-67.48,320.1,289.0,3.1,l,0,0.22"]
+    from src.ingest.normalize_dedup import parse_umd_text
+    df = parse_umd_text(rows, "VJ114IMGML", platform_hint="NOAA-20")
+    assert len(df) == 2 and df.attrs["n_bad_lines"] == 2
+    r = df.iloc[0]
+    assert r["platform"] == "NOAA-20" and r["latitude"] == -29.16
+    assert r["t_mir_k"] == 331.2 and r["t_tir_k"] == 290.4
+    assert r["sample_idx"] == 3200.0 and r["pixarea_km2"] == 0.21
+    assert df.iloc[1]["type_raw"] == 2 and df.iloc[1]["conf_num"] == 95.0
+
+
+def test_01_umd_latest_collection_selected_once_per_month():
+    """C6 and C6.1 (and VIIRS C1 and C2) of the same month are never both
+    ingested -- that would double-count every detection."""
+    from src.ingest.download_data import collection_rank, select_latest_collections
+    files = {"MCD14ML": ["data/MODIS/C6/MCD14ML/MCD14ML.200011.006.03.txt.gz",
+                         "data/MODIS/C61/MCD14ML/MCD14ML.200011.061.01.txt.gz",
+                         "data/MODIS/C6/MCD14ML/MCD14ML.200012.006.03.txt.gz"],
+             "VNP14IMGML": ["data/VIIRS/C1/VNP14IMGML/VNP14IMGML.201201.C1.05.txt.gz",
+                            "data/VIIRS/C2/VNP14IMGML/VNP14IMGML.201201.C2.01.txt.gz"]}
+    assert collection_rank(files["MCD14ML"][1]) == (6, 1)
+    assert collection_rank(files["MCD14ML"][0]) == (6, 0)
+    sel, sup = select_latest_collections(files)
+    assert set(sel["MCD14ML"]) == {files["MCD14ML"][1], files["MCD14ML"][2]}
+    assert sel["VNP14IMGML"] == [files["VNP14IMGML"][1]]
+    assert len(sup) == 2
+
+
+class _FakeUMD:
+    """In-memory stand-in for UMDSession (no network)."""
+    method = "sftp"
+
+    def __init__(self, tree):
+        self.tree = tree                       # {remote_path: bytes}
+
+    def listdir(self, path):
+        pre = "" if path in (".", "") else path.rstrip("/") + "/"
+        kids = {}
+        for p in self.tree:
+            if p.startswith(pre):
+                head = p[len(pre):].split("/", 1)
+                kids[head[0]] = len(head) > 1
+        return sorted(kids.items())
+
+    def download(self, remote, dest):
+        Path(dest).write_bytes(self.tree[remote])
+        return dest
+
+    def close(self):
+        pass
+
+
+def test_01_fetch_umd_history_parses_headed_files_and_fails_fast(paths):
+    import gzip
+    from src.ingest import download_data as d
+    body = "\n".join([MCD14ML_HEADER,
+                      "20001101 0040 T -29.160 -67.500 330.5 295.1 681. 25.3 74 0 D",
+                      "20001101 0040 T 10.000 10.000 330.5 295.1 681. 25.3 74 0 D"])
+    tree = {f"data/MODIS/C61/MCD14ML/MCD14ML.2000{m:02d}.061.01.txt.gz":
+            gzip.compress(body.encode()) for m in (11, 12)}
+    man = d.ProvenanceManifest(paths.provenance_manifest)
+    res = d.fetch_umd_history(paths, [2000], man, session=_FakeUMD(tree))
+    assert len(res["fires"]) == 2
+    staged = pd.read_parquet(res["fires"][0])
+    assert len(staged) == 1                    # (10, 10) outside every box
+    assert any(e["product"] == "MCD14ML_parsed" for e in man.entries)
+    # every file unparseable -> abort after UMD_FAIL_FAST files
+    bad = {f"data/MODIS/C61/MCD14ML/MCD14ML.2001{m:02d}.061.01.txt.gz":
+           gzip.compress(b"this is not\nan MCD14ML file at all\n") for m in range(1, 13)}
+    with pytest.raises(RuntimeError, match="all failed"):
+        d.fetch_umd_history(paths, [2001], d.ProvenanceManifest(
+            paths.provenance_manifest), session=_FakeUMD(bad))
+
+
+def test_01_umd_rows_with_extra_trailing_fields_stay_aligned():
+    """Extra trailing fields / trailing delimiters must not shift columns."""
+    from src.ingest.normalize_dedup import parse_umd_text
+    rows = ["YYYYMMDD,HHMM,Sat,Lat,Lon,T_I4,T_I5,Sample,Pixarea,FRP,Conf,Type",
+            "20210814,1335,N,-29.1,-67.5,330,290,3200,0.2,7.5,n,0,EXTRA,MORE",
+            "junk",
+            "20210814,1336,N,-29.2,-67.6,331,291,3201,0.2,8.5,h,0,"]
+    df = parse_umd_text(rows, "VNP14IMGML")
+    assert len(df) == 2 and df.attrs["n_bad_lines"] == 1
+    assert df["latitude"].tolist() == [-29.1, -29.2]
+    assert df["frp_mw"].tolist() == [7.5, 8.5]
