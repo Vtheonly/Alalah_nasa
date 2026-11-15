@@ -700,3 +700,13 @@ Tests: 3 new in test_01 (redaction incl. manifest file, quota wait then
 success, quota give-up + explicit non-quota 400).
 User advice given: package was built private (KAGGLE_PUBLIC False); rotate
 the FIRMS MAP_KEY anyway (old Kaggle versions keep the old manifest).
+* Follow-up (same day): notebook-1 Kaggle auth failed with
+  `unrecognized arguments: --page-size 1` (the CLI on Colab lacks that
+  option) and the user's kaggle.json holds a NEW-style token (`KGAT_...`),
+  which the CLI only accepts via `~/.kaggle/access_token` /
+  `KAGGLE_API_TOKEN` (legacy-key auth would send it as a basic-auth key).
+  The auth cell now detects `KGAT_`, writes access_token + env var,
+  `pip install -U kaggle six` (kaggle 2.2.5 imports six without declaring
+  it), checks with `datasets list --mine --csv` only, and redacts the key
+  from any error text. Option parsing of list/create/version verified
+  against kaggle 2.2.5 (api.kaggle.com not reachable from this sandbox).
