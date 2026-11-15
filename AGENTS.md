@@ -620,3 +620,7 @@ real and synthetic data, synthetic never presented as evidence.
   + fallback off (its twin DB has no diagnostics).
 * Verified by Playwright screenshots of every page (no page errors). Basemap
   tiles (CARTO) need internet; hexagons render without them.
+* Follow-up: after staging, `run_normalization` ran silently for 30+ min on
+  Colab (2 vCPU, ~50 M detections, two passes). Not stuck: clipping is
+  0.1 s / 400k points against the NE 50 m polygons. Added progress lines
+  (pass 1 every 25 files, pass 2 every 12 months, final summary).

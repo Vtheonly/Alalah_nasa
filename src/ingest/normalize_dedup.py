@@ -871,8 +871,19 @@ def run_normalization(paths, staged_frames: list[pd.DataFrame] | None = None
     spool = Path(tempfile.mkdtemp(prefix="fh_norm_spool_",
                                   dir=str(out_root.parent)))
     n_in = 0
+    import time as _time
+    t0 = _time.time()
+    n_files = (len(list(Path(paths.raw_stage_dir).glob("*.parquet")))
+               if staged_frames is None and Path(paths.raw_stage_dir).is_dir()
+               else len(staged_frames or []))
+    logger.info("normalization pass 1/2: clip + spool %d staged files by month",
+                n_files)
     try:
         for k, (name, df) in enumerate(source):
+            if k % 25 == 0 or k + 1 == n_files:
+                logger.info("normalization pass 1/2: file %d/%d (%s), %d rows "
+                            "read, %.0f s", k + 1, n_files, name, n_in,
+                            _time.time() - t0)
             n_in += len(df)
             if not len(df):
                 continue
@@ -888,7 +899,15 @@ def run_normalization(paths, staged_frames: list[pd.DataFrame] | None = None
         audits, active = [], {p: [] for p in S.PLATFORM_INDEX}
         n_out = 0
         countries = set()
-        for d in sorted(spool.glob("ym=*")):
+        months = sorted(spool.glob("ym=*"))
+        logger.info("normalization pass 2/2: dedup + write %d months "
+                    "(%d rows read, %.0f s)", len(months), n_in,
+                    _time.time() - t0)
+        for i_m, d in enumerate(months):
+            if i_m % 12 == 0 or i_m + 1 == len(months):
+                logger.info("normalization pass 2/2: month %d/%d (%s), %d rows "
+                            "written, %.0f s", i_m + 1, len(months),
+                            d.name[3:], n_out, _time.time() - t0)
             df = pd.concat([pd.read_parquet(f) for f in sorted(d.glob("*.parquet"))],
                            ignore_index=True)
             df = science_tier_dominance_dedup(df)
@@ -913,6 +932,8 @@ def run_normalization(paths, staged_frames: list[pd.DataFrame] | None = None
     report = {"audit": audit, "platform_active_day": active,
               "n_rows": int(n_out), "n_rows_parsed": int(n_in),
               "n_countries": int(len(countries))}
+    logger.info("normalization done: %d rows in, %d rows out, %d countries, "
+                "%.0f s", n_in, n_out, len(countries), _time.time() - t0)
     (out_root / "ingestion_audit.json").write_text(json.dumps(
         {"audit": audit, "n_rows": int(n_out), "n_rows_parsed": int(n_in)},
         indent=2, default=str))
