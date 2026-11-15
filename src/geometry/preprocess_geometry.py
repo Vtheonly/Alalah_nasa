@@ -98,17 +98,64 @@ def static_flare_mask(df: pd.DataFrame, res: int = S.H3_FLARE_RES) -> np.ndarray
     (~0.74 km^2) absorb off-nadir geolocation drift.  ``is_static_industrial``
     is True for type_raw == 2 or (Y_m >= 3 years AND mean active days/year
     >= 15 AND day/night symmetry R_DN > 0.30).
+
+    Fully vectorized (factorize + bincount): the former per-cell Python
+    lambdas and per-row ``strftime`` took hours at tens of millions of
+    detections; this is O(n log n) with integer keys only.
     """
+    n = len(df)
+    type2 = df["type_raw"].to_numpy() == 2
+    if n == 0:
+        return type2
+    h3r8 = latlon_to_h3_int(df["latitude"].to_numpy(),
+                            df["longitude"].to_numpy(), res)
+    day = (pd.to_datetime(df["solar_date"]).to_numpy()
+           .astype("datetime64[D]").astype(np.int64))
+    dn = df["dn_flag"].to_numpy().astype(str)
+    static_ids = static_flare_cells(h3r8, day, dn)
+    return type2 | np.isin(h3r8, static_ids)
+
+
+def static_flare_cells(h3r8: np.ndarray, day: np.ndarray,
+                       dn: np.ndarray) -> np.ndarray:
+    """Res-8 cell ids meeting the static-industrial rule from per-detection
+    arrays (``day``: integer solar day, ``dn``: 'D'/'N').  Separate so the
+    rule can be evaluated over ALL years from lean arrays, then applied to
+    one partition at a time (:func:`preprocess_partitioned`)."""
+    if len(h3r8) == 0:
+        return np.array([], dtype=np.int64)
+    day = np.asarray(day, dtype=np.int64)
+    year = (day.astype("datetime64[D]").astype("datetime64[Y]")
+            .astype(np.int64))
+    dn = np.asarray(dn).astype(str)
+    cell, ucell = pd.factorize(np.asarray(h3r8), sort=False)
+    n_cells = len(ucell)
+    # distinct (cell, day) and (cell, year) pairs -> per-cell counts
+    cd = np.unique(cell.astype(np.int64) * (1 << 32) + (day - day.min()))
+    active_days = np.bincount((cd >> 32).astype(np.int64), minlength=n_cells)
+    cy = np.unique(cell.astype(np.int64) * (1 << 16) + (year - year.min()))
+    active_years = np.bincount((cy >> 16).astype(np.int64), minlength=n_cells)
+    n_d = np.bincount(cell, weights=(dn == "D").astype(float),
+                      minlength=n_cells)
+    n_n = np.bincount(cell, weights=(dn == "N").astype(float),
+                      minlength=n_cells)
+    mean_days_per_year = active_days / np.maximum(1, active_years)
+    r_dn = np.minimum(n_d, n_n) / (np.maximum(n_d, n_n) + 1.0)
+    static = ((active_years >= S.FLARE_MIN_YEARS)
+              & (mean_days_per_year >= S.FLARE_MIN_DAYS_PER_YEAR)
+              & (r_dn > S.FLARE_MIN_DN_SYMMETRY))
+    return np.asarray(ucell, dtype=np.int64)[static]
+
+
+def _static_flare_mask_reference(df: pd.DataFrame,
+                                 res: int = S.H3_FLARE_RES) -> np.ndarray:
+    """Original groupby/lambda implementation (kept for equivalence tests)."""
     h3r8 = latlon_to_h3_int(df["latitude"].to_numpy(),
                             df["longitude"].to_numpy(), res)
     dates = pd.to_datetime(df["solar_date"])
-    years = dates.dt.year
-    doy = dates.dt.dayofyear
-    days = dates.dt.strftime("%Y-%m-%d")
-    dn = df["dn_flag"].to_numpy()
-
-    grp = pd.DataFrame({"m": h3r8, "year": years, "doy": doy, "day": days,
-                        "dn": dn})
+    grp = pd.DataFrame({"m": h3r8, "year": dates.dt.year,
+                        "day": dates.dt.strftime("%Y-%m-%d"),
+                        "dn": df["dn_flag"].to_numpy()})
     per_cell = grp.groupby("m").agg(
         active_days=("day", "nunique"),
         active_years=("year", "nunique"),
@@ -171,6 +218,44 @@ def cluster_pass(ecef: np.ndarray, areas: np.ndarray, tracks: np.ndarray,
     r_event = float(1.4 * np.sqrt(max(areas.max(), 1e-6)))
     tree = cKDTree(ecef)
     pairs = tree.query_pairs(r=max(r_event, 1.0 * S.BOWTIE_AREA_KM2), output_type="ndarray")
+    # Vectorized over all candidate pairs (the former per-pair Python loop
+    # was the hot spot at tens of millions of pixels); same edge rules.
+    pi, pj = pairs[:, 0], pairs[:, 1]
+    diff = ecef[pi] - ecef[pj]
+    dij = np.sqrt(np.einsum("ij,ij->i", diff, diff))
+    sq = np.sqrt(areas)
+    # ---- event clustering graph -----------------------------------------
+    ev = dij <= S.CLUSTER_D_FACTOR * np.maximum(sq[pi], sq[pj])
+    if ev.any():
+        g = coo_matrix((np.ones(int(ev.sum())), (pi[ev], pj[ev])), shape=(n, n))
+        ncomp, labels = connected_components(g, directed=False)
+    else:
+        labels = np.arange(n, dtype=np.int64)
+    # ---- bow-tie graph (MODIS, A > 1.5 km^2) -----------------------------
+    if str(sensor_family).upper().startswith("MOD"):
+        big = areas > S.BOWTIE_AREA_KM2
+        if big.any():
+            thr = S.BOWTIE_TRACK_FACTOR * 0.5 * (tracks[pi] + tracks[pj])
+            e = big[pi] & big[pj] & (dij < thr)
+            deg = (np.bincount(pi[e], minlength=n)
+                   + np.bincount(pj[e], minlength=n))
+            omega = 1.0 / (1.0 + deg.astype(np.float64))
+    return omega, labels
+
+
+# ---------------------------------------------------------------------------
+# Saturation classification (readme 5.1.3.3)
+# ---------------------------------------------------------------------------
+def _cluster_pass_reference(ecef, areas, tracks, sensor_family):
+    """Original per-pair loop implementation (equivalence tests only)."""
+    n = len(ecef)
+    omega = np.ones(n, dtype=np.float64)
+    labels = np.arange(n, dtype=np.int64)
+    if n < 2:
+        return omega, labels
+    r_event = float(1.4 * np.sqrt(max(areas.max(), 1e-6)))
+    tree = cKDTree(ecef)
+    pairs = tree.query_pairs(r=max(r_event, 1.0 * S.BOWTIE_AREA_KM2), output_type="ndarray")
     # ---- event clustering graph -----------------------------------------
     ev_src, ev_dst = [], []
     for i, j in pairs:
@@ -199,9 +284,6 @@ def cluster_pass(ecef: np.ndarray, areas: np.ndarray, tracks: np.ndarray,
     return omega, labels
 
 
-# ---------------------------------------------------------------------------
-# Saturation classification (readme 5.1.3.3)
-# ---------------------------------------------------------------------------
 def saturation_flags(sensor_family, t_mir_k, frp_mw):
     """``i4_m13_fallback`` (VIIRS M13 retrieval; sigma x 1.35) and Tobit
     right-censored ``sat_flag``."""
@@ -220,8 +302,12 @@ def saturation_flags(sensor_family, t_mir_k, frp_mw):
 # ---------------------------------------------------------------------------
 # Full preprocessing
 # ---------------------------------------------------------------------------
-def preprocess_observations(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Canonical detections -> (Product 1 base, pass_observations)."""
+def preprocess_observations(df: pd.DataFrame, static_cells=None
+                            ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Canonical detections -> (Product 1 base, pass_observations).
+
+    ``static_cells``: Res-8 static-industrial cell ids computed over the
+    whole archive (partitioned runs); None -> computed from ``df``."""
     if df.empty:
         prov = pd.DataFrame(columns=PROV_COLUMNS)
         pas = pd.DataFrame(columns=PASS_COLUMNS)
@@ -230,7 +316,13 @@ def preprocess_observations(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFram
 
     # ---- hygiene flags (kept in Product 1, excluded from biomass fusion)
     out["is_sama_filtered"] = sama_filter_mask(out)
-    out["is_static_industrial"] = static_flare_mask(out)
+    if static_cells is None:
+        out["is_static_industrial"] = static_flare_mask(out)
+    else:
+        h3r8 = latlon_to_h3_int(out["latitude"].to_numpy(),
+                                out["longitude"].to_numpy(), S.H3_FLARE_RES)
+        out["is_static_industrial"] = ((out["type_raw"].to_numpy() == 2)
+                                       | np.isin(h3r8, static_cells))
     type_excluded = out["type_raw"].isin([1, 3]).to_numpy()
     out["is_biomass"] = (~(type_excluded | out["is_sama_filtered"].to_numpy()
                            | out["is_static_industrial"].to_numpy()))
@@ -276,6 +368,101 @@ def preprocess_observations(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFram
 
     pas = _aggregate_passes(bio)
     return prov, pas
+
+
+def _active_fire_files_by_year(root) -> dict[int, list]:
+    """``active_fires/country_iso=X/year=Y/*.parquet`` grouped by year."""
+    import re
+    from pathlib import Path
+    groups: dict[int, list] = {}
+    for f in sorted(Path(root).rglob("*.parquet")):
+        m = re.search(r"year=(\d{4})", str(f))
+        groups.setdefault(int(m.group(1)) if m else -1, []).append(f)
+    return groups
+
+
+def _read_parquets(files, columns=None) -> pd.DataFrame:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    if not files:
+        return pd.DataFrame(columns=columns or [])
+    tables = [pq.read_table(f, columns=columns, partitioning=None) for f in files]
+    t = pa.concat_tables(tables, promote_options="permissive")
+    del tables
+    return t.to_pandas(self_destruct=True, split_blocks=True,
+                       deduplicate_objects=True)
+
+
+def preprocess_partitioned(active_fires_dir, prov_dir) -> tuple[pd.DataFrame, dict]:
+    """Bounded-memory :func:`preprocess_observations` over the whole
+    ``active_fires/`` archive (tens of millions of detections).
+
+    1. Lean pass over every partition (5 columns) -> the Res-8
+       static-industrial cell set over ALL years (the rule needs >= 3 years).
+    2. One UTC year at a time (all countries): full preprocess with that
+       global cell set; Product-1 base rows written to
+       ``prov_dir/year=YYYY.parquet``; pass ids / event cluster ids offset so
+       they stay globally unique.  Passes last minutes, so a year boundary
+       can only split a pass that straddles 00:00 UTC on 1 January.
+    Returns ``(pass_obs, summary)``; the provenance is NOT held in memory.
+    """
+    import shutil
+    from pathlib import Path
+    groups = _active_fire_files_by_year(active_fires_dir)
+    lean_cols = ["latitude", "longitude", "acq_date", "acq_hhmm", "type_raw"]
+    cells, days, dns = [], [], []
+    for year in sorted(groups):
+        d = _read_parquets(groups[year], lean_cols)
+        if not len(d):
+            continue
+        _sh, sdate, dn, _sza = compute_solar_time_and_sza(
+            d["acq_date"].to_numpy(dtype="datetime64[D]"),
+            d["acq_hhmm"].to_numpy(dtype=np.int64),
+            d["longitude"].to_numpy(dtype=np.float64),
+            d["latitude"].to_numpy(dtype=np.float64))
+        cells.append(latlon_to_h3_int(d["latitude"].to_numpy(),
+                                      d["longitude"].to_numpy(),
+                                      S.H3_FLARE_RES))
+        days.append(np.asarray(sdate, dtype="datetime64[D]").astype(np.int64))
+        dns.append(np.asarray(dn).astype("U1"))
+        del d
+    static_ids = (static_flare_cells(np.concatenate(cells),
+                                     np.concatenate(days),
+                                     np.concatenate(dns))
+                  if cells else np.array([], dtype=np.int64))
+    del cells, days, dns
+    prov_dir = Path(prov_dir)
+    if prov_dir.exists():
+        shutil.rmtree(prov_dir) if prov_dir.is_dir() else prov_dir.unlink()
+    prov_dir.mkdir(parents=True)
+    pass_parts, n_rows, pass_off, event_off = [], 0, 0, 0
+    for year in sorted(groups):
+        df = _read_parquets(groups[year])
+        df = df.drop(columns=[c for c in ("year",) if c in df.columns])
+        if not len(df):
+            continue
+        prov, pas = preprocess_observations(df, static_cells=static_ids)
+        del df
+        bio = prov["pass_id"].to_numpy() >= 0
+        if bio.any():
+            pid = prov["pass_id"].to_numpy(np.int64)
+            eid = prov["event_cluster_id"].to_numpy(np.int64)
+            prov.loc[bio, "pass_id"] = pid[bio] + pass_off
+            prov.loc[bio, "event_cluster_id"] = eid[bio] + event_off
+            pass_off = int(prov.loc[bio, "pass_id"].max()) + 1
+            event_off = int(prov.loc[bio, "event_cluster_id"].max()) + 1
+        prov.to_parquet(prov_dir / f"year={year}.parquet", index=False,
+                        compression="zstd")
+        n_rows += len(prov)
+        pass_parts.append(pas)
+        del prov
+    pass_obs = (pd.concat(pass_parts, ignore_index=True) if pass_parts
+                else pd.DataFrame(columns=PASS_COLUMNS))
+    key = ["h3_index", "solar_date", "platform", "dn_flag"]
+    n_dup = int(pass_obs.duplicated(key).sum()) if len(pass_obs) else 0
+    return pass_obs, {"provenance_rows": n_rows, "years": sorted(groups),
+                      "static_flare_cells": int(len(static_ids)),
+                      "duplicate_pass_keys_across_years": n_dup}
 
 
 def _aggregate_passes(bio: pd.DataFrame) -> pd.DataFrame:

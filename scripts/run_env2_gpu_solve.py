@@ -37,6 +37,19 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger("run_env2_gpu_solve")
 
 
+# Provenance columns used by finalize_monthly (country attribution, NRT
+# gap-fill / revision flags); Product 1 is streamed separately.
+PROV_FINALIZE_COLUMNS = ["h3_index", "country_iso", "data_tier", "solar_date",
+                         "acq_date"]
+
+
+def read_prov_columns(path, columns=PROV_FINALIZE_COLUMNS) -> pd.DataFrame:
+    import pyarrow.dataset as ds
+    dset = ds.dataset(str(path), format="parquet")
+    cols = [c for c in columns if c in dset.schema.names]
+    return dset.to_table(columns=cols).to_pandas(self_destruct=True)
+
+
 def load_env2_inputs(paths):
     with open(paths.priors_pkl, "rb") as fh:
         blob = pickle.load(fh)
@@ -49,7 +62,7 @@ def load_env2_inputs(paths):
             "hex_pyromes": pd.read_parquet(paths.pyromes_parquet),
             "pass_cal": pd.read_parquet(paths.pass_calibrated_parquet),
             "pass_obs": pd.read_parquet(paths.pass_obs_parquet),
-            "prov": pd.read_parquet(paths.provenance_base_parquet),
+            "prov": read_prov_columns(paths.provenance_base_parquet),
             "artifacts": artifacts, "cloud_df": cloud_df}
 
 
@@ -118,8 +131,16 @@ def main(argv=None) -> int:
         workers_per_gpu=args.workers_per_gpu, max_sweeps=args.max_sweeps)
     logger.info("solve + folds done (%.0fs); c_modis=%s c_multi=%s",
                 time.time() - t0, h["c_modis"], h["c_multi"])
+    out_dir = Path(paths.duckdb_path).parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    p1_path = out_dir / f"{ex.PRODUCT_TABLES['product1']}.parquet"
+    n_p1 = ex.write_product1_streamed(paths.provenance_base_parquet,
+                                      inp["pass_cal"], p1_path)
+    logger.info("Product 1 streamed: %d detections -> %s", n_p1, p1_path)
+    inp["prov"] = None
     products = ex.build_products(h["monthly"], h["daily"], inp["pass_obs"],
-                                 inp["prov"], inp["pass_cal"])
+                                 None, inp["pass_cal"],
+                                 product1=str(p1_path))
     written = ex.export_duckdb(products, paths.duckdb_path,
                                parquet_dir=str(Path(paths.duckdb_path).parent),
                                diagnostics={"timing_gate": gate,

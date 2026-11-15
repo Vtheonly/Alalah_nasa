@@ -489,3 +489,50 @@ Tests: test_01 45 passed (new: fast-path equivalence, malformed-row
 fallback, batched MCD14ML, negative FRP, resume counting with corrupt new
 months + zero re-downloads, streamed cloud assembly == in-memory
 finalize + climatology).
+
+### Env 2 (Kaggle) real-scale memory / speed (same session)
+
+Scale estimate from the live run: VIIRS months carry 230-415k detections in
+the target boxes (e.g. VNP14IMGML 201906 / 201907), so the clipped archive
+is ~50-60 M detections. Measured on the old code: ~0.9 KB RAM per detection
+held (prov + passes) and ~1.8 KB peak during preprocess -> ~50-100 GB, plus
+hours in two pure-Python hot loops. Changes (all verified EXACT):
+
+* `static_flare_mask`: factorize + bincount instead of per-cell lambdas +
+  per-row strftime (39x faster; identical mask; `_static_flare_mask_reference`
+  kept for the equivalence test).
+* `cluster_pass`: vectorized over all KD-tree pairs instead of a per-pair
+  Python loop (40x faster; identical labels / bow-tie weights;
+  `_cluster_pass_reference` kept).
+* `preprocess_partitioned`: lean 5-column all-years pass -> static Res-8
+  cell set (`static_flare_cells`), then one UTC year at a time; provenance
+  written as `obs_provenance_base.parquet/year=YYYY.parquet` (a DIRECTORY
+  now; `pd.read_parquet` / `pyarrow.dataset` read it transparently); pass /
+  event ids offset to stay globally unique; duplicate pass keys across
+  years are counted and logged (0 expected: passes never straddle solar
+  midnight).
+* `run_env2_cpu_prep.py`: audit/INV-04 calendar from 6 columns; `prov_bio`
+  loaded with the 14 columns pyromes + calibration use
+  (`PROV_BIO_COLUMNS`, biomass filter pushed into the Parquet scan).
+  Readers use `partitioning=None` (hive dirs `country_iso=X/year=Y` would
+  otherwise add dictionary-typed duplicate columns -> schema merge error).
+* `run_env2_gpu_solve.py`: finalize gets 5 provenance columns
+  (`PROV_FINALIZE_COLUMNS`); Product 1 is streamed partition by partition
+  (`export_duckdb.write_product1_streamed`); `export_duckdb` accepts a
+  pre-written Parquet path.
+* `priors.cloud_fraction_matrix`: the cloud table (~2e7 rows real) is
+  indexed ONCE per table object (`_cloud_index`, sorted CMG bins) and each
+  chunk extracts only its bins (identical matrices / source codes).
+* Notebook 2 cleanup removes the provenance directory with `rmtree`.
+
+Verification: 3-year twin staged as Env 1 output, `cpu_prep -> gpu_solve ->
+validate` run with the new code AND the previous commit (git worktree):
+all 8 output Parquets identical row-for-row (provenance, passes, calibrated
+passes, daily, monthly, uncertainty, pyromes, Product 1); diagnostics.json
+equal to ~1e-13 relative (summation order). New equivalence tests in
+test_02 (flare mask, cluster_pass, cloud index, partitioned == monolithic).
+2 M realistic detections: preprocess 30 s. NOT measured at the full real
+scale here (no real data in this sandbox): remaining full-size in-RAM
+tables on Kaggle are `prov_bio` (14 cols, ~110 B/row) inside calibration,
+pass_obs / pass_calibrated (one row per cell-day-platform-dn) and the cloud
+table; DuckDB builds the Product 1 table out-of-core.

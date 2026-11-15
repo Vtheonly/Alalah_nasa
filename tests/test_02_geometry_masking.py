@@ -326,3 +326,134 @@ def test_02_sza_day_of_year_jan1_is_doy1():
     omega = np.deg2rad(15.0 * et1[0] / 60.0)
     expect = np.rad2deg(np.arccos(np.cos(decl1[0]) * np.cos(omega)))
     assert sza[0] == pytest.approx(expect, abs=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# Real-scale vectorizations must be EXACT replacements of the originals
+# ---------------------------------------------------------------------------
+def test_02_static_flare_mask_vectorized_equals_reference():
+    import numpy as np
+    import pandas as pd
+    from src.geometry import preprocess_geometry as pg
+    rng = np.random.default_rng(3)
+    n = 60000
+    fl = rng.integers(0, 120, n // 2)
+    lat = np.r_[28 + fl * 0.01, rng.uniform(-30, 0, n - n // 2)]
+    lon = np.r_[5 + fl * 0.01, rng.uniform(-60, -40, n - n // 2)]
+    days = (pd.to_datetime("2012-01-01")
+            + pd.to_timedelta(rng.integers(0, 4000, n), "D"))
+    df = pd.DataFrame({"latitude": lat, "longitude": lon,
+                       "solar_date": days.values.astype("datetime64[D]"),
+                       "dn_flag": rng.choice(["D", "N"], n),
+                       "type_raw": rng.choice([0, 0, 0, 2], n)})
+    a = pg.static_flare_mask(df)
+    assert np.array_equal(a, pg._static_flare_mask_reference(df))
+    assert a[: n // 2].mean() > 0.9 and a[n // 2:].mean() < 0.35
+
+
+def test_02_cluster_pass_vectorized_equals_reference():
+    import numpy as np
+    from src.geometry import preprocess_geometry as pg
+    from src.geometry.preprocess_geometry import latlon_to_ecef
+    rng = np.random.default_rng(7)
+    for trial in range(12):
+        n = int(rng.integers(2, 800))
+        ecef = latlon_to_ecef(-10 + rng.normal(0, 0.03, n),
+                              -55 + rng.normal(0, 0.03, n))
+        fam = "MODIS" if trial % 2 else "VIIRS"
+        areas = (rng.uniform(0.9, 4.0, n) if fam == "MODIS"
+                 else np.full(n, 0.18))
+        a = pg.cluster_pass(ecef, areas, np.sqrt(areas), fam)
+        b = pg._cluster_pass_reference(ecef, areas, np.sqrt(areas), fam)
+        assert np.array_equal(a[0], b[0]) and np.array_equal(a[1], b[1])
+
+
+def test_02_cloud_matrix_index_cache_is_exact_and_tracks_table():
+    """The per-table cloud index gives the same matrix as a fresh table
+    copy and is rebuilt (not reused) for a different table object."""
+    import numpy as np
+    import pandas as pd
+    from src.engine import priors as pr
+    rng = np.random.default_rng(5)
+    lb = -30 + 0.25 * np.arange(20) + 0.125
+    L, O = np.meshgrid(lb, lb - 30)
+    cloud = pd.concat([pd.DataFrame({"lat_025": L.ravel(), "lon_025": O.ravel(),
+                                     "year": 2015, "period": m,
+                                     "period_kind": "month",
+                                     "cloud_frac": rng.random(L.size)})
+                       for m in range(1, 13)], ignore_index=True)
+    cl, co = rng.uniform(-30, -25, 50), rng.uniform(-60, -55, 50)
+    dates = pd.date_range("2015-01-01", "2015-12-31")
+    a, _ = pr.cloud_fraction_matrix(cl, co, dates, cloud, None)
+    b, _ = pr.cloud_fraction_matrix(cl, co, dates, cloud.copy(), None)
+    assert np.array_equal(a, b, equal_nan=True)
+    c, _ = pr.cloud_fraction_matrix(cl, co, dates,
+                                    cloud.assign(cloud_frac=0.25), None)
+    assert np.allclose(c, 0.25)
+    # spot check: a cell's daily value is its CMG bin's monthly value
+    lat_c, lon_c = pr.cmg_bin_centers(cl[:1], co[:1])
+    row = cloud[(cloud.lat_025 == lat_c[0]) & (cloud.lon_025 == lon_c[0])
+                & (cloud.period == 7)]
+    assert np.isclose(a[0, dates.get_loc("2015-07-15")], row.cloud_frac.iloc[0])
+
+
+def test_02_partitioned_preprocess_equals_monolithic(tmp_path):
+    """preprocess_partitioned (one year at a time, static-flare cells from a
+    lean all-years pass) == preprocess_observations on everything at once:
+    same pass table, same provenance flags/weights, same event grouping."""
+    import numpy as np
+    import pandas as pd
+    from src.geometry import preprocess_geometry as pg
+    from src.ingest.normalize_dedup import CANONICAL_COLUMNS
+    rng = np.random.default_rng(11)
+    npass, n = 900, 30000
+    days = pd.date_range("2012-01-20", "2014-12-31").strftime("%Y-%m-%d").to_numpy()
+    p_plat = rng.choice(["SNPP", "Terra", "Aqua"], npass)
+    p_day = days[rng.integers(0, len(days), npass)]
+    p_hhmm = np.where(rng.random(npass) < .5, 1630, 430)
+    p_lat = rng.uniform(-11, -9, npass)
+    p_lon = rng.uniform(-56, -54, npass)
+    pid = rng.integers(0, npass, n)
+    flare = rng.random(n) < 0.3          # a persistent multi-year flare site
+    fam = np.where(np.isin(p_plat[pid], ["Terra", "Aqua"]), "MODIS", "VIIRS")
+    df = pd.DataFrame({
+        "country_iso": "BRA", "sensor_family": fam, "platform": p_plat[pid],
+        "data_tier": "ML_SCIENCE",
+        "latitude": np.where(flare, -10.5, p_lat[pid] + rng.normal(0, .02, n)),
+        "longitude": np.where(flare, -55.5, p_lon[pid] + rng.normal(0, .02, n)),
+        "acq_date": p_day[pid], "acq_hhmm": p_hhmm[pid] + rng.integers(0, 4, n),
+        "t_mir_k": 330.0, "t_tir_k": 295.0, "scan_km": np.nan,
+        "track_km": np.nan, "sample_idx": rng.integers(0, 3200, n).astype(float),
+        "pixarea_km2": np.where(fam == "VIIRS", .2, 1.5),
+        "frp_mw": rng.gamma(1, 10, n), "conf_raw": "n", "conf_num": 80.0,
+        "type_raw": 0, "version_raw": "C2",
+        "ingest_ts": "2026-11-15T00:00:00Z"})[CANONICAL_COLUMNS]
+    root = tmp_path / "active_fires"
+    year = df["acq_date"].str[:4]
+    for y, g in df.groupby(year):
+        d = root / "country_iso=BRA" / f"year={y}"
+        d.mkdir(parents=True)
+        g.to_parquet(d / "part.parquet", index=False)
+    ref_prov, ref_pass = pg.preprocess_observations(
+        pd.concat([g for _, g in df.groupby(year)], ignore_index=True))
+    pas, info = pg.preprocess_partitioned(root, tmp_path / "prov")
+    got_prov = pd.read_parquet(tmp_path / "prov")
+    assert info["provenance_rows"] == len(ref_prov) == len(got_prov)
+    assert info["duplicate_pass_keys_across_years"] == 0
+    assert info["static_flare_cells"] >= 1
+    assert ref_prov["is_static_industrial"].any()
+    key = ["h3_index", "solar_date", "platform", "dn_flag"]
+    a = ref_pass.sort_values(key).reset_index(drop=True)
+    b = pas.sort_values(key).reset_index(drop=True)
+    pd.testing.assert_frame_equal(a, b, check_dtype=False)
+    order = ["platform", "acq_date", "acq_hhmm", "latitude", "longitude", "frp_mw"]
+    r = ref_prov.sort_values(order).reset_index(drop=True)
+    g = got_prov.sort_values(order).reset_index(drop=True)
+    for c in ("is_static_industrial", "is_biomass", "bowtie_weight", "h3_index",
+              "dn_flag", "vza_deg"):
+        assert (r[c].to_numpy() == g[c].to_numpy()).all(), c
+    # same grouping of detections into events (ids differ by offsets only)
+    assert (pd.factorize(r["event_cluster_id"])[0]
+            == pd.factorize(g["event_cluster_id"])[0]).all()
+    bio = g["pass_id"] >= 0
+    assert g.loc[bio, "event_cluster_id"].is_unique is False   # real clusters

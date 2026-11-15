@@ -53,20 +53,33 @@ PRODUCT3_COLUMNS = [
 ]
 
 
-def build_product1(prov: pd.DataFrame, pass_cal: pd.DataFrame) -> pd.DataFrame:
+def product1_gain_table(pass_cal: pd.DataFrame) -> pd.DataFrame | None:
+    """Per (h3, solar_date, platform, dn) forward gain / obs sigma /
+    reliability joined onto every detection of Product 1."""
+    if not len(pass_cal):
+        return None
+    key = pass_cal[["h3_index", "solar_date", "platform", "dn_flag",
+                    "mu_gain_det", "sigma2", "w_mean"]].copy()
+    key["solar_date"] = pd.to_datetime(key["solar_date"]).dt.strftime(
+        "%Y-%m-%d")
+    gain = key.groupby(["h3_index", "solar_date", "platform", "dn_flag"],
+                       as_index=False).agg(
+        forward_gain_c=("mu_gain_det", "mean"),
+        sigma2_mean=("sigma2", "mean"),
+        reliability_prob=("w_mean", "mean"))
+    gain["obs_sigma"] = np.sqrt(gain.pop("sigma2_mean").to_numpy(float))
+    return gain
+
+
+def build_product1(prov: pd.DataFrame, pass_cal: pd.DataFrame,
+                   gain: pd.DataFrame | None = None) -> pd.DataFrame:
     """Product 1: raw provenance + derived diagnostics."""
     p1 = prov.copy()
     # reliability + forward gain + obs sigma joined from the calibrated pass
     # table (per detection, via h3/date/platform/dn groups)
-    if len(pass_cal):
-        key = pass_cal.copy()
-        key["solar_date"] = pd.to_datetime(key["solar_date"]).dt.strftime(
-            "%Y-%m-%d")
-        gain = key.groupby(["h3_index", "solar_date", "platform", "dn_flag"],
-                           as_index=False).agg(
-            forward_gain_c=("mu_gain_det", "mean"),
-            obs_sigma=("sigma2", lambda s: float(np.sqrt(np.mean(s)))),
-            reliability_prob=("w_mean", "mean"))
+    if gain is None and len(pass_cal):
+        gain = product1_gain_table(pass_cal)
+    if gain is not None:
         p1["solar_date_str"] = pd.to_datetime(
             p1["solar_date"]).dt.strftime("%Y-%m-%d")
         p1 = p1.merge(gain, left_on=["h3_index", "solar_date_str", "platform",
@@ -82,6 +95,39 @@ def build_product1(prov: pd.DataFrame, pass_cal: pd.DataFrame) -> pd.DataFrame:
         p1[col] = p1[col].fillna(default)
     keep = [c for c in PRODUCT1_COLUMNS if c in p1.columns]
     return p1[keep]
+
+
+def write_product1_streamed(prov_source, pass_cal: pd.DataFrame,
+                            out_path) -> int:
+    """Product 1 written one provenance partition at a time
+    (``prov_source``: the partitioned ``provenance_base.parquet`` directory
+    or a single file) -> ``out_path``; tens of millions of detections never
+    sit in RAM together.  Returns the row count."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from pathlib import Path as _P
+    src = _P(prov_source)
+    files = sorted(src.glob("*.parquet")) if src.is_dir() else [src]
+    gain = product1_gain_table(pass_cal)
+    out_path = _P(out_path)
+    tmp = out_path.with_name(out_path.name + ".part")
+    writer, n = None, 0
+    try:
+        for f in files:
+            p1 = build_product1(pd.read_parquet(f), pass_cal, gain)
+            t = pa.Table.from_pandas(p1, preserve_index=False)
+            if writer is None:
+                writer = pq.ParquetWriter(tmp, t.schema, compression="zstd")
+            else:
+                t = t.select(writer.schema.names).cast(writer.schema)
+            writer.write_table(t)
+            n += len(p1)
+    finally:
+        if writer is not None:
+            writer.close()
+    if writer is not None:
+        tmp.replace(out_path)
+    return n
 
 
 def sparse_daily_filter(daily: pd.DataFrame, pass_obs: pd.DataFrame,
@@ -124,7 +170,7 @@ def build_products(monthly: pd.DataFrame, daily: pd.DataFrame,
                    pass_obs: pd.DataFrame, prov: pd.DataFrame,
                    pass_cal: pd.DataFrame, priors: dict | None = None,
                    artifacts: dict | None = None, cloud_df=None,
-                   t_days: int = S.T_DAYS) -> dict:
+                   t_days: int = S.T_DAYS, product1=None) -> dict:
     """Assemble Products 1-3 from the FINALIZED monthly frame
     (:func:`src.engine.conformal.finalize_monthly`) and the sparse daily
     posterior rows.  No defaults are fabricated: missing diagnostics raise.
@@ -133,7 +179,8 @@ def build_products(monthly: pd.DataFrame, daily: pd.DataFrame,
     if missing:
         raise ValueError("monthly frame is not finalized (missing "
                          f"{missing}); run conformal.finalize_monthly first")
-    product1 = build_product1(prov, pass_cal)
+    product1 = (product1 if product1 is not None
+                else build_product1(prov, pass_cal))
     m = monthly
     product2_monthly = m[[c for c in PRODUCT2_MONTHLY_COLUMNS
                           if c in m.columns]].reset_index(drop=True)
@@ -189,7 +236,13 @@ def export_duckdb(products: dict, duckdb_path, parquet_dir=None,
     for name, df in products.items():
         table = PRODUCT_TABLES[name]
         path = os.path.join(out_dir, f"{table}.parquet")
-        df.to_parquet(path, index=False, compression="zstd")
+        if isinstance(df, (str, os.PathLike)):
+            # already written (streamed Product 1)
+            if os.path.abspath(str(df)) != os.path.abspath(path):
+                import shutil
+                shutil.copyfile(str(df), path)
+        else:
+            df.to_parquet(path, index=False, compression="zstd")
         parquet_paths[table] = path
     centers = hex_centers_frame(products["product2_monthly"])
     con = duckdb.connect(duckdb_path)

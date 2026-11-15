@@ -105,6 +105,43 @@ def build_cloud_clim_lookup(clim_df: pd.DataFrame | None):
     return dict(zip(keys, clim_df["cloud_frac_clim"].to_numpy(dtype=float)))
 
 
+_CLOUD_INDEX_CACHE: dict = {}
+
+
+def _cloud_index(tbl: pd.DataFrame | None, kind: str):
+    """``(sorted bin ids, period codes, values)`` of one table / period kind,
+    built ONCE per table object and reused by every chunk (the staged
+    2000-2026 table has ~2e7 rows; re-deriving bin ids per call dominated
+    the chunk build).  ``kind``: '8d', 'month' or 'clim'."""
+    if tbl is None or not len(tbl):
+        return None
+    key = (id(tbl), len(tbl), kind)
+    hit = _CLOUD_INDEX_CACHE.get(key)
+    if hit is not None and hit[0] is tbl:
+        return hit[1]
+    if kind == "clim":
+        sub = tbl
+        codes = sub["month"].to_numpy(np.int64)
+        vals = sub["cloud_frac_clim"].to_numpy(np.float64)
+    else:
+        if "period_kind" in tbl.columns:
+            mask = tbl["period_kind"].astype(str).to_numpy() == kind
+        else:
+            mask = np.full(len(tbl), kind == "8d")
+        sub = tbl[mask]
+        codes = (sub["year"].to_numpy(np.int64) * 100
+                 + sub["period"].to_numpy(np.int64))
+        vals = sub["cloud_frac"].to_numpy(np.float64)
+    tb = _bin_id(sub["lat_025"].to_numpy(), sub["lon_025"].to_numpy())
+    order = np.argsort(tb, kind="stable")
+    idx = (tb[order], codes[order], vals[order])
+    # keep the table referenced so its id() cannot be reused while cached
+    for k in [k for k in _CLOUD_INDEX_CACHE if k[2] == kind]:
+        del _CLOUD_INDEX_CACHE[k]
+    _CLOUD_INDEX_CACHE[key] = (tbl, idx)
+    return idx
+
+
 def cloud_fraction_matrix(cell_lats, cell_lons, dates, cloud_df, clim_df):
     """Vectorized daily cloud fraction for many cells.
 
@@ -129,22 +166,26 @@ def cloud_fraction_matrix(cell_lats, cell_lons, dates, cloud_df, clim_df):
     months = dates.month.to_numpy().astype(np.int64)
     p8 = period_8d(dates.dayofyear.to_numpy()).astype(np.int64)
 
-    def _fill(tbl, period_codes, value_col, src_code):
-        if tbl is None or not len(tbl):
+    def _fill(index, day_codes, src_code):
+        if index is None:
             return
-        tb = _bin_id(tbl["lat_025"].to_numpy(), tbl["lon_025"].to_numpy())
-        keep = np.isin(tb, ubins)
-        if not keep.any():
+        s_bins, s_codes, s_vals = index
+        lo = np.searchsorted(s_bins, ubins, side="left")
+        hi = np.searchsorted(s_bins, ubins, side="right")
+        cnt = hi - lo
+        if not cnt.any():
             return
-        tb = tb[keep]
-        codes_tbl = period_codes(tbl[keep])
-        ucode, t_code = np.unique(period_codes(None), return_inverse=True)
+        rows = np.repeat(lo - np.cumsum(np.r_[0, cnt[:-1]]), cnt) \
+            + np.arange(cnt.sum())
+        tb = s_bins[rows]
+        codes_tbl = s_codes[rows]
+        ucode, t_code = np.unique(day_codes, return_inverse=True)
         pos = np.searchsorted(ucode, codes_tbl)
         ok = (pos < len(ucode)) & (ucode[np.minimum(pos, len(ucode) - 1)]
                                    == codes_tbl)
         mat = np.full((len(ubins), len(ucode)), np.nan)
         bpos = np.searchsorted(ubins, tb)
-        vals = tbl[keep][value_col].to_numpy(dtype=np.float64)
+        vals = s_vals[rows]
         mat[bpos[ok], pos[ok]] = vals[ok]
         cand = mat[inv][:, t_code]                      # (n, T)
         fill = np.isnan(cloud) & np.isfinite(cand)
@@ -152,20 +193,10 @@ def cloud_fraction_matrix(cell_lats, cell_lons, dates, cloud_df, clim_df):
         source[fill] = src_code
 
     if cloud_df is not None and len(cloud_df):
-        kind = (cloud_df["period_kind"].astype(str)
-                if "period_kind" in cloud_df.columns
-                else pd.Series("8d", index=cloud_df.index))
-        c8 = cloud_df[kind.to_numpy() == "8d"]
-        cm = cloud_df[kind.to_numpy() == "month"]
-        _fill(c8, lambda t: (years * 100 + p8) if t is None else
-              (t["year"].to_numpy(np.int64) * 100
-               + t["period"].to_numpy(np.int64)), "cloud_frac", 0)
-        _fill(cm, lambda t: (years * 100 + months) if t is None else
-              (t["year"].to_numpy(np.int64) * 100
-               + t["period"].to_numpy(np.int64)), "cloud_frac", 1)
+        _fill(_cloud_index(cloud_df, "8d"), years * 100 + p8, 0)
+        _fill(_cloud_index(cloud_df, "month"), years * 100 + months, 1)
     if clim_df is not None and len(clim_df):
-        _fill(clim_df, lambda t: months if t is None else
-              t["month"].to_numpy(np.int64), "cloud_frac_clim", 2)
+        _fill(_cloud_index(clim_df, "clim"), months, 2)
     # residual gaps: cell mean (or 0.5 when the cell has no information)
     if np.isnan(cloud).any():
         import warnings
