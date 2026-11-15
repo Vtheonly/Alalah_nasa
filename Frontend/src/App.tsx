@@ -20,7 +20,6 @@ import {
   Sparkles,
 } from "lucide-react";
 import {
-  clamp,
   MONTH_COUNT,
   MONTH_NAMES,
   monthLabel,
@@ -269,6 +268,7 @@ function buildSeriesOption(series: MonthlyMetric[], selectedMonth: string): ECha
 
 export default function App() {
   const [regionId, setRegionId] = useState(REGIONS[0].id);
+  const [mapFocused, setMapFocused] = useState(false);
   const [monthIndexValue, setMonthIndexValue] = useState(INITIAL_MONTH);
   const [mapMetric, setMapMetric] = useState<MapMetric>("frp");
   const [data, setData] = useState<RegionData | null>(null);
@@ -370,6 +370,7 @@ export default function App() {
 
   function chooseRegion(item: Region) {
     setRegionId(item.id);
+    setMapFocused(true);
     setSearch(item.name);
     setSearchOpen(false);
     setActiveSection("overview");
@@ -386,8 +387,8 @@ export default function App() {
         <a className="brand" href="#overview" onClick={() => jumpTo("overview")}>
           <span className="brand-mark"><Flame size={20} fill="currentColor" /></span>
           <span className="brand-copy">
-            <strong>EMBER ATLAS</strong>
-            <small>FIRE INTELLIGENCE</small>
+            <strong>FIRE HARMONIZER</strong>
+            <small>BURNING EARTH · 2000–2026</small>
           </span>
         </a>
 
@@ -458,7 +459,7 @@ export default function App() {
               <strong>Data &amp; method</strong>
               <p>MODIS and VIIRS observations are harmonized into one monthly fire record with uncertainty and quality flags.</p>
               <div><span>Calendar / series</span><b>{data?.sources.timeseries === "live" ? "API" : "Demo fallback"}</b></div>
-              <div><span>Map segmentation</span><b>{mapSource === "live" ? "H3 · API" : "Illustrative grid"}</b></div>
+              <div><span>Map segmentation</span><b>{mapSource === "live" ? "H3 · API" : "Synthetic H3"}</b></div>
               <small>Demo values are synthetic and are not satellite observations.</small>
             </div>
           )}
@@ -467,9 +468,9 @@ export default function App() {
         <main className="page-content" id="overview">
           <section className="page-intro">
             <div>
-              <div className="eyebrow"><span className="eyebrow-line" /> EARTH OBSERVATION · MONTHLY MONITORING</div>
-              <h1>Fire, in <em>perspective.</em></h1>
-              <p>Explore a consistent view of fire activity, harmonized across satellite generations.</p>
+              <div className="eyebrow"><span className="eyebrow-line" /> MODIS · VIIRS · 26 YEARS</div>
+              <h1>Watch the earth <em>burn</em>, honestly measured.</h1>
+              <p>Explore one consistent monthly fire record, fused across satellite generations with uncertainty and quality flags.</p>
             </div>
             <div className="intro-controls">
               <div className="search-wrap">
@@ -524,7 +525,7 @@ export default function App() {
               value={compact(mapCells?.features.length ?? data?.fireCells.features.length, 0)}
               unit="map cells"
               icon={<Layers3 size={17} />}
-              detail={mapSource === "live" ? "H3 cells from DuckDB" : "Illustrative hexagonal grid"}
+              detail={mapSource === "live" ? "H3 cells from harmonized output" : "Synthetic H3 cells"}
             />
             <MetricCard
               label="Measured coverage"
@@ -566,17 +567,24 @@ export default function App() {
                     >{label}</button>
                   ))}
                 </div>
+                <button
+                  className="map-tool-button"
+                  aria-label="Return to global globe view"
+                  title="Return to global globe view"
+                  onClick={() => setMapFocused(false)}
+                ><Globe2 size={15} /></button>
               </div>
             </div>
 
             <div className="map-frame">
               <MapView
                 region={region}
+                focused={mapFocused}
                 cells={renderedCells}
                 selectedCell={selectedCell}
                 onCellSelect={setSelectedCell}
               />
-              <div className="map-top-chip"><Globe2 size={13} /> Interactive 3D globe</div>
+              <div className="map-top-chip"><Globe2 size={13} /> {mapFocused ? "H3 cells · height scaled to fire heat" : "Global globe · select an area to fly in"}</div>
               <div className="map-region-chip"><span className="region-dot active" /> {region.iso} · {region.name}</div>
               <div className="map-legend">
                 <div className="legend-heading">{mapMetricLabel}<span>LOW <i /> HIGH</span></div>
@@ -587,7 +595,7 @@ export default function App() {
             </div>
             <div className="map-footer">
               <span><span className="foot-dot" />Country borders and coastlines from OpenStreetMap</span>
-              <span>{mapSource === "live" ? "H3 segmentation · API data" : "Synthetic segmentation · illustrative only"}</span>
+              <span>{mapSource === "live" ? "H3 segmentation · harmonized output" : "Synthetic H3 segmentation · illustrative only"}</span>
               <span>Drag to rotate <b>·</b> Scroll to zoom <b>·</b> Select a cell for details</span>
             </div>
           </section>
@@ -596,7 +604,7 @@ export default function App() {
             <button className="play-button" onClick={() => setPlaying((value) => !value)} aria-label={playing ? "Pause timeline" : "Play timeline"}>
               {playing ? <Pause size={15} fill="currentColor" /> : <Play size={15} fill="currentColor" />}
             </button>
-            <div className="timeline-copy"><strong>{monthLabel(selectedMonth)}</strong><small>Move through the monthly record</small></div>
+            <div className="timeline-copy"><strong>{monthLabel(selectedMonth)}</strong><small>Animate monthly fire spread · H3 output</small></div>
             <input
               type="range"
               min={0}
@@ -661,7 +669,7 @@ export default function App() {
           )}
 
           <footer className="page-footer">
-            <span>EMBER ATLAS <b>·</b> A harmonized view of satellite fire observations</span>
+            <span>FIRE HARMONIZER <b>·</b> A harmonized view of satellite fire observations</span>
             <span>MODIS + VIIRS <b>·</b> Values shown with measured coverage and uncertainty</span>
           </footer>
         </main>

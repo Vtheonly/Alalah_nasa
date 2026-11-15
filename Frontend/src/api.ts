@@ -45,6 +45,8 @@ interface ApiMapResponse {
       phi_q50_mw?: number | null;
       anomaly_ratio?: number | null;
       width?: number | null;
+      quality_flag?: string | null;
+      measured_fraction?: number | null;
     };
   }>;
 }
@@ -132,6 +134,8 @@ function normalizeMap(response: ApiMapResponse): FireCollection {
       phi_q50_mw: feature.properties.phi_q50_mw ?? undefined,
       anomaly_ratio: feature.properties.anomaly_ratio ?? undefined,
       width: feature.properties.width ?? undefined,
+      quality_flag: feature.properties.quality_flag ?? undefined,
+      measured_fraction: feature.properties.measured_fraction ?? undefined,
       frp_score: Math.max(0, feature.properties.phi_q50_mw ?? 0),
       anomaly_score: Math.max(0, feature.properties.anomaly_ratio ?? 0),
       uncertainty_score: Math.max(0, feature.properties.width ?? 0),
@@ -154,15 +158,24 @@ export function mapFeaturesForMetric(data: FireCollection, metric: MapMetric): F
     anomaly: "anomaly_score",
     uncertainty: "uncertainty_score",
   }[metric];
-  const rawValues = data.features.map((feature) => feature.properties[property]);
+  const metricValue = (feature: FireFeature): number => {
+    const value = feature.properties[property];
+    return typeof value === "number" && Number.isFinite(value) ? value : 0;
+  };
+  const rawValues = data.features.map(metricValue);
   const scale = Math.max(0.01, ...rawValues);
+  const heatScale = Math.max(
+    0.01,
+    ...data.features.map((feature) => feature.properties.frp_score),
+  );
   return {
     type: "FeatureCollection",
     features: data.features.map((feature) => ({
       ...feature,
       properties: {
         ...feature.properties,
-        value: clamp(feature.properties[property] / scale, 0, 1),
+        value: clamp(metricValue(feature) / scale, 0, 1),
+        heat_score: clamp(feature.properties.frp_score / heatScale, 0, 1),
       },
     })),
   };
