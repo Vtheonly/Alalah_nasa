@@ -466,3 +466,26 @@ one bad line discarded the whole file. Fixed in the codebase:
   failure. Tested on real HDF4 files written with pyhdf (uint8 percent with
   fill 255, float fraction with -1 water). Units of the live layer still to
   be confirmed from that manifest entry on the next run.
+
+---
+
+## Handoff update — live Env 1 run on Colab (2026-11-15): resume, memory, speed
+
+The user ran acquisition on Colab (12 GiB RAM, 2 vCPU, no swap) and patched
+four problems LOCALLY in the Colab clone (never pushed; the notebook's
+clone cell does `reset --hard` to `main`, so they are re-implemented here):
+
+| Symptom (live run) | Root cause | Fix in the codebase |
+|---|---|---|
+| 6 MCD14ML months (200708, 201301, 201308, 202001, 202108, 202508) rejected: `schema gate: negative FRP` | real files carry isolated `frp < 0` fill rows (1 of 699,186 in 200708) and the gate rejected the whole month | `drop_negative_frp_rows`: rows dropped + logged + counted in the manifest (`negative_frp_rows_dropped`); > 1 % of the file's lines -> corrupt file |
+| Resume aborted: `first 3 MCD14ML files all failed` although 304 months were staged | staged files were skipped WITHOUT counting toward `attempts`, so 3 new failures = "all failed" | staged files counted as successes before the loop (`pending` list) |
+| `exit -9` (OOM kill) at [1050/1322] VNP14IMGML.201508 | (a) all 696 parsed CMG frames held in RAM (~5 GiB, float64 + object columns); (b) whole VIIRS month read as a Python line list + `dtype=str` frame (~7-9 GiB for 3.5 M lines) BEFORE the box filter | (a) every CMG grid is cached as its own compact Parquet under `staged_raw/cmg_cache/` (float32 / int16 / category) and `assemble_cloud_table` / `assemble_burned_table` stream them per (year, period) with a ParquetWriter (climatology accumulated incrementally); (b) `normalize_dedup.parse_umd_file`: bounded-memory file parser (see below) |
+| ~40-60 s per VIIRS month (1.5-2.6 M lines) | Python-object parse of every global row | `parse_umd_file` fast path: pyarrow streaming CSV reader (lat/lon typed at parse time, box filter per 16 MB block before any object conversion) -> 7.2x faster with byte-identical output on a 2.6 M-line file (4.0 s vs 26.7 s here); falls back to the tolerant pandas path (batched, header re-applied) when the file has malformed rows or is whitespace-delimited (MCD14ML). The next file is downloaded in a background thread while the current one parses (one SFTP transfer in flight at a time). |
+
+Also: staged Parquets are written atomically (`.part` + rename) so an
+interrupted run never leaves a truncated file that resume would trust;
+stale `_tmp_umd_*.parquet` spill files from the local patch are deleted.
+Tests: test_01 45 passed (new: fast-path equivalence, malformed-row
+fallback, batched MCD14ML, negative FRP, resume counting with corrupt new
+months + zero re-downloads, streamed cloud assembly == in-memory
+finalize + climatology).

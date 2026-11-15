@@ -31,9 +31,11 @@ import io
 import json
 import logging
 import re
+import shutil
 import socket
 import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -463,7 +465,7 @@ def fetch_umd_history(paths: DataPaths, years: list[int],
         raise ValueError("keep_originals must be 'all' or 'ancillary'")
     import tempfile
 
-    from .normalize_dedup import parse_umd_text, platform_from_vxx_filename
+    from .normalize_dedup import parse_umd_file, platform_from_vxx_filename
     bboxes = bboxes or [b for c in S.TARGET_COUNTRIES for b in c.prefilter_boxes]
     out_dir = Path(paths.raw_stage_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -501,149 +503,239 @@ def fetch_umd_history(paths: DataPaths, years: list[int],
         logger.info("UMD: %d files to stage for years %s..%s %s", len(todo),
                     min(years_set), max(years_set),
                     {k: sum(1 for kk, _ in todo if kk == k) for k in files})
-        n_done = 0
         t_start = time.time()
-        with tempfile.TemporaryDirectory(prefix="umd_") as tmp:
-            for key, plist in files.items():
-                for rel in plist:
-                    y = _year_of_name(rel)
-                    if y is None or y not in years_set:
-                        continue
-                    n_done += 1
-                    name = Path(rel).name
-                    t_file = time.time()
-                    logger.info("UMD [%d/%d] %s (elapsed %.0f min)", n_done,
-                                len(todo), rel, (time.time() - t_start) / 60)
-                    if key in ("MCD14ML", "VNP14IMGML", "VJ114IMGML",
-                               "VJ214IMGML"):
-                        dest = out_dir / f"umd_{key}_{name}.parquet"
-                        if dest.exists():
-                            result["fires"].append(dest)
-                            continue
-                    tmp_path = Path(tmp) / name
-                    keep_this = originals_dir is not None and (
-                        keep_originals == "all"
-                        or key in ("MOD14C8Q", "MYD14C8Q", "MCD64CMQ"))
-                    kept = (Path(originals_dir) / key / name) if keep_this \
-                        else None
+        fire_keys = ("MCD14ML", "VNP14IMGML", "VJ114IMGML", "VJ214IMGML")
+        cmg_dir = out_dir / UMD_CMG_CACHE_DIR
+        cmg_dir.mkdir(parents=True, exist_ok=True)
+        # leftovers of an interrupted run with an older in-memory spill patch
+        for stale in out_dir.glob("_tmp_umd_*.parquet"):
+            stale.unlink(missing_ok=True)
+
+        def staged_path(key: str, name: str) -> Path:
+            if key in fire_keys:
+                return out_dir / f"umd_{key}_{name}.parquet"
+            return cmg_dir / f"{key}_{name}.parquet"
+
+        def kept_path(key: str, name: str) -> Path | None:
+            if originals_dir is None or not (
+                    keep_originals == "all" or key not in fire_keys):
+                return None
+            return Path(originals_dir) / key / name
+
+        def obtain(key: str, rel: str, tmp_path: Path) -> Path:
+            """Local copy of a remote file (kept original reused)."""
+            kept = kept_path(key, Path(rel).name)
+            if kept is not None and kept.exists() and kept.stat().st_size > 0:
+                shutil.copyfile(kept, tmp_path)
+            else:
+                session.download(rel, tmp_path)
+                _record_original(manifest, key, tmp_path,
+                                 f"{session.method}://{S.UMD_FTP_HOST}/{rel}",
+                                 session.method)
+            return tmp_path
+
+        # Resume: files already staged are counted as successes (so a rerun
+        # that only meets a few bad months never trips the fail-fast check)
+        # and never re-downloaded.
+        pending = []
+        for key, rel in todo:
+            dest = staged_path(key, Path(rel).name)
+            if dest.exists():
+                attempts[key] = attempts.get(key, 0) + 1
+                result["fires" if key in fire_keys else
+                       ("burned" if key == "MCD64CMQ" else "cloud")].append(dest)
+            else:
+                pending.append((key, rel))
+        n_cached = len(todo) - len(pending)
+        if n_cached:
+            logger.info("UMD: %d of %d files already staged (resume); %d to "
+                        "fetch", n_cached, len(todo), len(pending))
+        with tempfile.TemporaryDirectory(prefix="umd_") as tmp, \
+                ThreadPoolExecutor(max_workers=1) as pool:
+            # The next file downloads while the current one is parsed (one
+            # transfer in flight at a time: the SFTP session is never shared
+            # by two concurrent operations).
+            futures = {}
+
+            def prefetch(i):
+                if i < len(pending) and i not in futures:
+                    k, r = pending[i]
+                    futures[i] = pool.submit(obtain, k, r,
+                                             Path(tmp) / Path(r).name)
+
+            prefetch(0)
+            for i, (key, rel) in enumerate(pending):
+                n_done = n_cached + i + 1
+                name = Path(rel).name
+                dest = staged_path(key, name)
+                t_file = time.time()
+                logger.info("UMD [%d/%d] %s (elapsed %.0f min)", n_done,
+                            len(todo), rel, (time.time() - t_start) / 60)
+                tmp_path = Path(tmp) / name
+                kept = kept_path(key, name)
+                try:
                     try:
-                        if kept is not None and kept.exists() and \
-                                kept.stat().st_size > 0:
-                            import shutil as _sh
-                            _sh.copyfile(kept, tmp_path)
-                        else:
-                            session.download(rel, tmp_path)
-                            _record_original(manifest, key, tmp_path,
-                                             f"{session.method}://"
-                                             f"{S.UMD_FTP_HOST}/{rel}",
-                                             session.method)
-                        attempts[key] = attempts.get(key, 0) + 1
-                        if key == "MCD14ML" or key.startswith("V"):
-                            opener = gzip.open if name.endswith(".gz") else open
-                            with opener(tmp_path, "rt", errors="replace") as fh:
-                                lines = fh.read().splitlines()
-                            coll = collection_rank(rel)
-                            df = parse_umd_text(
-                                lines, key, platform_hint=(
-                                    None if key == "MCD14ML"
-                                    else platform_from_vxx_filename(name)),
-                                version_raw=(f"C{coll[0]}{coll[1] or ''}"
-                                             if coll != (0, 0) else None))
-                            n_lines = df.attrs.get("n_lines", 0)
-                            n_bad = df.attrs.get("n_bad_lines", 0)
-                            if n_lines and n_bad > UMD_MAX_BAD_LINE_FRACTION * n_lines:
-                                raise ValueError(
-                                    f"{n_bad}/{n_lines} unparseable lines; header="
-                                    f"{df.attrs.get('header')}; first line="
-                                    f"{lines[0][:160] if lines else ''!r}")
-                            df = df[_in_boxes(df["latitude"], df["longitude"],
-                                              bboxes)]
-                            if len(df) and not schema_validation_gate(df, name):
-                                raise ValueError("schema validation gate failed")
-                            df.to_parquet(dest, index=False, compression="zstd")
-                            result["fires"].append(dest)
-                            if manifest:
-                                manifest.log(f"{key}_parsed", rel, "parse",
-                                             detail=json.dumps({
-                                                 "lines": n_lines,
-                                                 "bad_lines": n_bad,
-                                                 "rows_in_target_boxes": len(df)}))
-                            logger.info("UMD [%d/%d] parsed %d lines (%d bad), "
-                                        "%d rows in target boxes, %.0fs",
-                                        n_done, len(todo), n_lines, n_bad,
-                                        len(df), time.time() - t_file)
-                        elif key in ("MOD14C8Q", "MYD14C8Q", "MCD64CMQ"):
-                            hdf_path = _gunzip_if_needed(tmp_path)
-                            meta = parse_cmg_filename(name)
-                            if meta is None:
-                                raise ValueError(
-                                    f"cannot parse product/year/period from "
-                                    f"CMG file name {name!r}")
-                        if key in ("MOD14C8Q", "MYD14C8Q"):
-                            if meta:
-                                sds = read_cloud_cmg_sds(hdf_path)
-                                summ = cloud_layer_summary(sds)
-                                if key not in cloud_logged:
-                                    cloud_logged.add(key)
-                                    logger.info("UMD %s cloud layer: %s", key,
-                                                json.dumps(summ))
-                                    if manifest:
-                                        manifest.log(f"{key}_cloud_layer", rel,
-                                                     "parse",
-                                                     detail=json.dumps(summ))
-                                f = parse_cloud_cmg(sds, meta["year"],
-                                                    meta["period"],
-                                                    meta["period_kind"])
-                                f["platform"] = meta["product"][:3]
-                                f = f[_in_boxes(f["lat_025"], f["lon_025"],
-                                                bboxes)]
-                                if f.empty:
-                                    raise ValueError(
-                                        "no valid cloud-fraction values inside "
-                                        "the target boxes; layer summary: "
-                                        + json.dumps(summ))
-                                result["cloud"].append(f)
-                                logger.info("UMD [%d/%d] cloud %s %d-%02d: %d "
-                                            "cells, mean %.3f, %.0fs", n_done,
-                                            len(todo), summ["layer"],
-                                            meta["year"], meta["period"],
-                                            len(f), f["cloud_frac"].mean(),
-                                            time.time() - t_file)
-                        elif key == "MCD64CMQ":
-                            if meta:
-                                sds = read_hdf4_sds(hdf_path, CMQ_BURN_LAYERS,
-                                                    required=("BurnedArea",))
-                                f = parse_burned_area_cmg(sds, meta["year"],
-                                                          meta["period"])
-                                result["burned"].append(
-                                    f[_in_boxes(f["lat_025"], f["lon_025"],
-                                                bboxes)])
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning("UMD file %s failed: %s", rel, exc)
-                        failures.setdefault(key, []).append(f"{rel}: {exc}")
-                        if manifest:
-                            manifest.log(key, rel, session.method,
-                                         detail=str(exc)[:2000], status="FAIL")
-                        if (attempts.get(key, 0) >= UMD_FAIL_FAST
-                                and len(failures[key]) >= attempts[key]):
-                            msg = (f"first {attempts[key]} {key} files all failed "
-                                   "-- aborting instead of downloading the rest: "
-                                   + " | ".join(failures[key][:3]))
-                            if manifest:
-                                manifest.critical(key, msg)
-                            raise RuntimeError(msg) from exc
+                        futures.pop(i).result()
                     finally:
-                        Path(str(tmp_path) + ".unz").unlink(missing_ok=True)
-                        if kept is not None and tmp_path.exists() and \
-                                not kept.exists():
-                            kept.parent.mkdir(parents=True, exist_ok=True)
-                            import shutil as _sh
-                            _sh.move(str(tmp_path), str(kept))
-                        tmp_path.unlink(missing_ok=True)   # delete immediately
+                        prefetch(i + 1)
+                    attempts[key] = attempts.get(key, 0) + 1
+                    if key in fire_keys:
+                        coll = collection_rank(rel)
+                        df = parse_umd_file(
+                            tmp_path, key, platform_hint=(
+                                None if key == "MCD14ML"
+                                else platform_from_vxx_filename(name)),
+                            version_raw=(f"C{coll[0]}{coll[1] or ''}"
+                                         if coll != (0, 0) else None),
+                            bboxes=bboxes)
+                        n_lines = df.attrs.get("n_lines", 0)
+                        n_bad = df.attrs.get("n_bad_lines", 0)
+                        if n_lines and n_bad > UMD_MAX_BAD_LINE_FRACTION * n_lines:
+                            raise ValueError(
+                                f"{n_bad}/{n_lines} unparseable lines; header="
+                                f"{df.attrs.get('header')}")
+                        df, n_neg = drop_negative_frp_rows(df, name, n_lines)
+                        if len(df) and not schema_validation_gate(df, name):
+                            raise ValueError("schema validation gate failed")
+                        _atomic_parquet(df, dest)
+                        result["fires"].append(dest)
+                        if manifest:
+                            manifest.log(f"{key}_parsed", rel, "parse",
+                                         detail=json.dumps({
+                                             "lines": n_lines,
+                                             "bad_lines": n_bad,
+                                             "negative_frp_rows_dropped": n_neg,
+                                             "rows_in_target_boxes": len(df)}))
+                        logger.info("UMD [%d/%d] parsed %d lines (%d bad, %d "
+                                    "negative FRP dropped), %d rows in target "
+                                    "boxes, %.0fs", n_done, len(todo), n_lines,
+                                    n_bad, n_neg, len(df), time.time() - t_file)
+                        del df
+                        continue
+                    hdf_path = _gunzip_if_needed(tmp_path)
+                    meta = parse_cmg_filename(name)
+                    if meta is None:
+                        raise ValueError("cannot parse product/year/period "
+                                         f"from CMG file name {name!r}")
+                    if key in ("MOD14C8Q", "MYD14C8Q"):
+                        sds = read_cloud_cmg_sds(hdf_path)
+                        summ = cloud_layer_summary(sds)
+                        if key not in cloud_logged:
+                            cloud_logged.add(key)
+                            logger.info("UMD %s cloud layer: %s", key,
+                                        json.dumps(summ))
+                            if manifest:
+                                manifest.log(f"{key}_cloud_layer", rel, "parse",
+                                             detail=json.dumps(summ))
+                        f = parse_cloud_cmg(sds, meta["year"], meta["period"],
+                                            meta["period_kind"])
+                        f["platform"] = meta["product"][:3]
+                        f = f[_in_boxes(f["lat_025"], f["lon_025"], bboxes)]
+                        if f.empty:
+                            raise ValueError(
+                                "no valid cloud-fraction values inside the "
+                                "target boxes; layer summary: " + json.dumps(summ))
+                        _atomic_parquet(compact_cmg_frame(f), dest)
+                        result["cloud"].append(dest)
+                        logger.info("UMD [%d/%d] cloud %s %d-%02d: %d cells, "
+                                    "mean %.3f, %.0fs", n_done, len(todo),
+                                    summ["layer"], meta["year"], meta["period"],
+                                    len(f), f["cloud_frac"].mean(),
+                                    time.time() - t_file)
+                    elif key == "MCD64CMQ":
+                        sds = read_hdf4_sds(hdf_path, CMQ_BURN_LAYERS,
+                                            required=("BurnedArea",))
+                        f = parse_burned_area_cmg(sds, meta["year"],
+                                                  meta["period"])
+                        f = f[_in_boxes(f["lat_025"], f["lon_025"], bboxes)]
+                        _atomic_parquet(compact_cmg_frame(f), dest)
+                        result["burned"].append(dest)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("UMD file %s failed: %s", rel, exc)
+                    failures.setdefault(key, []).append(f"{rel}: {exc}")
+                    if manifest:
+                        manifest.log(key, rel, session.method,
+                                     detail=str(exc)[:2000], status="FAIL")
+                    if (attempts.get(key, 0) >= UMD_FAIL_FAST
+                            and len(failures[key]) >= attempts[key]):
+                        msg = (f"first {attempts[key]} {key} files all failed "
+                               "-- aborting instead of downloading the rest: "
+                               + " | ".join(failures[key][:3]))
+                        for fut in futures.values():
+                            fut.cancel()
+                        if manifest:
+                            manifest.critical(key, msg)
+                        raise RuntimeError(msg) from exc
+                finally:
+                    Path(str(tmp_path) + ".unz").unlink(missing_ok=True)
+                    if kept is not None and tmp_path.exists() and \
+                            not kept.exists():
+                        kept.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(tmp_path), str(kept))
+                    tmp_path.unlink(missing_ok=True)   # delete immediately
     finally:
         if own:
             session.close()
     return result
+
+
+# Parsed CMG grids are cached one Parquet per original file under
+# ``staged_raw/<UMD_CMG_CACHE_DIR>/`` (instant resume, bounded RAM); the
+# final cloud / burned-area tables are assembled from them by download_all.
+UMD_CMG_CACHE_DIR = "cmg_cache"
+# Rare negative-FRP rows (fill / sensor noise; e.g. 1 of 699,186 rows in
+# MCD14ML.200708) are dropped and audited; above this fraction the file is
+# treated as corrupt instead.
+MAX_NEGATIVE_FRP_FRACTION = 0.01
+
+
+def drop_negative_frp_rows(df: pd.DataFrame, source_name: str,
+                           n_total: int | None = None
+                           ) -> tuple[pd.DataFrame, int]:
+    """Drop isolated ``frp_mw < 0`` rows (logged; counted in the manifest).
+    More than :data:`MAX_NEGATIVE_FRP_FRACTION` of ``n_total`` (the file's
+    line count; default ``len(df)``) -> ValueError (corrupt file)."""
+    if not len(df) or "frp_mw" not in df.columns:
+        return df, 0
+    neg = pd.to_numeric(df["frp_mw"], errors="coerce").fillna(0.0).to_numpy() < 0.0
+    n_neg = int(neg.sum())
+    if n_neg == 0:
+        return df, 0
+    total = max(len(df), int(n_total or 0))
+    if n_neg > MAX_NEGATIVE_FRP_FRACTION * total:
+        raise ValueError(f"{n_neg}/{total} rows with negative FRP "
+                         f"(> {MAX_NEGATIVE_FRP_FRACTION:.0%}): corrupt file")
+    logger.info("%s: dropping %d negative-FRP row(s) of %d", source_name,
+                n_neg, len(df))
+    return df.loc[~neg].reset_index(drop=True), n_neg
+
+
+def _atomic_parquet(df: pd.DataFrame, dest: Path) -> None:
+    """Write via a temp name + rename: an interrupted run (OOM kill, Colab
+    disconnect) never leaves a truncated file that resume would trust."""
+    dest = Path(dest)
+    part = dest.with_name(dest.name + ".part")
+    df.to_parquet(part, index=False, compression="zstd")
+    part.replace(dest)
+
+
+def compact_cmg_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Small dtypes for CMG tables (float32 values, int16 year/period,
+    categorical labels): ~4x less RAM than the float64/object defaults."""
+    out = df.copy()
+    for c in ("lat_025", "lon_025"):
+        if c in out:
+            out[c] = out[c].astype(np.float64).round(3)
+    for c in ("cloud_frac", "burned_area_km2", "unmapped_fraction", "qa"):
+        if c in out and pd.api.types.is_float_dtype(out[c]):
+            out[c] = out[c].astype(np.float32)
+    for c in ("year", "period", "month"):
+        if c in out:
+            out[c] = out[c].astype(np.int16)
+    for c in ("period_kind", "platform"):
+        if c in out:
+            out[c] = out[c].astype("category")
+    return out
 
 
 def _gunzip_if_needed(path: Path) -> Path:
@@ -1278,6 +1370,109 @@ def download_cmr_granules(urls: list[str], tmp_dir: Path, bboxes,
     return out
 
 
+def _as_frame(part) -> pd.DataFrame:
+    return pd.read_parquet(part) if isinstance(part, (str, Path)) else part
+
+
+def _cmg_month_of(df: pd.DataFrame) -> np.ndarray:
+    period = df["period"].to_numpy(np.int64)
+    kind = df["period_kind"].astype(str).to_numpy()
+    doy = np.clip((period - 1) * 8 + 4, 1, 365)
+    m8 = (pd.Timestamp("2001-01-01")
+          + pd.to_timedelta(doy - 1, unit="D")).month.to_numpy()
+    return np.where(kind == "month", period, m8)
+
+
+def assemble_cloud_table(parts: list, out_path: Path,
+                         clim_path: Path | None = None) -> dict:
+    """Streamed equivalent of ``finalize_cloud_table`` +
+    ``build_cloud_climatology_fallback`` over per-file parts (Parquet paths
+    or frames): one (year, period, kind) at a time, Terra/Aqua averaged,
+    written with a ParquetWriter -- RAM stays at a few periods of one
+    region instead of the whole 2000-2026 table."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    groups: dict[tuple, list] = {}
+    for part in parts:
+        if isinstance(part, (str, Path)):
+            keys = pq.read_table(part, columns=["year", "period",
+                                                "period_kind"]).to_pandas()
+        else:
+            keys = part[["year", "period", "period_kind"]]
+        for k in keys.astype({"period_kind": str}).drop_duplicates() \
+                .itertuples(index=False):
+            groups.setdefault((int(k[0]), int(k[1]), str(k[2])), []).append(part)
+    schema = pa.schema([("lat_025", pa.float64()), ("lon_025", pa.float64()),
+                        ("year", pa.int16()), ("period", pa.int16()),
+                        ("period_kind", pa.string()),
+                        ("cloud_frac", pa.float32())])
+    out_path = Path(out_path)
+    tmp = out_path.with_name(out_path.name + ".part")
+    clim_sum: pd.Series | None = None
+    clim_n: pd.Series | None = None
+    n_rows, kinds = 0, set()
+    with pq.ParquetWriter(tmp, schema, compression="zstd") as writer:
+        for (year, period, kind) in sorted(groups):
+            frames = []
+            for part in groups[(year, period, kind)]:
+                f = _as_frame(part)
+                f = f[(f["year"].to_numpy() == year)
+                      & (f["period"].to_numpy() == period)
+                      & (f["period_kind"].astype(str).to_numpy() == kind)]
+                frames.append(f[["lat_025", "lon_025", "cloud_frac"]])
+            g = (pd.concat(frames, ignore_index=True)
+                 .groupby(["lat_025", "lon_025"], as_index=False)["cloud_frac"]
+                 .mean())
+            g["year"], g["period"], g["period_kind"] = year, period, kind
+            writer.write_table(pa.Table.from_pandas(
+                g[schema.names].astype({"year": np.int16, "period": np.int16,
+                                        "cloud_frac": np.float32}),
+                schema=schema, preserve_index=False))
+            n_rows += len(g)
+            kinds.add(kind)
+            if 2012 <= year <= 2025:
+                month = int(_cmg_month_of(g.iloc[:1])[0])
+                idx = pd.MultiIndex.from_arrays(
+                    [g["lat_025"], g["lon_025"], np.full(len(g), month)],
+                    names=["lat_025", "lon_025", "month"])
+                v = pd.Series(g["cloud_frac"].to_numpy(np.float64), index=idx)
+                c = pd.Series(1.0, index=idx)
+                clim_sum = v if clim_sum is None else clim_sum.add(v, fill_value=0.0)
+                clim_n = c if clim_n is None else clim_n.add(c, fill_value=0.0)
+    tmp.replace(out_path)
+    n_clim = 0
+    if clim_path is not None and clim_sum is not None:
+        clim = (clim_sum / clim_n).rename("cloud_frac_clim").reset_index()
+        clim["month"] = clim["month"].astype(np.int64)
+        clim.to_parquet(clim_path, index=False)
+        n_clim = len(clim)
+    return {"rows": n_rows, "periods": len(groups), "kinds": sorted(kinds),
+            "climatology_rows": n_clim}
+
+
+def assemble_burned_table(parts: list, out_path: Path) -> int:
+    """Concatenate per-file burned-area parts with a ParquetWriter."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    out_path = Path(out_path)
+    tmp = out_path.with_name(out_path.name + ".part")
+    writer, n = None, 0
+    try:
+        for part in parts:
+            f = compact_cmg_frame(_as_frame(part))
+            t = pa.Table.from_pandas(f, preserve_index=False)
+            if writer is None:
+                writer = pq.ParquetWriter(tmp, t.schema, compression="zstd")
+            writer.write_table(t.cast(writer.schema))
+            n += len(f)
+    finally:
+        if writer is not None:
+            writer.close()
+    if writer is not None:
+        tmp.replace(out_path)
+    return n
+
+
 def finalize_cloud_table(parts: list[pd.DataFrame]) -> pd.DataFrame:
     """Merge Terra (MOD) + Aqua (MYD) CMG cloud fractions: mean per
     (0.25 deg bin, year, period, period_kind)."""
@@ -1420,22 +1615,20 @@ def download_all(paths: DataPaths, years: list[int] | None = None,
         cloud_parts += got["cloud"]
         burn_parts += got["burned"]
     if cloud_parts:
-        cloud = finalize_cloud_table(cloud_parts)
-        cloud.to_parquet(paths.cloud_parquet, index=False)
+        info = assemble_cloud_table(
+            cloud_parts, Path(paths.cloud_parquet),
+            Path(paths.cloud_parquet).with_name("cloud_climatology.parquet"))
+        logger.info("cloud table: %s", info)
         manifest.log("cloud_cmg", str(paths.cloud_parquet), "pyhdf",
-                     detail=f"{len(cloud)} rows; kinds="
-                            f"{sorted(cloud['period_kind'].unique())}")
-        build_cloud_climatology_fallback(cloud).to_parquet(
-            Path(paths.cloud_parquet).with_name("cloud_climatology.parquet"),
-            index=False)
+                     detail=json.dumps(info))
     else:
         manifest.critical("cloud_cmg", "no MOD14C8Q/MYD14C8Q/Mx14CMQ grid "
                           "reachable via UMD or CMR (zero-cloud assumptions "
                           "are never fabricated)")
     if burn_parts:
-        pd.concat(burn_parts, ignore_index=True).to_parquet(
-            paths.burned_area_parquet, index=False)
-        manifest.log("burned_area_cmq", str(paths.burned_area_parquet), "pyhdf")
+        n_burn = assemble_burned_table(burn_parts, Path(paths.burned_area_parquet))
+        manifest.log("burned_area_cmq", str(paths.burned_area_parquet), "pyhdf",
+                     detail=f"{n_burn} rows")
     else:
         manifest.log("burned_area_cmq", "none", "pyhdf",
                      detail="MCD64CMQ unavailable: validation-only product",

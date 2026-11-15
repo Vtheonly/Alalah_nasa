@@ -19,6 +19,7 @@ Contract (readme Sections 4.5, 6.3):
 from __future__ import annotations
 
 import json
+import logging
 import re
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -29,6 +30,8 @@ from shapely.geometry import shape
 from shapely import contains_xy
 
 from ..config import settings as S
+
+logger = logging.getLogger("fire_harmonizer.ingest.normalize")
 
 CANONICAL_COLUMNS = [
     "country_iso", "sensor_family", "platform", "data_tier",
@@ -172,7 +175,19 @@ def parse_umd_text(rows: list[str], product: str, data_tier: str = "ML_SCIENCE",
                       index_col=False, on_bad_lines="skip",
                       skipinitialspace=True,
                       names=range(max(width, len(first)) + 16))
-    n_lines = len(body)
+    return _umd_finish(raw, mapping, first, len(body), product, data_tier,
+                       platform_hint, version_raw)
+
+
+def _umd_finish(raw: pd.DataFrame, mapping: dict, first: list[str],
+                n_lines: int, product: str, data_tier: str,
+                platform_hint: str | None, version_raw: str | None,
+                extra_bad: int = 0) -> pd.DataFrame:
+    """Shared tail of the UMD parsers: string table with integer column
+    labels -> canonical frame (bad rows dropped and counted)."""
+    product = product.upper()
+    empty = pd.DataFrame(columns=CANONICAL_COLUMNS + ["dn_source"])
+    empty.attrs.update(n_lines=n_lines, n_bad_lines=extra_bad, header=None)
 
     def col(field):
         i = mapping.get(field)
@@ -192,7 +207,7 @@ def parse_umd_text(rows: list[str], product: str, data_tier: str = "ML_SCIENCE",
     if platform_hint:
         plat = plat.where(plat.notna(), platform_hint)
     good &= plat.notna()
-    n_bad = int(n_lines - good.sum())
+    n_bad = int(extra_bad + len(raw) - good.sum())
     r = good.to_numpy()
     if not r.any():
         empty.attrs.update(n_lines=n_lines, n_bad_lines=n_bad,
@@ -228,6 +243,150 @@ def parse_umd_text(rows: list[str], product: str, data_tier: str = "ML_SCIENCE",
     out.attrs.update(n_lines=n_lines, n_bad_lines=n_bad,
                      header=first if _header_mapping(first) else None)
     return out
+
+
+def _boxes_mask(lat, lon, bboxes) -> np.ndarray:
+    lat = np.asarray(lat, dtype=float)
+    lon = np.asarray(lon, dtype=float)
+    if bboxes is None:
+        return np.isfinite(lat) & np.isfinite(lon)
+    keep = np.zeros(len(lat), dtype=bool)
+    for (w, so, e, n) in bboxes:
+        keep |= (lon >= w) & (lon <= e) & (lat >= so) & (lat <= n)
+    return keep
+
+
+def _concat_parsed(parts: list[pd.DataFrame], n_lines: int, n_bad: int,
+                   header) -> pd.DataFrame:
+    parts = [p for p in parts if len(p)]
+    out = (pd.concat(parts, ignore_index=True) if parts else
+           pd.DataFrame(columns=CANONICAL_COLUMNS + ["dn_source"]))
+    out.attrs.update(n_lines=int(n_lines), n_bad_lines=int(n_bad),
+                     header=header)
+    return out
+
+
+def _parse_umd_csv_arrow(path: Path, first: list[str], mapping: dict,
+                         product: str, data_tier: str, platform_hint,
+                         version_raw, bboxes) -> pd.DataFrame | None:
+    """Fast path for comma-delimited, headed UMD files (VIIRS C1/C2):
+    multithreaded pyarrow streaming CSV reader, lat/lon typed at parse time,
+    rows outside ``bboxes`` dropped per block BEFORE any Python-object
+    conversion (2.6 M-line monthly VIIRS file: ~60 s -> a few seconds,
+    bounded memory).  Returns None when the file has malformed rows (e.g.
+    extra trailing fields) so the caller can use the tolerant pandas path,
+    which keeps such rows aligned instead of dropping them."""
+    import pyarrow as pa
+    import pyarrow.csv as pacsv
+    names = [str(i) for i in range(len(first))]
+    invalid = [0]
+
+    def _on_invalid(_row):
+        invalid[0] += 1
+        return "skip"
+
+    types = {str(i): pa.string() for i in range(len(first))}
+    types[str(mapping["lat"])] = pa.float64()
+    types[str(mapping["lon"])] = pa.float64()
+    try:
+        reader = pacsv.open_csv(
+            str(path),
+            read_options=pacsv.ReadOptions(skip_rows=1, column_names=names,
+                                           block_size=16 << 20),
+            parse_options=pacsv.ParseOptions(delimiter=",",
+                                             invalid_row_handler=_on_invalid),
+            convert_options=pacsv.ConvertOptions(column_types=types,
+                                                 strings_can_be_null=False))
+        parts, n_rows, n_nolatlon = [], 0, 0
+        for batch in reader:
+            n_rows += batch.num_rows
+            lat = batch.column(str(mapping["lat"])).to_numpy(zero_copy_only=False)
+            lon = batch.column(str(mapping["lon"])).to_numpy(zero_copy_only=False)
+            lat = np.asarray(lat, dtype=float)
+            lon = np.asarray(lon, dtype=float)
+            n_nolatlon += int((~(np.isfinite(lat) & np.isfinite(lon))).sum())
+            keep = _boxes_mask(lat, lon, bboxes)
+            if keep.any():
+                sub = batch.filter(pa.array(keep)).to_pandas()
+                sub.columns = [int(c) for c in sub.columns]
+                parts.append(sub)
+    except (pa.ArrowInvalid, pa.ArrowTypeError) as exc:
+        logger.info("%s: arrow fast path not applicable (%s); pandas path",
+                    Path(path).name, str(exc)[:200])
+        return None
+    if invalid[0]:
+        logger.info("%s: %d malformed rows; re-parsing with the tolerant "
+                    "pandas path", Path(path).name, invalid[0])
+        return None
+    raw = (pd.concat(parts, ignore_index=True) if parts
+           else pd.DataFrame(columns=list(range(len(first)))))
+    out = _umd_finish(raw, mapping, first, n_rows, product, data_tier,
+                      platform_hint, version_raw, extra_bad=n_nolatlon)
+    out.attrs["header"] = first
+    return out
+
+
+def parse_umd_file(path, product: str, data_tier: str = "ML_SCIENCE",
+                   platform_hint: str | None = None,
+                   version_raw: str | None = None, bboxes=None,
+                   batch_lines: int = 400_000) -> pd.DataFrame:
+    """Parse a UMD ``MCD14ML`` / ``Vxx14IMGML`` file (``.gz`` or plain) with
+    BOUNDED memory, keeping only rows inside ``bboxes`` (all rows if None).
+
+    * Comma-delimited headed files (VIIRS) -> :func:`_parse_umd_csv_arrow`.
+    * Otherwise (whitespace MCD14ML, header-less, or malformed rows) the
+      file is streamed in ``batch_lines`` batches through
+      :func:`parse_umd_text` (the header is re-applied to every batch).
+    ``attrs``: ``n_lines`` / ``n_bad_lines`` over the WHOLE file, ``header``.
+    """
+    import gzip
+    path = Path(path)
+    opener = gzip.open if path.name.endswith(".gz") else open
+    with opener(path, "rt", errors="replace") as fh:
+        first_line = ""
+        for ln in fh:
+            if ln.strip():
+                first_line = ln.rstrip("\r\n")
+                break
+    if not first_line:
+        return _concat_parsed([], 0, 0, None)
+    sep = "," if "," in first_line else None
+    first = first_line.split(",") if sep else first_line.split()
+    mapping = _header_mapping(first)
+    if sep and mapping is not None:
+        out = _parse_umd_csv_arrow(path, first, mapping, product, data_tier,
+                                   platform_hint, version_raw, bboxes)
+        if out is not None:
+            return out
+    parts, n_lines, n_bad = [], 0, 0
+    header = [first_line] if mapping is not None else []
+
+    def _flush(batch):
+        nonlocal n_lines, n_bad
+        df = parse_umd_text(header + batch, product, data_tier, platform_hint,
+                            version_raw)
+        n_lines += df.attrs.get("n_lines", 0)
+        n_bad += df.attrs.get("n_bad_lines", 0)
+        if len(df):
+            parts.append(df[_boxes_mask(df["latitude"], df["longitude"],
+                                        bboxes)])
+
+    with opener(path, "rt", errors="replace") as fh:
+        batch: list[str] = []
+        skip_header = mapping is not None
+        for ln in fh:
+            if skip_header:
+                if ln.strip():
+                    skip_header = False
+                continue
+            batch.append(ln)
+            if len(batch) >= batch_lines:
+                _flush(batch)
+                batch = []
+        if batch:
+            _flush(batch)
+    return _concat_parsed(parts, n_lines, n_bad,
+                          first if mapping is not None else None)
 
 
 def parse_mcd14ml_rows(rows: list[str], data_tier: str = "ML_SCIENCE",

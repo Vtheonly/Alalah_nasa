@@ -10,6 +10,7 @@ and solar-date midnight rollover across +-180 degrees.
 """
 from __future__ import annotations
 
+import json
 import math
 from pathlib import Path
 
@@ -670,7 +671,7 @@ def test_01_umd_walk_descends_mx14cmq_and_stages_cloud_first(paths, monkeypatch)
     res = d.fetch_umd_history(paths, [2000, 2002], d.ProvenanceManifest(
         paths.provenance_manifest), session=_FakeUMD(tree))
     assert order == ["cloud", "cloud", "fires"]
-    cloud = pd.concat(res["cloud"])
+    cloud = pd.concat([pd.read_parquet(p) for p in res["cloud"]])
     assert set(cloud["platform"]) == {"MOD", "MYD"}
     assert set(cloud["period_kind"]) == {"month"}
     assert set(zip(cloud["year"], cloud["period"])) == {(2000, 11), (2002, 11)}
@@ -737,7 +738,7 @@ def test_01_c6_cmq_mean_land_cloud_fraction_real_hdf(paths, tmp_path, variant):
     tree = {"data/MODIS/C6/Mx14CMQ/MOD14CMQ.200011.006.01.hdf": f.read_bytes()}
     man = d.ProvenanceManifest(paths.provenance_manifest)
     res = d.fetch_umd_history(paths, [2000], man, session=_FakeUMD(tree))
-    cloud_df = pd.concat(res["cloud"])
+    cloud_df = pd.concat([pd.read_parquet(p) for p in res["cloud"]])
     assert len(cloud_df) > 1000
     assert np.allclose(cloud_df["cloud_frac"], 0.35, atol=1e-6)
     assert any(e["product"] == "MOD14C8Q_cloud_layer" and
@@ -755,3 +756,174 @@ def test_01_cmq_without_any_cloud_layer_fails_with_layer_list(tmp_path):
     v.endaccess(); sd.end()
     with pytest.raises(KeyError, match="TotalPix"):
         d.read_cloud_cmg_sds(f)
+
+
+# ---------------------------------------------------------------------------
+# Live-run hardening (Colab 2026-11-14/15): resume, negative FRP, memory, speed
+# ---------------------------------------------------------------------------
+VIIRS_C2_HEADER = "YYYYMMDD,HHMM,Sat,Lat,Lon,T_I4,T_I5,Sample,Line,Pixarea,FRP,Conf,Type,DN"
+
+
+def _viirs_lines(n, seed=0, lat=(-40.0, 10.0), lon=(-75.0, 150.0)):
+    import numpy as np
+    rng = np.random.default_rng(seed)
+    out = [VIIRS_C2_HEADER]
+    for i in range(n):
+        out.append(f"201907{rng.integers(1, 29):02d},{rng.integers(0, 2359):04d},N,"
+                   f"{rng.uniform(*lat):.5f},{rng.uniform(*lon):.5f},330.1,290.2,"
+                   f"{rng.integers(0, 6400)},{rng.integers(0, 6400)},0.18,"
+                   f"{rng.gamma(1, 5):.2f},{'nlh'[i % 3]},0,D")
+    return out
+
+
+def test_01_parse_umd_file_arrow_fast_path_matches_text_parser(tmp_path):
+    """The pyarrow fast path (VIIRS CSV) gives exactly the rows/values of
+    the tolerant text parser followed by the box filter."""
+    import gzip
+    import numpy as np
+    from src.ingest.normalize_dedup import parse_umd_file, parse_umd_text
+    from src.config import settings as S
+    boxes = [b for c in S.TARGET_COUNTRIES for b in c.prefilter_boxes]
+    lines = _viirs_lines(5000)
+    f = tmp_path / "VNP14IMGML.201907.C2.04.csv.gz"
+    f.write_bytes(gzip.compress("\n".join(lines).encode()))
+    new = parse_umd_file(f, "VNP14IMGML", platform_hint="SNPP",
+                         version_raw="C2", bboxes=boxes)
+    old = parse_umd_text(lines, "VNP14IMGML", platform_hint="SNPP",
+                         version_raw="C2")
+    keep = np.zeros(len(old), bool)
+    for (w, so, e, n) in boxes:
+        keep |= ((old.longitude >= w) & (old.longitude <= e)
+                 & (old.latitude >= so) & (old.latitude <= n)).to_numpy()
+    old = old[keep]
+    cols = [c for c in old.columns if c != "ingest_ts"]
+    key = ["latitude", "longitude", "acq_hhmm", "frp_mw"]
+    pd.testing.assert_frame_equal(
+        old[cols].sort_values(key).reset_index(drop=True),
+        new[cols].sort_values(key).reset_index(drop=True), check_dtype=False)
+    assert new.attrs["n_lines"] == 5000 and new.attrs["n_bad_lines"] == 0
+    assert 0 < len(new) < 5000
+
+
+def test_01_parse_umd_file_falls_back_on_malformed_rows(tmp_path):
+    """Rows with extra trailing fields make the arrow reader skip them; the
+    file is then re-parsed by the tolerant path, which keeps them."""
+    from src.ingest.normalize_dedup import parse_umd_file
+    lines = _viirs_lines(50, lat=(-30, -29), lon=(-68, -67))
+    lines[5] += ",EXTRA,MORE"
+    lines[9] = "junk line"
+    f = tmp_path / "VNP14IMGML.201907.C2.04.csv"
+    f.write_text("\n".join(lines))
+    df = parse_umd_file(f, "VNP14IMGML", platform_hint="SNPP", bboxes=None)
+    assert len(df) == 49 and df.attrs["n_bad_lines"] == 1
+    assert df.attrs["n_lines"] == 50
+
+
+def test_01_parse_umd_file_streams_whitespace_mcd14ml_in_batches(tmp_path):
+    """MCD14ML (whitespace) is streamed in batches with the header applied
+    to each batch: identical to a single full parse."""
+    import gzip
+    from src.ingest.normalize_dedup import parse_umd_file, parse_umd_text
+    rows = [MCD14ML_HEADER] + [
+        f"200011{d:02d} 0040 T -29.{d:03d} -67.500 330.5 295.1 681. {d}.3 74 0 D"
+        for d in range(1, 29)] * 10
+    f = tmp_path / "MCD14ML.200011.061.01.txt.gz"
+    f.write_bytes(gzip.compress("\n".join(rows).encode()))
+    a = parse_umd_file(f, "MCD14ML", batch_lines=7)
+    b = parse_umd_text(rows, "MCD14ML")
+    cols = [c for c in b.columns if c != "ingest_ts"]
+    pd.testing.assert_frame_equal(a[cols].reset_index(drop=True),
+                                  b[cols].reset_index(drop=True),
+                                  check_dtype=False)
+    assert a.attrs["n_lines"] == 280 and a.attrs["header"] is not None
+
+
+def test_01_negative_frp_rows_dropped_or_file_rejected():
+    from src.ingest.download_data import drop_negative_frp_rows
+    df = pd.DataFrame({"frp_mw": [5.0] * 699 + [-21.0]})
+    out, n = drop_negative_frp_rows(df, "MCD14ML.200708")
+    assert n == 1 and len(out) == 699 and (out["frp_mw"] >= 0).all()
+    with pytest.raises(ValueError, match="negative FRP"):
+        drop_negative_frp_rows(pd.DataFrame({"frp_mw": [5.0] * 90 + [-1.0] * 10}),
+                               "bad")
+
+
+def _mcd14ml_gz(month, lines_extra=()):
+    import gzip
+    body = [MCD14ML_HEADER,
+            f"2001{month:02d}01 0040 T -29.160 -67.500 330.5 295.1 681. 25.3 74 0 D",
+            f"2001{month:02d}02 0040 T -29.170 -67.510 330.5 295.1 681. 12.0 74 0 D",
+            *lines_extra,
+            # 200 rows outside every target box (the 1% threshold is relative
+            # to the whole file, as for the real 1-in-699,186 case)
+            *[f"2001{month:02d}03 0040 T 10.000 10.000 330 295 681. 9.0 74 0 D"] * 200]
+    return gzip.compress("\n".join(body).encode())
+
+
+def test_01_resume_counts_staged_files_and_drops_negative_frp(paths):
+    """Colab failure: on resume, 304 staged months were skipped WITHOUT being
+    counted, so 3 new months failing (negative FRP) tripped the fail-fast
+    abort.  Staged files now count as successes, a single negative-FRP row
+    is dropped instead of discarding the month, and a resumed run downloads
+    nothing that is already staged."""
+    from src.ingest import download_data as d
+    neg = ("20010301 0041 T -29.180 -67.520 330.5 295.1 681. -21.0 74 0 D",)
+    tree = {f"data/MODIS/C61/MCD14ML/MCD14ML.2001{m:02d}.061.01.txt.gz":
+            _mcd14ml_gz(m, neg if m in (3, 7, 11) else ()) for m in range(1, 13)}
+    sess = _FakeUMD(tree)
+    downloads = []
+    orig = sess.download
+    sess.download = lambda r, p: (downloads.append(r), orig(r, p))[1]
+    man = d.ProvenanceManifest(paths.provenance_manifest)
+    res = d.fetch_umd_history(paths, [2001], man, session=sess)
+    assert len(res["fires"]) == 12 and len(downloads) == 12
+    staged = pd.read_parquet(next(p for p in res["fires"] if "200103" in p.name))
+    assert len(staged) == 2 and (staged["frp_mw"] >= 0).all()
+    parsed = [json.loads(e["detail"]) for e in man.entries
+              if e["product"] == "MCD14ML_parsed"]
+    assert sum(p["negative_frp_rows_dropped"] for p in parsed) == 3
+    assert not list(Path(paths.raw_stage_dir).glob("*.part"))
+    # resume: 9 months staged, 3 corrupt new months -> no fail-fast abort
+    for p in res["fires"][:3]:
+        Path(p).unlink()
+    for r in list(tree)[:3]:
+        tree[r] = b"\x1f\x8b corrupt"
+    downloads.clear()
+    res2 = d.fetch_umd_history(paths, [2001], d.ProvenanceManifest(
+        paths.provenance_manifest), session=sess)
+    assert len(downloads) == 3 and len(res2["fires"]) == 9
+
+
+def test_01_cloud_assembly_streamed_equals_in_memory(tmp_path):
+    """assemble_cloud_table (per-period streaming over per-file parts) ==
+    finalize_cloud_table + build_cloud_climatology_fallback."""
+    import numpy as np
+    from src.ingest import download_data as d
+    rng = np.random.default_rng(1)
+    parts = []
+    for y in (2011, 2012, 2013):
+        for m in (1, 2):
+            for plat in ("MOD", "MYD"):
+                f = pd.DataFrame({"lat_025": np.repeat([-29.125, -29.375], 3),
+                                  "lon_025": np.tile([-67.125, -67.375, -67.625], 2),
+                                  "cloud_frac": rng.uniform(0, 1, 6),
+                                  "year": y, "period": m, "period_kind": "month",
+                                  "platform": plat})
+                p = tmp_path / f"{plat}_{y}_{m}.parquet"
+                d.compact_cmg_frame(f).to_parquet(p)
+                parts.append(p if plat == "MOD" else f)   # paths and frames
+    out = tmp_path / "cloud.parquet"
+    clim = tmp_path / "clim.parquet"
+    info = d.assemble_cloud_table(parts, out, clim)
+    ref = d.finalize_cloud_table([pd.read_parquet(p) if isinstance(p, Path)
+                                  else p for p in parts])
+    got = pd.read_parquet(out)
+    key = ["year", "period", "lat_025", "lon_025"]
+    m = ref.merge(got, on=key, suffixes=("_r", "_g"))
+    assert len(m) == len(ref) == len(got) == info["rows"] == 36
+    assert np.allclose(m["cloud_frac_r"], m["cloud_frac_g"], atol=1e-6)
+    ref_c = d.build_cloud_climatology_fallback(ref)
+    got_c = pd.read_parquet(clim)
+    mc = ref_c.merge(got_c, on=["lat_025", "lon_025", "month"])
+    assert len(mc) == len(ref_c) == len(got_c) == 12
+    assert np.allclose(mc["cloud_frac_clim_x"], mc["cloud_frac_clim_y"], atol=1e-6)
