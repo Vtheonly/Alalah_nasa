@@ -47,6 +47,7 @@ neighbours).
 from __future__ import annotations
 
 import math
+import logging
 import os
 import pickle
 import tempfile
@@ -59,6 +60,8 @@ from ..config import settings as S
 from . import cuda_kernels, likelihoods
 from . import thomas_takahashi as tt
 from .priors import DRIFT_START_T, cloud_fraction_matrix
+
+logger = logging.getLogger("fire_harmonizer.engine.solver")
 
 DN_STATES = ("D", "N")
 T0 = pd.Timestamp(S.DATE_START)
@@ -946,10 +949,67 @@ def _chunk_job(shared, ci, chunk, device, use_cuda, opts):
                       keep_years=opts["keep_years"],
                       keep_solver=opts["keep_solver"],
                       seed=S.GMM_RANDOM_STATE + ci)
-    if not opts["keep_states"]:
-        for k in ("z_map", "var", "cloud", "cloud_source"):
-            res.pop(k, None)
+    if not (opts["keep_states"] or opts.get("save_states")):
+        _drop_states(res)
     return res
+
+
+_STATE_KEYS = ("z_map", "var", "cloud", "cloud_source")
+
+
+def _drop_states(res):
+    for k in _STATE_KEYS:
+        res.pop(k, None)
+
+
+def _finish_chunk(res, ci, opts):
+    """Checkpoint the dense states (float32) then drop them unless the
+    caller asked to keep them: a (1000 x 9510) chunk carries ~240 MB of
+    state arrays, which summed over hundreds of chunks in the parent
+    process would need tens of GB of RAM per solve."""
+    res.pop("solver", None) if not opts.get("keep_solver") else None
+    if opts["checkpoint_dir"]:
+        _save_chunk_checkpoint(opts["checkpoint_dir"], ci, res)
+    if not opts["keep_states"]:
+        _drop_states(res)
+    return res
+
+
+def _dump_atomic(obj, path):
+    tmp_path = path + ".part"
+    with open(tmp_path, "wb") as fh:
+        pickle.dump(obj, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp_path, path)
+
+
+def _chunk_path(out_dir, ci):
+    return os.path.join(out_dir, f"chunk_{ci:06d}.pkl")
+
+
+def _solve_tag(pass_table, cells, batch_size, opts, platform_mask,
+               platform_active) -> str:
+    """Fingerprint of everything that determines a solve's chunk results
+    (inputs, cells, batching, options, platform mask) -- NOT the number of
+    workers, so a retry with fewer workers reuses finished chunks."""
+    import hashlib
+    h = hashlib.sha256()
+    h.update(np.asarray(cells, dtype=np.int64).tobytes())
+    h.update(repr(int(batch_size)).encode())
+    h.update(repr(sorted((k, v) for k, v in opts.items()
+                         if k not in ("checkpoint_dir", "keep_solver"))).encode())
+    h.update(pickle.dumps(platform_mask))
+    h.update(repr(sorted((k, len(v)) for k, v in (platform_active or {}).items())
+                  ).encode())
+    if pass_table is not None and len(pass_table):
+        h.update(repr((len(pass_table), list(pass_table.columns))).encode())
+        sample = pass_table.iloc[:: max(1, len(pass_table) // 5000)]
+        h.update(pd.util.hash_pandas_object(sample, index=False)
+                 .to_numpy().tobytes())
+        for c in pass_table.columns:
+            if pd.api.types.is_numeric_dtype(pass_table[c]):
+                h.update(repr(float(np.nansum(pass_table[c].to_numpy(
+                    dtype=np.float64)))).encode())
+    return h.hexdigest()[:20]
 
 
 def _gpu_worker(rank, n_workers, n_devices, job_file, out_dir):
@@ -960,15 +1020,15 @@ def _gpu_worker(rank, n_workers, n_devices, job_file, out_dir):
     dev = f"cuda:{rank % n_devices}"
     torch.cuda.set_device(rank % n_devices)
     use_cuda = cuda_kernels.cuda_available()
-    for ci, chunk in enumerate(job["chunks"]):
-        if ci % n_workers != rank:
-            continue
-        res = _chunk_job(job["shared"], ci, chunk, dev, use_cuda, job["opts"])
-        res.pop("solver", None)
-        if job["opts"]["checkpoint_dir"]:
-            _save_chunk_checkpoint(job["opts"]["checkpoint_dir"], ci, res)
-        with open(os.path.join(out_dir, f"chunk_{ci:06d}.pkl"), "wb") as fh:
-            pickle.dump(res, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    opts = dict(job["opts"], keep_solver=False)
+    todo = job["todo"]                    # chunk indices not yet solved
+    for k, ci in enumerate(todo):
+        if k % n_workers != rank or os.path.exists(_chunk_path(out_dir, ci)):
+            continue                      # other worker's chunk / resumed
+        res = _chunk_job(job["shared"], ci, job["chunks"][ci], dev, use_cuda,
+                         opts)
+        _dump_atomic(_finish_chunk(res, ci, opts), _chunk_path(out_dir, ci))
+        del res
         torch.cuda.empty_cache()
 
 
@@ -1012,7 +1072,8 @@ def solve_all_chunks(pass_table, active_cells, hex_pyromes, priors,
     opts = {"t_days": t_days, "sweeps": sweeps, "max_sweeps": max_sweeps,
             "daily_mode": daily_mode,
             "keep_years": keep_years,
-            "keep_states": keep_states or checkpoint_dir is not None,
+            "keep_states": keep_states,
+            "save_states": checkpoint_dir is not None,
             "keep_solver": n_dev <= 1, "checkpoint_dir": checkpoint_dir}
     shared = {"pass_table": pass_table, "hex_pyromes": hex_pyromes,
               "priors": priors, "artifacts": artifacts, "cloud_df": cloud_df,
@@ -1020,26 +1081,60 @@ def solve_all_chunks(pass_table, active_cells, hex_pyromes, priors,
               "platform_mask": platform_mask}
     n_workers = n_dev * max(1, int(workers_per_gpu))
     results = []
-    if n_dev >= 1 and n_workers >= 2 and len(chunks) >= 2:
-        import torch.multiprocessing as tmp
-        with tempfile.TemporaryDirectory(prefix="fh_solve_") as td:
-            job_file = os.path.join(td, "job.pkl")
-            with open(job_file, "wb") as fh:
-                pickle.dump({"chunks": chunks, "shared": shared, "opts": opts},
-                            fh, protocol=pickle.HIGHEST_PROTOCOL)
-            tmp.spawn(_gpu_worker, args=(n_workers, n_dev, job_file, td),
-                      nprocs=min(n_workers, len(chunks)), join=True)
-            for ci in range(len(chunks)):
-                with open(os.path.join(td, f"chunk_{ci:06d}.pkl"), "rb") as fh:
+    # Resumable chunk results: with FIRE_HARMONIZER_RESUME_DIR set, every
+    # finished chunk is kept under <dir>/<solve fingerprint>/ and a re-run
+    # (e.g. after an out-of-memory kill, with fewer workers) skips it.
+    resume_root = os.environ.get("FIRE_HARMONIZER_RESUME_DIR")
+    tmp_ctx = tempfile.TemporaryDirectory(prefix="fh_solve_")
+    with tmp_ctx as td:
+        out_dir = td
+        if resume_root:
+            tag = _solve_tag(pass_table, cells, batch_size, opts,
+                             platform_mask, platform_active)
+            out_dir = os.path.join(resume_root, f"solve_{tag}")
+            os.makedirs(out_dir, exist_ok=True)
+        done = sum(os.path.exists(_chunk_path(out_dir, ci))
+                   for ci in range(len(chunks)))
+        if done:
+            logger.info("resume: %d / %d chunks already solved in %s", done,
+                        len(chunks), out_dir)
+        if done < len(chunks):
+            if n_dev >= 1 and n_workers >= 2 and len(chunks) >= 2:
+                import torch.multiprocessing as tmp
+                todo = [ci for ci in range(len(chunks))
+                        if not os.path.exists(_chunk_path(out_dir, ci))]
+                nprocs = min(n_workers, len(todo))
+                job_file = os.path.join(td, "job.pkl")
+                with open(job_file, "wb") as fh:
+                    pickle.dump({"chunks": chunks, "shared": shared,
+                                 "opts": opts, "todo": todo}, fh,
+                                protocol=pickle.HIGHEST_PROTOCOL)
+                tmp.spawn(_gpu_worker, args=(nprocs, n_dev, job_file,
+                                             out_dir),
+                          nprocs=nprocs, join=True)
+            else:
+                device = "cuda:0" if n_dev >= 1 else "cpu"
+                use_cuda = (cuda_kernels.cuda_available() if n_dev >= 1
+                            else False)
+                for ci, chunk in enumerate(chunks):
+                    if os.path.exists(_chunk_path(out_dir, ci)):
+                        continue
+                    res = _finish_chunk(_chunk_job(shared, ci, chunk, device,
+                                                   use_cuda, opts), ci, opts)
+                    if resume_root:
+                        keep = res.pop("solver", None)
+                        _dump_atomic(res, _chunk_path(out_dir, ci))
+                        if keep is not None:
+                            res["solver"] = keep
+                    results.append((ci, res))
+        in_mem = dict(results)
+        results = []
+        for ci in range(len(chunks)):
+            if ci in in_mem:
+                results.append(in_mem.pop(ci))
+            else:
+                with open(_chunk_path(out_dir, ci), "rb") as fh:
                     results.append(pickle.load(fh))
-    else:
-        device = "cuda:0" if n_dev >= 1 else "cpu"
-        use_cuda = cuda_kernels.cuda_available() if n_dev >= 1 else False
-        for ci, chunk in enumerate(chunks):
-            res = _chunk_job(shared, ci, chunk, device, use_cuda, opts)
-            if checkpoint_dir:
-                _save_chunk_checkpoint(checkpoint_dir, ci, res)
-            results.append(res)
     out = {"cells": np.concatenate([r["cells"] for r in results])
            if results else cells,
            "monthly": pd.concat([r["monthly"] for r in results],

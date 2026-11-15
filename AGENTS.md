@@ -536,3 +536,38 @@ scale here (no real data in this sandbox): remaining full-size in-RAM
 tables on Kaggle are `prov_bio` (14 cols, ~110 B/row) inside calibration,
 pass_obs / pass_calibrated (one row per cell-day-platform-dn) and the cloud
 table; DuckDB builds the Product 1 table out-of-core.
+
+### Kaggle robustness: resource profiles, OOM fallback ladder, resumable solves
+
+* **Parent-process RAM bug fixed** (`solver.solve_all_chunks`): with a
+  checkpoint dir, `keep_states` was forced True, so every chunk result
+  shipped its dense `z_map/var/cloud/cloud_source` arrays (~240 MB per
+  1000-cell chunk) back to the parent -> ~70 GB per solve at real scale
+  even though `run_env2_gpu_solve.py` asks for `keep_states=False`. Now
+  `save_states` (checkpoint) and `keep_states` (caller) are separate and
+  `_finish_chunk` drops the arrays after the float32 checkpoint.
+* **Resumable chunks**: with `FIRE_HARMONIZER_RESUME_DIR` set, finished
+  chunk results are written atomically to
+  `<dir>/solve_<fingerprint>/chunk_XXXXXX.pkl`; the fingerprint covers the
+  pass table (sampled hash + column sums), cells, batch size, solve
+  options and platform mask -- NOT the worker count, so a retry with fewer
+  workers reuses finished chunks, while a different batch size / fold /
+  input never mixes. Workers split the REMAINING chunk list (`job["todo"]`)
+  so fewer processes still cover everything exactly once.
+* `run_env2_validate.py --workers-per-gpu` now reaches the ablation solve
+  (it was parsed but ignored).
+* Notebook 2: `RESOURCE_PROFILE` = auto | safe (1/GPU) | balanced (2) |
+  fast (3) | custom; `plan_resources()` sizes workers from total RAM, GPU
+  memory and the real cpu_prep output sizes, re-planned with the timing
+  gate's measured peak VRAM; `run_engine_stage()` walks a ladder (fewer
+  workers -> smaller chunks as a flagged last resort) ONLY on
+  resource failures (rc -9/137/-6/134, CUDA/host OOM, SIGKILL, disk full);
+  any other error stops at once. `resource_plan.json` and
+  `resource_attempts.json` go to `run_report/`; the resume dir lives in
+  `/kaggle/tmp` and is removed after validation succeeds.
+* Tests: test_06 resume (interrupted single-process solve == uninterrupted,
+  only the lost chunk recomputed, states dropped, batch size -> new
+  fingerprint) + worker distribution of remaining chunks with fewer
+  workers. Notebook ladder exercised by executing its cells with a stubbed
+  stage runner (OOM -> step down; real error -> no retry). NOT run on a
+  real GPU / Kaggle.

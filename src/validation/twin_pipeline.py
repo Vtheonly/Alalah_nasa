@@ -103,7 +103,8 @@ def run(det, cells, z_true, truth, cloud_df, cfg, paths=None,
 
 def viirs_masked_ablation_fold(pass_cal, active_cells, hex_pyromes, priors,
                                artifacts, cloud_df, platform_active,
-                               t_days: int, batch_size: int = S.BATCH_SIZE):
+                               t_days: int, batch_size: int = S.BATCH_SIZE,
+                               workers_per_gpu: int = 1):
     """Re-solve with ALL VIIRS platforms masked over 2019-01-01..2021-12-31
     (readme 2019-2021 VIIRS-masked ablation); 2019-2021 monthly rows."""
     viirs = [S.PLATFORM_INDEX[p] for p in S.VIIRS_PLATFORMS]
@@ -113,7 +114,8 @@ def viirs_masked_ablation_fold(pass_cal, active_cells, hex_pyromes, priors,
         pass_cal, active_cells, hex_pyromes, priors, artifacts, cloud_df,
         t_days=t_days, platform_active=platform_active,
         platform_mask=slv.PlatformMask(viirs, t19, t21), daily_mode="none",
-        keep_years=(2019, 2021), keep_states=False, batch_size=batch_size)
+        keep_years=(2019, 2021), keep_states=False, batch_size=batch_size,
+        workers_per_gpu=workers_per_gpu)
     m = fold["monthly"].merge(hex_pyromes[["h3_index", "pyrome_id"]]
                               .drop_duplicates("h3_index"),
                               on="h3_index", how="left")

@@ -78,7 +78,8 @@ def main(argv=None) -> int:
         cells = sorted(set(int(c) for c in pass_cal["h3_index"].unique()))
         ablation = viirs_masked_ablation_fold(
             pass_cal, cells, hex_pyromes, blob["priors"], artifacts, cloud_df,
-            blob.get("platform_active_day"), S.T_DAYS, args.batch_size)
+            blob.get("platform_active_day"), S.T_DAYS, args.batch_size,
+            workers_per_gpu=args.workers_per_gpu)
         logger.info("VIIRS-masked 2019-2021 ablation re-solve done (%.0fs)",
                     time.time() - t0)
     diag = run_diagnostics(monthly, truth=None, burned_area=burned,

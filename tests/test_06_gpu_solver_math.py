@@ -409,3 +409,75 @@ def test_06_thomas_batch_and_t_shapes():
     eps = torch.randn(7, 11, 3)
     u = tt.joint_cholesky_sample(l, d, eps)
     assert u.shape == (7, 11, 3)
+
+
+# ---------------------------------------------------------------------------
+# Resumable chunk results (Kaggle: retry after an out-of-memory kill)
+# ---------------------------------------------------------------------------
+def test_06_solve_resume_skips_finished_chunks_and_is_identical(short_twin,
+                                                                tmp_path,
+                                                                monkeypatch):
+    import numpy as np
+    import pandas as pd
+    from src.engine import solver as slv
+    tw = short_twin
+    cells = np.array(sorted(set(int(c) for c in tw["pass_cal"]["h3_index"])))[:6]
+    args = (tw["pass_cal"], cells, tw["hex_pyromes"], tw["priors"],
+            tw["artifacts"], tw["cloud_df"])
+    kw = dict(t_days=tw["cfg"].t_days, platform_active=tw["platform_active"],
+              batch_size=2, keep_states=False, n_devices=0)
+    ref = slv.solve_all_chunks(*args, **kw)               # no resume dir
+    root = tmp_path / "resume"
+    monkeypatch.setenv("FIRE_HARMONIZER_RESUME_DIR", str(root))
+    calls = []
+    real = slv._chunk_job
+    monkeypatch.setattr(slv, "_chunk_job",
+                        lambda *a, **k: (calls.append(a[1]), real(*a, **k))[1])
+    first = slv.solve_all_chunks(*args, **kw)
+    assert sorted(calls) == [0, 1, 2]
+    solve_dirs = list(root.glob("solve_*"))
+    assert len(solve_dirs) == 1
+    assert len(list(solve_dirs[0].glob("chunk_*.pkl"))) == 3
+    assert not list(solve_dirs[0].glob("*.part"))
+    # "crash": chunk 1 lost -> only chunk 1 is recomputed
+    (solve_dirs[0] / "chunk_000001.pkl").unlink()
+    calls.clear()
+    again = slv.solve_all_chunks(*args, **kw)
+    assert calls == [1]
+    key = ["h3_index", "year", "month"]
+    for out in (first, again):
+        pd.testing.assert_frame_equal(
+            ref["monthly"].sort_values(key).reset_index(drop=True),
+            out["monthly"].sort_values(key).reset_index(drop=True))
+        assert "z_map" not in out["results"][0]       # states dropped
+    # different batching -> different fingerprint, never mixed
+    slv.solve_all_chunks(*args, **dict(kw, batch_size=3))
+    assert len(list(root.glob("solve_*"))) == 2
+
+
+def test_06_gpu_worker_distributes_only_remaining_chunks(tmp_path, monkeypatch):
+    """A retry with FEWER workers must still cover every unfinished chunk
+    exactly once (workers split the remaining list, not ci % n_workers)."""
+    import pickle
+    from src.engine import solver as slv
+    done_before = {0, 3, 4}
+    for ci in done_before:
+        slv._dump_atomic({"ci": ci}, slv._chunk_path(str(tmp_path), ci))
+    todo = [ci for ci in range(10) if ci not in done_before]
+    job = tmp_path / "job.pkl"
+    job.write_bytes(pickle.dumps({"chunks": [[ci] for ci in range(10)],
+                                  "shared": {}, "todo": todo,
+                                  "opts": {"keep_states": False,
+                                           "checkpoint_dir": None}}))
+    solved = []
+    monkeypatch.setattr(slv, "_chunk_job",
+                        lambda shared, ci, chunk, dev, use_cuda, opts:
+                        (solved.append(ci), {"ci": ci, "z_map": 1})[1])
+    monkeypatch.setattr(slv.torch.cuda, "set_device", lambda d: None)
+    monkeypatch.setattr(slv.torch.cuda, "empty_cache", lambda: None)
+    for rank in range(3):                      # 3 workers instead of e.g. 8
+        slv._gpu_worker(rank, 3, 4, str(job), str(tmp_path))
+    assert sorted(solved) == todo
+    for ci in range(10):
+        res = pickle.loads(open(slv._chunk_path(str(tmp_path), ci), "rb").read())
+        assert res["ci"] == ci and "z_map" not in res
