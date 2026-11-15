@@ -28,6 +28,38 @@ REQUIRED_TABLES = ("state_reconstructed_monthly", "uncertainty_diagnostics",
 FULL_YEARS = (2001, 2025)      # complete calendar years for annual statistics
 COUNTRY_NAMES = {c.iso3: c.name for c in S.TARGET_COUNTRIES}
 PLATFORM_ORDER = ["Terra", "Aqua", "SNPP", "NOAA-20", "NOAA-21"]
+# Nominal mission parameters (public mission documentation) used to draw
+# each sun-synchronous orbit on the 3-D globe.  ``ltan_h`` = local time of
+# the ascending node (Terra crosses the equator descending at 10:30, i.e.
+# ascending at 22:30); ``phase_deg`` spaces the JPSS satellites along the
+# same orbit (NOAA-20 ~half an orbit from S-NPP, NOAA-21 ~a quarter).
+SATELLITES = {
+    "Terra": {"sensor": "MODIS", "pixel_m": 1000, "altitude_km": 705,
+              "inclination_deg": 98.2, "period_min": 98.9, "ltan_h": 22.5,
+              "crossing": "10:30 descending", "swath_km": 2330,
+              "launch": "1999-12-18", "end": None, "phase_deg": 0,
+              "note": "orbit drifting to earlier crossing times since 2022"},
+    "Aqua": {"sensor": "MODIS", "pixel_m": 1000, "altitude_km": 705,
+             "inclination_deg": 98.2, "period_min": 98.8, "ltan_h": 13.5,
+             "crossing": "13:30 ascending", "swath_km": 2330,
+             "launch": "2002-05-04", "end": None, "phase_deg": 140,
+             "note": "orbit drifting to later crossing times since 2022"},
+    "SNPP": {"sensor": "VIIRS", "pixel_m": 375, "altitude_km": 824,
+             "inclination_deg": 98.7, "period_min": 101.4, "ltan_h": 13.42,
+             "crossing": "13:25 ascending", "swath_km": 3060,
+             "launch": "2011-10-28", "end": "2026-11-02", "phase_deg": 0,
+             "note": "first VIIRS: 375 m fire detection from 2012"},
+    "NOAA-20": {"sensor": "VIIRS", "pixel_m": 375, "altitude_km": 824,
+                "inclination_deg": 98.7, "period_min": 101.4, "ltan_h": 13.42,
+                "crossing": "13:25 ascending", "swath_km": 3060,
+                "launch": "2017-11-18", "end": None, "phase_deg": 180,
+                "note": "JPSS-1, half an orbit from S-NPP"},
+    "NOAA-21": {"sensor": "VIIRS", "pixel_m": 375, "altitude_km": 824,
+                "inclination_deg": 98.7, "period_min": 101.4, "ltan_h": 13.42,
+                "crossing": "13:25 ascending", "swath_km": 3060,
+                "launch": "2022-11-10", "end": None, "phase_deg": 90,
+                "note": "JPSS-2, a quarter orbit from NOAA-20"},
+}
 S_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep",
             "Oct", "Nov", "Dec"]
 
@@ -731,6 +763,34 @@ class HarmonizedStore:
                                         {"name": "Mean", "role": "harmonized",
                                          "data": [_f(x, 1) for x in seas["mean"]]}]}},
             "anomalies": anomalies, "by_country": by_country}
+
+    # ------------------------------------------------------------------ globe
+    def globe(self, year: int, month: int, limit: int = 2000) -> dict:
+        """3-D globe: the month's most active hexagons (all countries) +
+        the constellation (nominal mission parameters joined with each
+        platform's actual span and detection count in this record)."""
+        hot = self._df(f"""
+            SELECT m.h3_index, c.latitude, c.longitude, m.country_iso,
+                   m.phi_q50_mw, m.fre_tj_q50, m.anomaly_ratio,
+                   m.raw_count_sum
+            FROM state_reconstructed_monthly m JOIN hex_centers c
+              ON m.h3_index = c.h3_index
+            WHERE m.year = ? AND m.month = ? AND m.phi_q50_mw > 0.05
+            ORDER BY m.fre_tj_q50 DESC LIMIT {int(limit)}""", [year, month])
+        rec = {p["platform"]: p for p in self.overview()["platforms"]}
+        sats = []
+        for name, meta in SATELLITES.items():
+            r = rec.get(name, {})
+            sats.append({"platform": name, **meta,
+                         "record_first": r.get("first"), "record_last": r.get("last"),
+                         "n_detections": r.get("n_detections")})
+        return {"year": year, "month": month, "satellites": sats,
+                "hotspots": [[str(int(a)), round(float(b), 4), round(float(c), 4), d,
+                              _f(e, 2), _f(f, 1), _f(g, 2), int(h or 0)]
+                             for a, b, c, d, e, f, g, h in hot.itertuples(index=False)],
+                "hotspot_columns": ["h3_index", "lat", "lon", "country_iso",
+                                    "phi_q50_mw", "fre_tj", "anomaly_ratio",
+                                    "raw_count"]}
 
     # ----------------------------------------------------------------- replay
     def replay(self, iso: str | None, year: int, month: int, step: str = "day",

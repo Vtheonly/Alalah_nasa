@@ -198,3 +198,21 @@ def test_11_replay_by_day_and_by_overpass_hour(env, synthetic_db):
           AND YEAR(solar_date) = 2020 AND MONTH(solar_date) = 9""").fetchone()[0]
     assert n == len(day["detections"])
     assert c.get("/api/replay", params=dict(year=2020, month=9, step="week")).status_code == 422
+
+
+def test_11_globe_constellation_and_hotspots(env, synthetic_db):
+    c = env(FH_DATA_PROVIDER="synthetic", FH_SYNTHETIC_DB=synthetic_db)
+    g = c.get("/api/globe", params=dict(year=2020, month=9)).json()
+    assert g["provenance"]["is_synthetic"]
+    names = [s["platform"] for s in g["satellites"]]
+    assert names == ["Terra", "Aqua", "SNPP", "NOAA-20", "NOAA-21"]
+    for s in g["satellites"]:
+        assert 690 <= s["altitude_km"] <= 830 and 97 < s["inclination_deg"] < 99
+        assert s["record_first"] and s["n_detections"] > 0
+    snpp = next(s for s in g["satellites"] if s["platform"] == "SNPP")
+    assert snpp["record_first"] >= "2012-01" and snpp["end"] == "2026-11-02"
+    assert g["hotspots"] and all(-90 <= h[1] <= 90 and -180 <= h[2] <= 180
+                                 for h in g["hotspots"])
+    fre = [h[5] for h in g["hotspots"]]
+    assert fre == sorted(fre, reverse=True)
+    assert c.get("/api/globe", params=dict(year=2020, month=0)).status_code == 422

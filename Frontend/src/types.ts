@@ -181,3 +181,30 @@ export interface ReplayData {
   truncated: { cells: boolean; detections: boolean };
   n_detections_month: number;
 }
+
+export interface SatelliteMeta {
+  platform: string;
+  sensor: string;
+  pixel_m: number;
+  altitude_km: number;
+  inclination_deg: number;
+  period_min: number;
+  ltan_h: number;
+  crossing: string;
+  swath_km: number;
+  launch: string;
+  end: string | null;
+  phase_deg: number;
+  note: string;
+  record_first: string | null;
+  record_last: string | null;
+  n_detections: number | null;
+}
+
+export interface GlobeData {
+  provenance: Provenance;
+  year: number;
+  month: number;
+  satellites: SatelliteMeta[];
+  hotspots: Array<[string, number, number, string, number | null, number | null, number | null, number]>;
+}

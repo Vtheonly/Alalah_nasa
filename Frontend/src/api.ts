@@ -1,5 +1,5 @@
 import type {
-  CalendarCell, CellTrace, ReplayData, ChallengeDetail, ChallengeSummary, HexCollection,
+  CalendarCell, CellTrace, GlobeData, ReplayData, ChallengeDetail, ChallengeSummary, HexCollection,
   Insights, Overview, Region, Status, Validation,
 } from "./types";
 
@@ -37,6 +37,7 @@ export const api = {
       min_lon: r.bbox[0], min_lat: r.bbox[1], max_lon: r.bbox[2], max_lat: r.bbox[3],
       year, month, color_by: colorBy, country_iso: r.iso,
     })}`, s),
+  globe: (year: number, month: number, s?: AbortSignal) => get<GlobeData>(`/api/globe?${q({ year, month })}`, s),
   replay: (iso: string, year: number, month: number, step: "day" | "hour", s?: AbortSignal) =>
     get<ReplayData>(`/api/replay?${q({ country_iso: iso, year, month, step })}`, s),
   cell: (h3: string, year: number | null, month: number | null, s?: AbortSignal) =>

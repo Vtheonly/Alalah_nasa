@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { Activity, BarChart3, CheckCircle2, Compass, Flame, Microscope, Puzzle } from "lucide-react";
+import { lazy, Suspense, useEffect, useState } from "react";
+import { Activity, BarChart3, CheckCircle2, Compass, Flame, Globe2, Microscope, Puzzle } from "lucide-react";
 import { api } from "./api";
 import type { Status } from "./types";
 import { ProvenanceBanner, ProvenancePill } from "./components/Provenance";
@@ -9,6 +9,8 @@ import Challenges from "./views/Challenges";
 import ValidationView from "./views/Validation";
 import InsightsView from "./views/Insights";
 import Trace from "./views/Trace";
+
+const GlobeView = lazy(() => import("./views/GlobeView"));   // three.js only loads here
 
 export type Route = { page: string; args: string[] };
 
@@ -23,6 +25,7 @@ export function go(path: string) {
 
 const NAV = [
   { id: "overview", label: "Overview", icon: Compass },
+  { id: "globe", label: "3D globe", icon: Globe2 },
   { id: "explorer", label: "Explorer", icon: Activity },
   { id: "challenges", label: "Challenges & solutions", icon: Puzzle },
   { id: "validation", label: "Validation", icon: CheckCircle2 },
@@ -66,6 +69,7 @@ export default function App() {
       {error && <div className="banner banner-unvalidated">API unreachable: {error}</div>}
       <main className="page">
         {page === "overview" && <Overview status={status} />}
+        {page === "globe" && <Suspense fallback={<div className="skeleton" style={{ height: 640 }} />}><GlobeView /></Suspense>}
         {page === "explorer" && <Explorer args={route.args} />}
         {page === "challenges" && <Challenges args={route.args} />}
         {page === "validation" && <ValidationView />}

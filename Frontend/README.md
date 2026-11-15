@@ -12,6 +12,7 @@ provenance the backend reports on every page.
 | Page | What it demonstrates |
 |---|---|
 | Overview | Satellites behind the record, the processing pipeline, validation summary |
+| 3D globe | The five fire satellites on their sun-synchronous orbits (nominal altitude, inclination, period, equator-crossing time) over NASA Blue Marble imagery, with swath rings; fire hexagons light up when a swath passes; month slider (only satellites flying then), speed, follow-a-satellite |
 | Explorer | H3 map (fire power / anomaly / uncertainty / evidence), month player, burning calendar, time series (raw vs harmonized) |
 | Explorer → Replay | Pick a month on the burning calendar and replay it **day by day** or **overpass by overpass (hour)**: hexagons glow with the harmonized daily fire power and fade (heat trail), raw detections flash coloured by satellite, activity strip to scrub |
 | Challenges & solutions | 8 scientific/technical challenges, each with problem, solution, live evidence and the implementing modules |
@@ -42,3 +43,7 @@ Development with hot reload: `make serve` in one terminal, `npm run dev` in
 `auto`/`real` serve the real output only if it passes the critical validation
 checks; otherwise the synthetic store (fallback on) or the real output labelled
 *not validated* (fallback off). `make demo` forces synthetic data.
+
+Earth textures (`public/textures/`: Blue Marble, topology, night sky) come
+from the `three-globe` package (NASA Blue Marble imagery) and are bundled so
+the globe works offline. The 3D page is lazy-loaded (three.js chunk ~2 MB).

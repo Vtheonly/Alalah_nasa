@@ -342,6 +342,14 @@ def api_cell(h3_index: str, year: int | None = None, month: int | None = None):
     return {"provenance": prov(), **out}
 
 
+@app.get("/api/globe")
+def api_globe(year: int = 2020, month: int = 9):
+    """3-D globe: constellation parameters + the month's top fire hexagons."""
+    if not 1 <= month <= 12:
+        raise HTTPException(422, "month must be 1..12")
+    return {"provenance": prov(), **store().globe(year, month)}
+
+
 @app.get("/api/replay")
 def api_replay(year: int, month: int, country_iso: str | None = None,
                step: str = "day"):
@@ -389,9 +397,10 @@ def api_export_csv(min_lon: float, min_lat: float, max_lon: float, max_lat: floa
 
 
 # ------------------------------------------------------------- frontend
-if (FRONTEND_DIST / "assets").is_dir():
-    app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIST / "assets")),
-              name="assets")
+for _sub in ("assets", "textures"):     # built bundle + Blue Marble textures
+    if (FRONTEND_DIST / _sub).is_dir():
+        app.mount(f"/{_sub}", StaticFiles(directory=str(FRONTEND_DIST / _sub)),
+                  name=_sub)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 

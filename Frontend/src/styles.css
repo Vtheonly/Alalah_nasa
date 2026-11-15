@@ -295,3 +295,19 @@ details summary { cursor: pointer; color: var(--sky); font-size: 13px; }
 .ym.wide { min-width: 170px; }
 .small-btn { padding: 6px 12px; font-size: 13px; }
 @media (max-width: 1100px) { .replay-body { grid-template-columns: 1fr; } .replay-side { border-left: 0; border-top: 1px solid var(--line); } }
+
+/* ---------- 3D globe ---------- */
+.globe-layout { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 18px; align-items: start; }
+.globe-card { padding: 0; overflow: hidden; position: relative; background: radial-gradient(circle at 50% 45%, #0b1730, #03060d 70%); }
+.globe-hud { display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; padding: 12px; border-bottom: 1px solid var(--line); position: relative; z-index: 2; background: rgba(3, 6, 13, 0.6); }
+.globe-foot { display: flex; gap: 16px; flex-wrap: wrap; padding: 10px 14px; font-size: 12px; border-top: 1px solid var(--line); background: rgba(3, 6, 13, 0.6); }
+.globe-side { display: flex; flex-direction: column; gap: 12px; }
+.globe-side h2 { display: flex; align-items: center; gap: 8px; }
+.sat-list { display: flex; flex-direction: column; gap: 8px; }
+.sat-card { border: 1px solid var(--line); border-left-width: 3px; border-radius: 10px; padding: 10px; display: flex; flex-direction: column; gap: 6px; background: var(--card-2); }
+.sat-card.off { opacity: 0.45; }
+.sat-top { display: flex; align-items: center; gap: 8px; justify-content: space-between; }
+.sat-facts { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 12px; color: #cbd5e1; }
+.link-btn { background: none; border: 0; color: var(--sky); cursor: pointer; font: inherit; font-size: 12px; }
+.sat-label { font: 600 11px/1 Inter, system-ui, sans-serif; text-shadow: 0 0 6px #000, 0 0 2px #000; transform: translate(10px, -14px); pointer-events: none; white-space: nowrap; }
+@media (max-width: 1100px) { .globe-layout { grid-template-columns: 1fr; } }

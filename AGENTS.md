@@ -636,3 +636,16 @@ real and synthetic data, synthetic never presented as evidence.
   heatmap + satellite-coloured flashes, speed/scrub, activity strip; the
   calendar's "Replay <month>" button opens it. Synthetic daily
   `solar_date` now VARCHAR like the real export. Test in test_11.
+* 3D globe (user request "planet Earth 3D with the actual satellites and real
+  imagery"): `GET /api/globe?year&month` -> `SATELLITES` nominal mission
+  parameters (store.py: altitude, inclination, period, LTAN, swath, launch/
+  end, along-track phase) joined with each platform's actual record span +
+  detection count, and the month's top-2000 hexagons. Frontend
+  `views/GlobeView.tsx` (react-globe.gl + three, lazy chunk): Blue Marble +
+  topology bump + night sky (bundled in `Frontend/public/textures/`, from
+  the three-globe package; jsDelivr is blocked here), circular
+  sun-synchronous propagation in `orbits.ts` (Sun-fixed frame + sub-solar
+  longitude), orbit tracks, swath rings, hotspots lit when inside a swath,
+  month slider (satellites shown only while flying), speeds, follow.
+  Positions along the orbit are illustrative (labelled), NOT TLE tracking.
+  Server mounts `/textures` from `Frontend/dist`. Test in test_11.

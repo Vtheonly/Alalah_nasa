@@ -68,6 +68,7 @@ export default function Overview({ status }: { status: Status | null }) {
           <p>MODIS (1 km, since 2000) and VIIRS (375 m, since 2012) see fire differently. Fire Harmonizer fuses every detection into a single, uncertainty-aware estimate of fire energy on a global hexagon grid, and shows its evidence.</p>
           <div className="hero-actions">
             <a className="btn primary" href="#/explorer">Explore the map <ArrowRight size={15} /></a>
+            <a className="btn" href="#/globe">Watch the satellites in 3D</a>
             <a className="btn" href="#/challenges">See how each problem is solved</a>
           </div>
         </div>
