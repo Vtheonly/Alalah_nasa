@@ -25,12 +25,12 @@ export function go(path: string) {
 
 const NAV = [
   { id: "overview", label: "Overview", icon: Compass },
-  { id: "globe", label: "3D globe", icon: Globe2 },
-  { id: "explorer", label: "Explorer", icon: Activity },
-  { id: "challenges", label: "Challenges & solutions", icon: Puzzle },
+  { id: "globe", label: "Globe", icon: Globe2 },
+  { id: "explorer", label: "Explore", icon: Activity },
+  { id: "challenges", label: "Methods", icon: Puzzle },
   { id: "validation", label: "Validation", icon: CheckCircle2 },
   { id: "insights", label: "Insights", icon: BarChart3 },
-  { id: "trace", label: "Traceability", icon: Microscope },
+  { id: "trace", label: "Trace", icon: Microscope },
 ];
 
 export default function App() {
@@ -56,14 +56,17 @@ export default function App() {
           <span className="brand-mark"><Flame size={18} /></span>
           <span className="brand-text"><b>Fire Harmonizer</b><small>MODIS + VIIRS · 2000–2026</small></span>
         </a>
-        <nav className="tabs">
+        <nav className="tabs" aria-label="Primary navigation">
           {NAV.map(({ id, label, icon: Icon }) => (
-            <a key={id} href={`#/${id}`} className={page === id ? "tab active" : "tab"}>
+            <a key={id} href={`#/${id}`} className={page === id ? "tab active" : "tab"}
+              aria-current={page === id ? "page" : undefined}>
               <Icon size={15} /><span>{label}</span>
             </a>
           ))}
         </nav>
-        <ProvenancePill p={status?.provenance} />
+        <div className="topbar-status">
+          <ProvenancePill p={status?.provenance} />
+        </div>
       </header>
       <ProvenanceBanner status={status} />
       {error && <div className="banner banner-unvalidated">API unreachable: {error}</div>}
