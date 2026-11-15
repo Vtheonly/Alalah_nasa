@@ -28,6 +28,8 @@ REQUIRED_TABLES = ("state_reconstructed_monthly", "uncertainty_diagnostics",
 FULL_YEARS = (2001, 2025)      # complete calendar years for annual statistics
 COUNTRY_NAMES = {c.iso3: c.name for c in S.TARGET_COUNTRIES}
 PLATFORM_ORDER = ["Terra", "Aqua", "SNPP", "NOAA-20", "NOAA-21"]
+S_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep",
+            "Oct", "Nov", "Dec"]
 
 
 def _f(v, nd=4):
@@ -729,6 +731,88 @@ class HarmonizedStore:
                                         {"name": "Mean", "role": "harmonized",
                                          "data": [_f(x, 1) for x in seas["mean"]]}]}},
             "anomalies": anomalies, "by_country": by_country}
+
+    # ----------------------------------------------------------------- replay
+    def replay(self, iso: str | None, year: int, month: int, step: str = "day",
+               max_cells: int = 2500, max_detections: int = 25000) -> dict:
+        """Day-by-day (harmonized daily state + detections) or overpass-by-
+        overpass ("hour": raw detections per UTC hour, daily state behind)
+        replay of one month for the burning-calendar animation.
+
+        Compact columnar payload: hexagon polygons once, then
+        ``daily = [frame, cell, phi_q50, phi_q95]`` and
+        ``detections = [frame, lon, lat, frp, platform_idx]``.
+        Largest cells / strongest detections first when capped."""
+        from ...geometry.h3_utils import h3_boundary_geojson
+        cl, p = _iso_clause(iso, "m.")
+        cells = self._df(f"""
+            SELECT m.h3_index FROM state_reconstructed_monthly m
+            WHERE m.year = ? AND m.month = ? AND m.phi_q50_mw > 0 {cl}
+            ORDER BY m.fre_tj_q50 DESC LIMIT {int(max_cells)}""",
+                         [year, month] + p)["h3_index"].astype("int64")
+        cell_ids = cells.tolist()
+        idx = {c: i for i, c in enumerate(cell_ids)}
+        t0 = pd.Timestamp(S.DATE_START)
+        first = pd.Timestamp(year=year, month=month, day=1)
+        ndays = first.days_in_month
+        t_first = int((first - t0).days)
+        out = {"year": year, "month": month, "step": step, "frames": [],
+               "cells": [str(c) for c in cell_ids],
+               "polygons": [h3_boundary_geojson(c) for c in cell_ids],
+               "daily": [], "detections": [], "platforms": PLATFORM_ORDER,
+               "truncated": {"cells": len(cell_ids) >= max_cells,
+                             "detections": False}}
+        if not cell_ids:
+            return out
+        cid_list = ",".join(str(c) for c in cell_ids)
+        d = self._df(f"""
+            SELECT h3_index, t, phi_q50_mw, phi_q95_mw
+            FROM state_reconstructed_daily
+            WHERE t BETWEEN ? AND ? AND h3_index IN ({cid_list})
+            ORDER BY t, h3_index""",
+                     [t_first, t_first + ndays - 1])
+        det = pd.DataFrame(columns=["h3_index", "day", "hh", "longitude",
+                                    "latitude", "frp_mw", "platform"])
+        if self.has_product1:
+            det = self._df(f"""
+                SELECT h3_index, DAY(CAST(solar_date AS DATE)) AS day,
+                       CAST(acq_hhmm / 100 AS INTEGER) AS hh,
+                       longitude, latitude, frp_mw, platform
+                FROM obs_harmonized_provenance
+                WHERE h3_index IN ({cid_list}) AND is_biomass
+                  AND YEAR(CAST(solar_date AS DATE)) = ?
+                  AND MONTH(CAST(solar_date AS DATE)) = ?
+                ORDER BY frp_mw DESC, solar_date, acq_hhmm, latitude, longitude
+                LIMIT {int(max_detections) + 1}""",
+                           [year, month])
+            if len(det) > max_detections:
+                det = det.iloc[:max_detections]
+                out["truncated"]["detections"] = True
+        pidx = {pl: i for i, pl in enumerate(PLATFORM_ORDER)}
+        # harmonized state is DAILY: one row per (day index, cell); every
+        # frame carries the day it belongs to
+        out["daily"] = [[int(r.t) - t_first, idx[int(r.h3_index)],
+                         _f(r.phi_q50_mw, 3), _f(r.phi_q95_mw, 3)]
+                        for r in d.itertuples(index=False)]
+        if step == "hour":
+            keys = sorted(set(zip(det["day"].astype(int), det["hh"].astype(int))))
+            fidx = {k: i for i, k in enumerate(keys)}
+            out["frames"] = [{"key": f"{year}-{month:02d}-{dd:02d}T{hh:02d}",
+                              "label": f"{dd} {S_MONTHS[month - 1]} · {hh:02d}:00 UTC",
+                              "day": dd} for dd, hh in keys]
+            det_frame = [fidx[(int(a), int(b))] for a, b in zip(det["day"], det["hh"])]
+        else:
+            out["frames"] = [{"key": f"{year}-{month:02d}-{dd:02d}",
+                              "label": f"{dd} {S_MONTHS[month - 1]} {year}",
+                              "day": dd} for dd in range(1, ndays + 1)]
+            det_frame = (det["day"].astype(int) - 1).tolist()
+        out["detections"] = [[f, round(float(lo), 4), round(float(la), 4),
+                              round(float(fr), 2), pidx.get(pl, 0)]
+                             for f, lo, la, fr, pl in zip(
+                                 det_frame, det["longitude"], det["latitude"],
+                                 det["frp_mw"], det["platform"])]
+        out["n_detections_month"] = int(len(det))
+        return out
 
     # ----------------------------------------------------------- traceability
     def cell(self, h3: int, year: int | None, month: int | None) -> dict:

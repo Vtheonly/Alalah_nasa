@@ -461,7 +461,7 @@ def build_synthetic_products(seed: int = 20261115) -> dict:
         "phi_q95_mw": daily["frp"] * 0.9, "phi_mean_mw": daily["frp"] * 0.58,
     })
     daily_df["fre_tj_q50"] = S.FRE_TJ_PER_MW_DAY * daily_df["phi_q50_mw"]
-    daily_df["solar_date"] = daily["solar_date"]
+    daily_df["solar_date"] = dd.dt.strftime("%Y-%m-%d")   # as the real export
     daily_df["year"] = dd.dt.year
     daily_df["month"] = dd.dt.month
     products = {"product1": p1,

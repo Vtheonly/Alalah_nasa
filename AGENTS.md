@@ -624,3 +624,15 @@ real and synthetic data, synthetic never presented as evidence.
   Colab (2 vCPU, ~50 M detections, two passes). Not stuck: clipping is
   0.1 s / 400k points against the NE 50 m polygons. Added progress lines
   (pass 1 every 25 files, pass 2 every 12 months, final summary).
+* Replay (user request "calendar replay / heat spreading by day or hour"):
+  `GET /api/replay?country_iso&year&month&step=day|hour` (`store.replay`)
+  returns hexagon polygons once, the harmonized DAILY state
+  `[day0, cell, q50, q95]` (state_reconstructed_daily, keyed on `t`) and
+  every biomass detection `[frame, lon, lat, frp, platform]` (Product 1);
+  hour frames = actual (day, UTC hour) overpasses, each pointing to its
+  day's harmonized state (there is no sub-daily posterior). Caps: 2500
+  most active cells, 25k strongest detections (flagged). Frontend
+  `ReplayPanel` + `ReplayMap`: heat trail (decay per frame), detection
+  heatmap + satellite-coloured flashes, speed/scrub, activity strip; the
+  calendar's "Replay <month>" button opens it. Synthetic daily
+  `solar_date` now VARCHAR like the real export. Test in test_11.

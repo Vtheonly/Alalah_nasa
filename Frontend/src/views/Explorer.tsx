@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import ReactECharts from "echarts-for-react";
 import type { EChartsOption } from "echarts";
-import { Microscope, Pause, Play } from "lucide-react";
+import { Clapperboard, Map as MapIcon, Microscope, Pause, Play } from "lucide-react";
 import { api } from "../api";
 import type { CalendarCell, HexCollection, HexFeature, Region } from "../types";
 import HexMap, { LEGENDS, type MapMetric } from "../components/HexMap";
+import ReplayPanel from "../components/ReplayPanel";
 import Chart from "../components/Chart";
 import { C } from "../colors";
 import { compact, FLAG_LABEL, fmt, MONTHS } from "../format";
@@ -52,6 +53,7 @@ export default function Explorer({ args }: { args: string[] }) {
   const [hex, setHex] = useState<HexCollection | null>(null);
   const [sel, setSel] = useState<string | null>(null);
   const [playing, setPlaying] = useState(false);
+  const [mode, setMode] = useState<"monthly" | "replay">("monthly");
 
   useEffect(() => { api.regions().then(setRegions).catch(() => undefined); }, []);
   useEffect(() => {
@@ -118,6 +120,15 @@ export default function Explorer({ args }: { args: string[] }) {
 
       <div className="explorer">
         <div className="card map-card">
+          <div className="mode-tabs">
+            <button className={mode === "monthly" ? "active" : ""} onClick={() => setMode("monthly")}><MapIcon size={14} /> Monthly map</button>
+            <button className={mode === "replay" ? "active" : ""} onClick={() => { setPlaying(false); setMode("replay"); }}>
+              <Clapperboard size={14} /> Replay {ym ? `${MONTHS[ym.month - 1]} ${ym.year}` : ""}
+            </button>
+          </div>
+          {mode === "replay" && ym ? (
+            <ReplayPanel region={region} year={ym.year} month={ym.month} onSelect={setSel} />
+          ) : (<>
           <div className="map-toolbar">
             <div className="seg">
               {METRICS.map((m) => (
@@ -137,6 +148,7 @@ export default function Explorer({ args }: { args: string[] }) {
             {LEGENDS[metric].stops.map(([c, l]) => <span key={l} className="legend-stop"><i style={{ background: c }} />{l}</span>)}
             <span className="muted">{hex ? `${hex.meta.n} hexagons` : ""}</span>
           </div>
+          </>)}
         </div>
         <aside className="card side">
           <h3>{cur ? `${MONTHS[cur.month - 1]} ${cur.year}` : "—"} · {region.iso}</h3>
@@ -169,7 +181,13 @@ export default function Explorer({ args }: { args: string[] }) {
 
       <div className="grid-2">
         <div className="card">
-          <div className="card-head"><h2>Burning calendar</h2><span className="muted">fire energy per month · click to jump</span></div>
+          <div className="card-head">
+            <h2>Burning calendar</h2>
+            <span className="muted">click a month to select it, then replay it</span>
+            {ym && <button className="btn small-btn" onClick={() => { setPlaying(false); setMode("replay"); window.scrollTo({ top: 0, behavior: "smooth" }); }}>
+              <Clapperboard size={14} /> Replay {MONTHS[ym.month - 1]} {ym.year}
+            </button>}
+          </div>
           {cal.length ? (
             <ReactECharts option={calendarOption(cal, ym ?? { year: 0, month: 0 })} style={{ height: 520 }} notMerge
               onEvents={{ click: (p: { value: number[] }) => { const years = Array.from(new Set(cal.map((c) => c.year))).sort(); setPlaying(false); setYm({ year: years[p.value[1]], month: p.value[0] + 1 }); } }} />

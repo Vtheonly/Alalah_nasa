@@ -173,3 +173,28 @@ def test_11_validation_insights_and_traceability(env, synthetic_db):
         or len(cell["detections"]) == 400
     assert c.get("/api/cell/123").status_code == 404
     assert c.get("/api/cell/abc").status_code == 422
+
+
+def test_11_replay_by_day_and_by_overpass_hour(env, synthetic_db):
+    """Burning-calendar replay: daily harmonized hexagon states + the raw
+    detections of every day / overpass hour, consistent with Product 1."""
+    c = env(FH_DATA_PROVIDER="synthetic", FH_SYNTHETIC_DB=synthetic_db)
+    day = c.get("/api/replay", params=dict(country_iso="BRA", year=2020,
+                                           month=9, step="day")).json()
+    assert day["provenance"]["is_synthetic"]
+    assert len(day["frames"]) == 30 and len(day["cells"]) == len(day["polygons"]) > 0
+    assert all(0 <= r[0] < 30 and 0 <= r[1] < len(day["cells"]) for r in day["daily"])
+    assert all(0 <= d[0] < 30 for d in day["detections"])
+    hour = c.get("/api/replay", params=dict(country_iso="BRA", year=2020,
+                                            month=9, step="hour")).json()
+    assert len(hour["frames"]) > len(day["frames"])
+    assert len(hour["detections"]) == len(day["detections"])   # same pixels
+    assert hour["daily"] == day["daily"]                       # daily state
+    # total detections == biomass Product-1 rows of the replayed hexagons
+    con = duckdb.connect(str(synthetic_db), read_only=True)
+    ids = ",".join(day["cells"])
+    n = con.execute(f"""SELECT COUNT(*) FROM obs_harmonized_provenance
+        WHERE is_biomass AND h3_index IN ({ids})
+          AND YEAR(solar_date) = 2020 AND MONTH(solar_date) = 9""").fetchone()[0]
+    assert n == len(day["detections"])
+    assert c.get("/api/replay", params=dict(year=2020, month=9, step="week")).status_code == 422

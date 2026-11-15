@@ -13,6 +13,7 @@ provenance the backend reports on every page.
 |---|---|
 | Overview | Satellites behind the record, the processing pipeline, validation summary |
 | Explorer | H3 map (fire power / anomaly / uncertainty / evidence), month player, burning calendar, time series (raw vs harmonized) |
+| Explorer → Replay | Pick a month on the burning calendar and replay it **day by day** or **overpass by overpass (hour)**: hexagons glow with the harmonized daily fire power and fade (heat trail), raw detections flash coloured by satellite, activity strip to scrub |
 | Challenges & solutions | 8 scientific/technical challenges, each with problem, solution, live evidence and the implementing modules |
 | Validation | Every check: question, threshold, result, evidence chart; the gate the server uses to call a run "validated" |
 | Insights | Trend (Theil–Sen, Mann–Kendall), fire season, most extreme months with attribution, country comparison |

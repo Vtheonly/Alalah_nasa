@@ -342,6 +342,20 @@ def api_cell(h3_index: str, year: int | None = None, month: int | None = None):
     return {"provenance": prov(), **out}
 
 
+@app.get("/api/replay")
+def api_replay(year: int, month: int, country_iso: str | None = None,
+               step: str = "day"):
+    """Burning-calendar replay of one month: harmonized daily hexagon states
+    + every satellite detection, by day or by overpass hour."""
+    if step not in ("day", "hour"):
+        raise HTTPException(422, "step must be 'day' or 'hour'")
+    if not 1 <= month <= 12:
+        raise HTTPException(422, "month must be 1..12")
+    iso = _country(country_iso)
+    return {"provenance": prov(), "country_iso": iso,
+            **store().replay(iso, year, month, step)}
+
+
 @app.get("/api/diagnostics")
 def api_diagnostics():
     d = store().diagnostics()

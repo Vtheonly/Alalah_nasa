@@ -165,3 +165,19 @@ export interface CellTrace {
   by_platform: Array<{ platform: string; n: number; frp_mw: number; biomass: number }>;
   reconciliation: null | { biomass_detections_in_product1: number; raw_count_in_product2: number; match: boolean; n_detections_total: number };
 }
+
+export interface ReplayData {
+  provenance: Provenance;
+  country_iso: string | null;
+  year: number;
+  month: number;
+  step: "day" | "hour";
+  frames: Array<{ key: string; label: string; day: number }>;
+  cells: string[];
+  polygons: number[][][];
+  daily: Array<[number, number, number | null, number | null]>;     // [day0, cell, q50, q95]
+  detections: Array<[number, number, number, number, number]>;      // [frame, lon, lat, frp, platform]
+  platforms: string[];
+  truncated: { cells: boolean; detections: boolean };
+  n_detections_month: number;
+}

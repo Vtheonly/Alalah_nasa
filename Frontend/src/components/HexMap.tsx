@@ -6,7 +6,7 @@ export type MapMetric = "frp" | "anomaly" | "uncertainty" | "evidence";
 
 // Inline style: if the basemap tiles cannot load (offline judging laptop),
 // the hexagons still render on a dark background.
-const STYLE: StyleSpecification = {
+export const STYLE: StyleSpecification = {
   version: 8,
   sources: {
     carto: {
