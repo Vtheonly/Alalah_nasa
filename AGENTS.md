@@ -571,3 +571,12 @@ table; DuckDB builds the Product 1 table out-of-core.
   workers. Notebook ladder exercised by executing its cells with a stubbed
   stage runner (OOM -> step down; real error -> no retry). NOT run on a
   real GPU / Kaggle.
+
+### Incident: `main` force-pushed (Frontend `ui2`), fixes erased (2026-11-15)
+A Frontend commit (`abe79d4 ui2`) was force-pushed to `main` from an old
+base (`98ae577`), silently removing 1b0c7ed / 0579e8f / f22980a. Colab then
+cloned the OLD ingest code and was OOM-killed (exit -9) while assembling
+the cloud table in RAM (symptom: one `UMD [k/N]` log line per already-staged
+file instead of `UMD: N of M files already staged (resume)`). Restored by a
+normal merge (77d0861, Frontend untouched). Never force-push `main`; if the
+log shows per-file skip lines, the clone is on pre-1b0c7ed code.
