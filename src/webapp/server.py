@@ -1,48 +1,62 @@
-"""FastAPI + read-only DuckDB Burning Activity Calendar web app.
+"""FastAPI web service for the harmonized MODIS/VIIRS fire record.
 
-Endpoints (readme Section 5.5):
-* ``GET /api/calendar`` -- Year x Month calendar aggregates for an AOI bbox
-  (bbox span <= 25 deg unless ``country_iso`` supplied).
-* ``GET /api/timeseries`` -- monthly array + constellation events.
-* ``GET /api/map_hex`` -- GeoJSON FeatureCollection of H3 polygons
-  (<= 3000 features).
-* ``GET /api/diagnostics`` -- diagnostics.json contents.
-* ``GET /api/export.csv`` -- CSV download sanitized against formula
-  injection (``=``/``+``/``-``/``@``/tab/CR prefixed with ``'``).
-* ``GET /`` -- static MapLibre GL JS + Apache ECharts frontend.
+All data comes from the server-side provider layer (``src.webapp.providers``):
+the real engine output or, when it is unavailable / not validated and the
+fallback is enabled, a clearly labelled SYNTHETIC demonstration store with
+the identical schema.  Every response carries ``provenance``; the frontend
+is identical for both providers.
+
+Endpoints:
+* ``GET /api/status`` -- active provider, validation gate, configuration.
+* ``GET /api/overview`` / ``/api/regions``.
+* ``GET /api/calendar`` / ``/api/timeseries`` / ``/api/map_hex`` (readme 5.5).
+* ``GET /api/challenges`` + ``/api/challenges/{id}`` -- each scientific /
+  technical challenge with the evidence of how it is solved.
+* ``GET /api/validation`` -- validation checks with evidence.
+* ``GET /api/insights`` -- trends, seasonality, anomalies.
+* ``GET /api/cell/{h3_index}`` -- traceability down to every satellite
+  detection behind a harmonized cell-month.
+* ``GET /api/diagnostics`` / ``/api/export.csv``.
 """
 from __future__ import annotations
 
-import json
+import functools
 import os
 import time
 from pathlib import Path
 
-import duckdb
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from ..config import settings as S
 from ..geometry.h3_utils import h3_boundary_geojson
+from . import providers
 
 STATIC_DIR = Path(__file__).parent / "static"
-DEFAULT_DB = Path(os.environ.get("FIRE_HARMONIZED_DB", "output/fire_harmonized.duckdb"))
+REPO_ROOT = Path(__file__).resolve().parents[2]
+FRONTEND_DIST = Path(os.environ.get("FH_FRONTEND_DIST",
+                                    str(REPO_ROOT / "Frontend" / "dist")))
 
-app = FastAPI(title="Burning Activity Calendar", version="1.0.0")
-_con = None
+app = FastAPI(title="Fire Harmonizer - Burning Activity Calendar",
+              version="2.0.0")
+_con = None          # kept for backward compatibility with older tests
 
 
-def get_con() -> duckdb.DuckDBPyConnection:
-    """Read-only DuckDB connection to fire_harmonized.duckdb."""
-    global _con
-    if _con is None:
-        path = Path(os.environ.get("FIRE_HARMONIZED_DB", str(DEFAULT_DB)))
-        if not path.exists():
-            raise HTTPException(503, "fire_harmonized.duckdb not found; run "
-                                     "the Env 2 pipeline first")
-        _con = duckdb.connect(str(path), read_only=True)
-    return _con
+def active() -> dict:
+    try:
+        return providers.get_active()
+    except RuntimeError as exc:          # no provider available
+        raise HTTPException(503, str(exc)) from exc
+
+
+def store():
+    return active()["store"]
+
+
+def prov() -> dict:
+    active()
+    return providers.provenance()
 
 
 def _validate_bbox(min_lon, min_lat, max_lon, max_lat, country_iso=None):
@@ -83,48 +97,35 @@ def _country(country_iso: str | None) -> str | None:
     return iso
 
 
-def _cell_filter_sql(country_iso: str | None):
-    """Spatial cell filter on the materialized ``hex_centers`` index: bbox
-    AND (optionally) the country."""
-    sql = ("SELECT h3_index FROM hex_centers WHERE longitude BETWEEN ? AND ? "
-           "AND latitude BETWEEN ? AND ?")
-    if country_iso:
-        sql += " AND country_iso = ?"
-    return sql
+# ------------------------------------------------------------------ status
+@app.get("/api/status")
+def api_status():
+    a = active()
+    st = a["store"]
+    val = st.validation()
+    cfg = dict(a["config"])
+    for k in ("real_db", "synthetic_db"):
+        cfg[k] = Path(cfg[k]).name
+    return {"provenance": prov(),
+            "dataset": st.dataset_provenance(),
+            "config": cfg,
+            "real_engine": a["real_engine"],
+            "validation_gate": val["gate"],
+            "constellation_events": [{"month": m, "label": lbl}
+                                     for m, lbl in S.CONSTELLATION_EVENTS]}
 
 
-def _calendar_rows(con, min_lon, min_lat, max_lon, max_lat, y0, y1, metric,
-                   country_iso):
-    col = _metric_column(metric)
-    q = f"""
-        SELECT m.year, m.month, COUNT(*) AS n_cells,
-               AVG(m.{col}) AS value, AVG(m.phi_q05_mw) AS q05,
-               AVG(m.phi_q95_mw) AS q95,
-               AVG(m.hist_median_2003_2020) AS hist_median,
-               AVG(m.anomaly_ratio) AS anomaly_ratio,
-               SUM(m.raw_count_sum) AS raw_count,
-               SUM(m.raw_frp_sum_mw) AS raw_frp,
-               AVG(u.measured_fraction) AS measured_fraction,
-               CASE WHEN BOOL_OR(u.quality_flag = 'ABSTAIN_LOW_EVIDENCE')
-                    THEN 'ABSTAIN_LOW_EVIDENCE'
-                    WHEN BOOL_OR(u.quality_flag = 'CLIMATOLOGY_CLOUD_FALLBACK')
-                    THEN 'CLIMATOLOGY_CLOUD_FALLBACK' ELSE 'NOMINAL' END
-                    AS quality_flag,
-               MODE(u.attribution_flag) AS attribution_flag
-        FROM state_reconstructed_monthly m
-        JOIN uncertainty_diagnostics u
-          ON m.h3_index = u.h3_index AND m.year = u.year AND m.month = u.month
-        WHERE m.h3_index IN ({_cell_filter_sql(country_iso)})
-          AND m.year BETWEEN ? AND ?
-        GROUP BY m.year, m.month ORDER BY m.year, m.month
-    """
-    params = [min_lon, max_lon, min_lat, max_lat]
-    if country_iso:
-        params.append(country_iso)
-    params += [y0, y1]
-    return con.execute(q, params).fetchall()
+@app.get("/api/overview")
+def api_overview():
+    return {"provenance": prov(), **store().overview()}
 
 
+@app.get("/api/regions")
+def api_regions():
+    return {"provenance": prov(), "regions": store().regions()}
+
+
+# ------------------------------------------------- calendar / series / map
 @app.get("/api/calendar")
 def api_calendar(min_lon: float, min_lat: float, max_lon: float, max_lat: float,
                  start_year: int = 2000, end_year: int = 2026,
@@ -133,18 +134,18 @@ def api_calendar(min_lon: float, min_lat: float, max_lon: float, max_lat: float,
     iso = _country(country_iso)
     _validate_bbox(min_lon, min_lat, max_lon, max_lat, iso)
     t0 = time.time()
-    con = get_con()
-    rows = _calendar_rows(con, min_lon, min_lat, max_lon, max_lat, start_year,
-                          end_year, metric, iso)
+    rows = store().calendar(min_lon, min_lat, max_lon, max_lat, start_year,
+                            end_year, metric, iso)
     cells = [dict(zip(("year", "month", "n_cells", "value", "q05", "q95",
                        "hist_median", "anomaly_ratio", "raw_count", "raw_frp",
                        "measured_fraction", "quality_flag",
-                       "attribution_flag"), r)) for r in rows]
+                       "attribution_flag", "fre_tj"), r)) for r in rows]
     return {"meta": {"bbox": [min_lon, min_lat, max_lon, max_lat],
                      "country_iso": iso,
                      "start_year": start_year, "end_year": end_year,
                      "metric": metric, "n_rows": len(cells),
-                     "elapsed_ms": round(1000 * (time.time() - t0), 2)},
+                     "elapsed_ms": round(1000 * (time.time() - t0), 2),
+                     "provenance": prov()},
             "cells": cells}
 
 
@@ -175,31 +176,19 @@ def api_map_hex(min_lon: float, min_lat: float, max_lon: float, max_lat: float,
                                  f"{', '.join(MAP_COLOR_FIELDS)}")
     iso = _country(country_iso)
     _validate_bbox(min_lon, min_lat, max_lon, max_lat, iso)
-    con = get_con()
-    q = f"""
-        SELECT m.h3_index, m.phi_q50_mw, m.{color_by} AS color_value,
-               m.phi_q95_mw - m.phi_q05_mw AS width, u.quality_flag,
-               u.measured_fraction
-        FROM state_reconstructed_monthly m
-        JOIN uncertainty_diagnostics u
-          ON m.h3_index = u.h3_index AND m.year = u.year AND m.month = u.month
-        WHERE m.h3_index IN ({_cell_filter_sql(iso)})
-          AND m.year = ? AND m.month = ?
-        LIMIT {int(S.MAX_HEX_FEATURES)}
-    """
-    params = [min_lon, max_lon, min_lat, max_lat]
-    if iso:
-        params.append(iso)
-    params += [year, month]
-    rows = con.execute(q, params).fetchall()
+    rows = store().map_hex(min_lon, min_lat, max_lon, max_lat, year, month,
+                           color_by, iso, S.MAX_HEX_FEATURES)
     features = []
-    for h3, phi, cval, width, qf, mf in rows:
+    for h3, phi, cval, width, qf, mf, rc, af, ar, fre in rows:
         features.append({
             "type": "Feature",
             "properties": {"h3_index": str(int(h3)), "phi_q50_mw": float(phi),
                            color_by: float(cval) if cval is not None else 0.0,
+                           "anomaly_ratio": float(ar) if ar is not None else 0.0,
                            "width": float(width) if width is not None else 0.0,
-                           "quality_flag": qf,
+                           "quality_flag": qf, "attribution_flag": af,
+                           "raw_count": float(rc or 0.0),
+                           "fre_tj": float(fre or 0.0),
                            "measured_fraction": float(mf) if mf is not None
                            else 0.0},
             "geometry": {"type": "Polygon",
@@ -207,22 +196,156 @@ def api_map_hex(min_lon: float, min_lat: float, max_lon: float, max_lat: float,
         })
     return {"type": "FeatureCollection", "features": features,
             "meta": {"year": year, "month": month, "color_by": color_by,
-                     "n": len(features), "max_features": S.MAX_HEX_FEATURES}}
+                     "n": len(features), "max_features": S.MAX_HEX_FEATURES,
+                     "provenance": prov()}}
+
+
+# --------------------------------------------------------------- challenges
+CHALLENGES = [
+    {"id": "sensor-transition", "icon": "git-merge",
+     "title": "The 2012 sensor jump",
+     "problem": "VIIRS (375 m) joined MODIS (1 km) in 2012 and sees far more "
+                "fire pixels: raw counts jump although the fires did not change.",
+     "solution": "Sensor-specific observation operators, calibrated on the "
+                 "2012-2021 overlap and then frozen, map every detection onto "
+                 "one latent fire-energy state, so the record stays continuous.",
+     "pipeline": ["src/calibration/operators.py", "src/engine/solver.py"],
+     "method": "_sensor_transition"},
+    {"id": "resolution", "icon": "scan",
+     "title": "Different pixel sizes and detection limits",
+     "problem": "A 1 km MODIS pixel misses small fires a 375 m VIIRS pixel "
+                "catches, and FRP per detection differs several-fold.",
+     "solution": "Sensor-specific forward gains plus a hurdle likelihood for "
+                 "non-detections translate counts and FRP of every sensor into "
+                 "the same physical quantity (fire radiative power).",
+     "pipeline": ["src/engine/likelihoods.py", "src/calibration/operators.py"],
+     "method": "_resolution"},
+    {"id": "overpass-timing", "icon": "clock",
+     "title": "Different overpass times and orbit drift",
+     "problem": "Terra passes at ~10:30, Aqua and VIIRS at ~13:30: each samples "
+                "a different moment of the daily fire cycle, and Terra/Aqua "
+                "drift after 2022.",
+     "solution": "Each detection is placed on its local solar time; a diurnal "
+                 "operator normalizes every pass to a 24-hour mean with separate "
+                 "day and night latent states.",
+     "pipeline": ["src/geometry/solar_geometry.py", "src/engine/solver.py"],
+     "method": "_overpass"},
+    {"id": "missing-observations", "icon": "cloud-off",
+     "title": "Clouds and missing observations",
+     "problem": "Clouds hide fires: a month without detections may mean "
+                "'no fire' or simply 'not seen'.",
+     "solution": "Cloud-aware visibility enters the likelihood, uncertainty "
+                 "widens when evidence is thin, and months with too little "
+                 "evidence are flagged ABSTAIN instead of guessed.",
+     "pipeline": ["src/engine/priors.py", "src/engine/conformal.py"],
+     "method": "_missing"},
+    {"id": "constellation", "icon": "satellite",
+     "title": "A constellation that keeps changing",
+     "problem": "Five satellites launched, drifted, had outages or ended "
+                "between 2000 and 2026 (S-NPP delivery ended Nov 2026).",
+     "solution": "Operational calendars mask each platform exactly when it "
+                 "flew, so the harmonized state stays continuous across every "
+                 "transition.",
+     "pipeline": ["src/ingest/normalize_dedup.py", "src/engine/solver.py"],
+     "method": "_constellation"},
+    {"id": "non-fire-sources", "icon": "factory",
+     "title": "Gas flares and other non-fire heat",
+     "problem": "Gas flares, industry and South Atlantic Anomaly noise look "
+                "like fires to a thermal sensor.",
+     "solution": "A persistent-source mask on a fine H3 grid (>=3 years, >=15 "
+                 "days/yr, day~night) and a SAMA filter remove them before "
+                 "fusion; they stay visible in the provenance table.",
+     "pipeline": ["src/geometry/preprocess_geometry.py"],
+     "method": "_flares"},
+    {"id": "duplicates", "icon": "copy",
+     "title": "Duplicate and overlapping detections",
+     "problem": "Overlapping MODIS scan lines (bow-tie) and multi-pixel fires "
+                "make one fire look like many.",
+     "solution": "Bow-tie weights down-weight duplicated pixels and per-pass "
+                 "clustering groups pixels into independent fire events.",
+     "pipeline": ["src/geometry/preprocess_geometry.py"],
+     "method": "_duplicates"},
+    {"id": "uncertainty", "icon": "gauge",
+     "title": "Knowing how sure we are",
+     "problem": "A fused estimate is meaningless without an honest statement "
+                "of its uncertainty.",
+     "solution": "Posterior intervals are recalibrated with conformal hold-out "
+                 "folds (VIIRS withheld, one satellite left out) so that 90% "
+                 "intervals really cover ~90%.",
+     "pipeline": ["src/engine/conformal.py", "src/validation/diagnostics.py"],
+     "method": "_uncertainty"},
+]
+_CH_METHODS = {"_sensor_transition": "challenge_sensor_transition",
+               "_resolution": "challenge_resolution",
+               "_overpass": "challenge_overpass",
+               "_missing": "challenge_missing",
+               "_constellation": "challenge_constellation",
+               "_flares": "challenge_flares",
+               "_duplicates": "challenge_duplicates",
+               "_uncertainty": "challenge_uncertainty"}
+
+
+@functools.lru_cache(maxsize=128)
+def _challenge_cached(store_id: int, cid: str, iso: str | None):
+    ch = next(c for c in CHALLENGES if c["id"] == cid)
+    fn = getattr(store(), _CH_METHODS[ch["method"]])
+    return fn(iso)
+
+
+@app.get("/api/challenges")
+def api_challenges():
+    return {"provenance": prov(),
+            "challenges": [{k: v for k, v in c.items() if k != "method"}
+                           for c in CHALLENGES]}
+
+
+@app.get("/api/challenges/{cid}")
+def api_challenge(cid: str, country_iso: str | None = None):
+    if cid not in {c["id"] for c in CHALLENGES}:
+        raise HTTPException(404, f"unknown challenge '{cid}'")
+    iso = _country(country_iso)
+    ch = next(c for c in CHALLENGES if c["id"] == cid)
+    ev = _challenge_cached(id(store()), cid, iso)
+    return {"provenance": prov(), "country_iso": iso,
+            **{k: v for k, v in ch.items() if k != "method"}, **ev}
+
+
+# --------------------------------------------- validation / insights / cell
+@app.get("/api/validation")
+def api_validation():
+    return {"provenance": prov(), **store().validation()}
+
+
+@functools.lru_cache(maxsize=16)
+def _insights_cached(store_id: int, iso: str | None):
+    return store().insights(iso)
+
+
+@app.get("/api/insights")
+def api_insights(country_iso: str | None = None):
+    iso = _country(country_iso)
+    return {"provenance": prov(), "country_iso": iso,
+            **_insights_cached(id(store()), iso)}
+
+
+@app.get("/api/cell/{h3_index}")
+def api_cell(h3_index: str, year: int | None = None, month: int | None = None):
+    try:
+        h3 = int(h3_index)
+    except ValueError as exc:
+        raise HTTPException(422, "h3_index must be the integer cell id") from exc
+    if month is not None and not 1 <= month <= 12:
+        raise HTTPException(422, "month must be 1..12")
+    out = store().cell(h3, year, month)
+    if not out:
+        raise HTTPException(404, f"cell {h3_index} not in the harmonized product")
+    return {"provenance": prov(), **out}
 
 
 @app.get("/api/diagnostics")
 def api_diagnostics():
-    con = get_con()
-    try:
-        row = con.execute(
-            "SELECT diagnostics_json FROM diagnostics LIMIT 1").fetchone()
-        return json.loads(row[0]) if row else {}
-    except duckdb.Error:
-        diag_path = Path(os.environ.get("FIRE_HARMONIZED_DIAGNOSTICS",
-                                        "output/diagnostics.json"))
-        if diag_path.exists():
-            return json.loads(diag_path.read_text())
-        return {"note": "diagnostics.json not yet generated"}
+    d = store().diagnostics()
+    return d if d else {"note": "diagnostics.json not yet generated"}
 
 
 def sanitize_csv_field(v) -> str:
@@ -239,18 +362,28 @@ def api_export_csv(min_lon: float, min_lat: float, max_lon: float, max_lat: floa
                    metric: str = "phi_q50_mw", country_iso: str | None = None):
     res = api_calendar(min_lon, min_lat, max_lon, max_lat, start_year, end_year,
                        metric, country_iso)
+    p = res["meta"]["provenance"]
     cols = ["year", "month", "value", "q05", "q95", "hist_median",
             "anomaly_ratio", "raw_count", "raw_frp", "measured_fraction",
             "quality_flag", "attribution_flag"]
     lines = [",".join(cols)]
     for c in res["cells"]:
         lines.append(",".join(sanitize_csv_field(c.get(col)) for col in cols))
+    lines.append(sanitize_csv_field(f"# provenance: {p['source']} "
+                                    f"validated={p['validated']}"))
     return "\n".join(lines) + "\n"
+
+
+# ------------------------------------------------------------- frontend
+if (FRONTEND_DIST / "assets").is_dir():
+    app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIST / "assets")),
+              name="assets")
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 @app.get("/", response_class=HTMLResponse)
 def index():
+    built = FRONTEND_DIST / "index.html"
+    if built.exists():
+        return FileResponse(built)
     return (STATIC_DIR / "index.html").read_text()
-
-
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

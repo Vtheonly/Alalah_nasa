@@ -1,49 +1,43 @@
-# Fire Harmonizer frontend
+# Fire Harmonizer — web frontend
 
-React + Vite dashboard for the Fire Harmonizer FastAPI service.
+React + Vite + ECharts + MapLibre. The frontend contains **no data and no
+provider logic**: every number, chart and label comes from the FastAPI
+backend (`src/webapp/server.py`), which decides server-side whether it serves
+the real harmonization engine output or the clearly labelled synthetic
+demonstration store. The UI is identical in both cases and shows the
+provenance the backend reports on every page.
 
-## Run locally
+## Pages
 
-Start the API from the repository root:
+| Page | What it demonstrates |
+|---|---|
+| Overview | Satellites behind the record, the processing pipeline, validation summary |
+| Explorer | H3 map (fire power / anomaly / uncertainty / evidence), month player, burning calendar, time series (raw vs harmonized) |
+| Challenges & solutions | 8 scientific/technical challenges, each with problem, solution, live evidence and the implementing modules |
+| Validation | Every check: question, threshold, result, evidence chart; the gate the server uses to call a run "validated" |
+| Insights | Trend (Theil–Sen, Mann–Kendall), fire season, most extreme months with attribution, country comparison |
+| Traceability | One hexagon-month traced to every satellite detection, with weights, flags and a reconciliation check |
 
-```powershell
-python -m uvicorn src.webapp.server:app --reload
+## Run
+
+```bash
+cd Frontend && npm install && npm run build        # or: make web
+cd .. && make serve                                # http://localhost:8000
 ```
 
-In another terminal:
+Development with hot reload: `make serve` in one terminal, `npm run dev` in
+`Frontend/` in another (Vite proxies `/api` to `http://127.0.0.1:8000`, or
+`VITE_API_PROXY_TARGET`).
 
-```powershell
-cd Frontend
-npm install
-npm run dev
-```
+## Choosing the data (backend only)
 
-Open the Vite URL printed in the terminal. The development server proxies
-`/api` requests to `http://127.0.0.1:8000`; set `VITE_API_PROXY_TARGET` to use
-a different API host.
+| Variable | Values | Default |
+|---|---|---|
+| `FH_DATA_PROVIDER` | `auto`, `real`, `synthetic` | `auto` |
+| `FH_SYNTHETIC_FALLBACK` | `true`, `false` | `true` |
+| `FIRE_HARMONIZED_DB` | real engine output | `output/fire_harmonized.duckdb` |
+| `FH_SYNTHETIC_DB` | synthetic store (built on first use, ~15 s) | `output/synthetic_demo.duckdb` |
 
-The calendar, time series, and segmented map are fetched from `/api/calendar`,
-`/api/timeseries`, and `/api/map_hex`. If the API is unavailable or has no
-records for the selected area/month, the affected view uses deterministic
-demonstration data and labels it as such. CARTO's OpenStreetMap-based basemap
-requires an internet connection.
-
-## Globe and H3 fire animation
-
-The map opens on a global globe. Choose a study area from the sidebar or search
-to fly into it; use the globe button to return to the global view. Regional map
-features use the H3 polygons returned by `/api/map_hex`. Their extrusion height
-is scaled from each cell's harmonized median fire radiative power, while the
-color control can display FRP, anomaly, or uncertainty.
-
-The timeline's Play control advances through the monthly harmonized output.
-H3 cells entering or leaving the active month fade in/out, and their heat-based
-extrusions interpolate between monthly values. When the API is unavailable,
-the clearly labelled demonstration layer is generated from real H3 cell
-boundaries at resolution 6; it is not presented as observed fire data.
-
-## Build
-
-```powershell
-npm run build
-```
+`auto`/`real` serve the real output only if it passes the critical validation
+checks; otherwise the synthetic store (fallback on) or the real output labelled
+*not validated* (fallback off). `make demo` forces synthetic data.

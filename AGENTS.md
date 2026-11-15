@@ -580,3 +580,43 @@ the cloud table in RAM (symptom: one `UMD [k/N]` log line per already-staged
 file instead of `UMD: N of M files already staged (resume)`). Restored by a
 normal merge (77d0861, Frontend untouched). Never force-push `main`; if the
 log shows per-file skip lines, the clone is on pre-1b0c7ed code.
+
+---
+
+## Web app v2: challenges/validation/insights/traceability + provider layer (2026-11-15)
+
+User requirements: every challenge demonstrated by a UI feature, evidence for
+every result, traceability to satellite observations, honest handling of a
+failed/unready real engine via a SERVER-SIDE provider switch, identical UI for
+real and synthetic data, synthetic never presented as evidence.
+
+* `src/webapp/providers/store.py` — `HarmonizedStore`: one query layer over
+  the export schema (Products 1-3, hex_centers, diagnostics). Serves BOTH the
+  real output and the synthetic store; all challenge evidence, validation
+  checks, insights and cell traces are SQL over those tables.
+* `src/webapp/providers/synthetic.py` — synthetic demonstration store: known
+  truth -> per-satellite detections sampled with real sensor behaviour
+  (sensitivity, overpass + post-2022 drift, launches/outages, clouds,
+  bow-tie duplicates, SAMA, gas flares) -> posterior with calibrated noise;
+  climatology indices, flags and diagnostics via the ENGINE'S OWN functions;
+  written by the engine's `export_duckdb` + `dataset_provenance` (source
+  SYNTHETIC_DEMO), `synthetic_truth`, `synthetic_regions`. ~15 s, 845 cells,
+  ~400k detections. Raw counts are exact aggregates of Product 1 rows (test).
+* `src/webapp/providers/__init__.py` — `FH_DATA_PROVIDER` auto|real|synthetic,
+  `FH_SYNTHETIC_FALLBACK`; real is "validated" only if critical checks pass
+  (`break_2012`, `ablation_coverage`, `ablation_skill`); otherwise fallback
+  to synthetic, or real labelled `validated: false` when fallback is off;
+  503 when nothing is available. Reasons never expose server paths.
+* `server.py` endpoints: status, overview, regions, calendar, timeseries,
+  map_hex (now most-active-first), challenges(+/{id}), validation, insights,
+  cell/{h3} (traceability + reconciliation), diagnostics, export.csv (with
+  provenance line). Serves `Frontend/dist` at `/` when built.
+* Frontend rewritten (no demo data in the browser): Overview, Explorer,
+  Challenges, Validation, Insights, Traceability; generic chart-spec renderer
+  so challenge/validation evidence is backend-defined.
+* Tests: `tests/test_11_webapp_providers.py` (schema parity, provenance
+  labelling, fallback rules, gate, 503, every challenge has evidence,
+  traceability reconciliation); test_10 fixture pins `FH_DATA_PROVIDER=real`
+  + fallback off (its twin DB has no diagnostics).
+* Verified by Playwright screenshots of every page (no page errors). Basemap
+  tiles (CARTO) need internet; hexagons render without them.

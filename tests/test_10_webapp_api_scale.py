@@ -34,13 +34,22 @@ def client(full_twin, tmp_path_factory):
                                  full_twin["cloud_df"])
     db = tmp / "fire_harmonized.duckdb"
     ex.export_duckdb(products, db, parquet_dir=str(tmp))
+    from src.webapp import providers
     srv._con = None
     os.environ["FIRE_HARMONIZED_DB"] = str(db)
+    # this twin DB carries no validation diagnostics: serve it explicitly as
+    # the (unvalidated) real provider, never the synthetic fallback
+    os.environ["FH_DATA_PROVIDER"] = "real"
+    os.environ["FH_SYNTHETIC_FALLBACK"] = "false"
+    providers.reset()
     try:
         with TestClient(srv.app) as c:
             yield c
     finally:
-        os.environ.pop("FIRE_HARMONIZED_DB", None)
+        for k in ("FIRE_HARMONIZED_DB", "FH_DATA_PROVIDER",
+                  "FH_SYNTHETIC_FALLBACK"):
+            os.environ.pop(k, None)
+        providers.reset()
         srv._con = None
 
 
