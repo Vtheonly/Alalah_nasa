@@ -927,3 +927,75 @@ def test_01_cloud_assembly_streamed_equals_in_memory(tmp_path):
     mc = ref_c.merge(got_c, on=["lat_025", "lon_025", "month"])
     assert len(mc) == len(ref_c) == len(got_c) == 12
     assert np.allclose(mc["cloud_frac_clim_x"], mc["cloud_frac_clim_y"], atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# FIRMS API: MAP_KEY never leaks, quota exhaustion waits instead of failing
+# ---------------------------------------------------------------------------
+class _FakeResp:
+    def __init__(self, status, text=""):
+        self.status_code = status
+        self.text = text
+
+    def json(self):
+        return json.loads(self.text)
+
+
+def _fake_get(responses, calls):
+    def get(url, timeout=None, params=None):
+        calls.append(url)
+        return responses.pop(0)
+    return get
+
+
+def test_01_firms_redacts_map_key_everywhere(tmp_path, monkeypatch):
+    import src.ingest.download_data as dd
+    key = "abcdef0123456789abcdef0123456789"
+    url = (f"https://firms.modaps.eosdis.nasa.gov/api/area/csv/{key}/"
+           "VIIRS_NOAA21_NRT/-125,24,-66,50/5/2026-09-10")
+    red = dd.redact_secrets(f"400 Client Error: Bad Request for url: {url}")
+    assert key not in red and "/csv/<MAP_KEY>/VIIRS_NOAA21_NRT" in red
+    assert key not in dd.redact_secrets(f"x?MAP_KEY={key}&y=1")
+    monkeypatch.setenv("FIRMS_MAP_KEY", key)
+    assert key not in dd.redact_secrets(f"some text {key} more")
+    man = dd.ProvenanceManifest(tmp_path / "m.json")
+    man.log("nrt_x", url, "http", detail=f"2026-09-10: {url}", status="FAIL")
+    man.entries.append({"detail": url})          # legacy unredacted entry
+    man.save()
+    assert key not in (tmp_path / "m.json").read_text()
+
+
+def test_01_firms_quota_wait_then_success(monkeypatch):
+    import src.ingest.download_data as dd
+    calls, sleeps = [], []
+    monkeypatch.setattr(dd.requests, "get", _fake_get(
+        [_FakeResp(400, "Exceeding allowed transaction limit."),
+         _FakeResp(200, "latitude,longitude\n1,2\n")], calls))
+    text = dd._firms_get("https://x/api/area/csv/KEYKEYKEY/S/1,2,3,4/5/2026-01-01",
+                         map_key="KEYKEYKEY", sleep=sleeps.append)
+    assert text.startswith("latitude")
+    assert dd.FIRMS_QUOTA_WAIT_S in sleeps and len(calls) == 2
+
+
+def test_01_firms_quota_gives_up_and_plain_400_is_explicit(monkeypatch):
+    import src.ingest.download_data as dd
+    key = "KEYKEYKEY123"
+    url = f"https://x/api/area/csv/{key}/S/1,2,3,4/5/2026-01-01"
+    n = dd.FIRMS_QUOTA_MAX_WAITS + 1
+    monkeypatch.setattr(dd.requests, "get", _fake_get(
+        [_FakeResp(403, "transaction limit exceeded")] * n, []))
+    with pytest.raises(dd.FirmsQuotaExhausted) as ei:
+        dd._firms_get(url, map_key=key, sleep=lambda s: None)
+    assert key not in str(ei.value)
+    # a non-quota 400 fails at once, with the server's reason and no key
+    monkeypatch.setattr(dd, "firms_quota_status",
+                        lambda k: {"transaction_limit": 5000,
+                                   "current_transactions": 10})
+    calls = []
+    monkeypatch.setattr(dd.requests, "get", _fake_get(
+        [_FakeResp(400, "Invalid area coordinates.")], calls))
+    with pytest.raises(dd.FirmsApiError) as ei:
+        dd._firms_get(url, map_key=key, sleep=lambda s: None)
+    assert not isinstance(ei.value, dd.FirmsQuotaExhausted)
+    assert "Invalid area coordinates" in str(ei.value)
+    assert key not in str(ei.value) and len(calls) == 1

@@ -661,3 +661,42 @@ real and synthetic data, synthetic never presented as evidence.
   spacecraft model via `customLayerData` with in-place geometry updates.
   Clouds are attached by a short retry loop (onGlobeReady can fire before
   the ref). Textures added: earth-night.jpg, earth-water.jpg, earth-clouds.jpg.
+
+---
+
+## Handoff update — Env 1 finished on Colab; FIRMS NRT quota + MAP_KEY leak (2026-11-15)
+
+Live result: 120,476,162 detections in 1,878 `active_fires/` partitions,
+coverage audit all true, cloud grids 2000-2018 only (C6 Mx14CMQ ends 2018;
+the engine's flagged climatology fallback covers 2019-2026), package
+2.7 GiB built at codebase 0871361. 34 provenance FAILs, all
+`nrt_VIIRS_NOAA21_NRT` with HTTP 400: the USA CONUS box from window
+2026-09-10 and every Alaska window -- the LAST source of the NRT loop, so
+almost certainly the MAP_KEY transaction quota (5,000 per 10 min; big
+box x 5-day requests cost several each). Impact: NOAA-21 NRT for the USA
+Aug-Nov 2026 only (SNPP/NOAA-20/MODIS cover the same period).
+
+**Security bug found:** `requests.raise_for_status()` texts include the
+request URL, and FIRMS puts the MAP_KEY in the URL path, so the key was
+written into `data_provenance_manifest.json` (shipped in staged-data/)
+and into `package_manifest.json` warnings. Fixed:
+* `download_data.redact_secrets()` (FIRMS `/api/*/csv/<key>/` path, query
+  keys, and the literal values of FIRMS_MAP_KEY / MAP_KEY /
+  EARTHDATA_TOKEN env vars); applied in `ProvenanceManifest.log` and
+  `save` (also scrubs legacy entries), and in every FIRMS error/log line.
+* Notebook 1: `scrub_secrets()` on the verification warnings; the
+  provenance manifest is shipped as a scrubbed COPY (never hard-linked);
+  packaging aborts if any DATA_SECRETS value appears in a text file of the
+  package.
+* `_firms_get`: 200 -> text; quota (429, or 400/403 whose body says
+  transaction/limit/exceed, or `mapkey_status` >= 90 % used) -> wait
+  `FIRMS_QUOTA_WAIT_S` (630 s) up to `FIRMS_QUOTA_MAX_WAITS` (3) times, then
+  `FirmsQuotaExhausted` -> the NRT loop stops fetching (one FAIL line, not
+  dozens); other 4xx -> `FirmsApiError` with the server's body (key
+  redacted) so the cause is visible; 5xx -> backoff as before.
+* NRT windows already staged (`firms_nrt_<src>_<box>_<day>.parquet`) are
+  reused on rerun; per-source summary "N fetched, N reused, N failed".
+Tests: 3 new in test_01 (redaction incl. manifest file, quota wait then
+success, quota give-up + explicit non-quota 400).
+User advice given: package was built private (KAGGLE_PUBLIC False); rotate
+the FIRMS MAP_KEY anyway (old Kaggle versions keep the old manifest).

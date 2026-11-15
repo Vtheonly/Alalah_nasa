@@ -31,6 +31,7 @@ import io
 import json
 import logging
 import re
+import os
 import shutil
 import socket
 import time
@@ -52,6 +53,46 @@ FTP_TIMEOUT_S = 30.0
 HTTP_TIMEOUT_S = 120.0
 FIRMS_SLEEP_S = 0.15                 # respects the 5,000 tx / 10 min limit
 FIRMS_MAX_BACKOFF_S = 60.0
+# FIRMS meters MAP_KEY use in transactions per 10-minute window (a large
+# area x DAY_RANGE request costs several).  When the quota is exhausted the
+# API answers with a 4xx + "transaction limit" text: wait for the window to
+# roll over instead of failing every remaining request.
+FIRMS_QUOTA_WAIT_S = float(os.environ.get("FIRMS_QUOTA_WAIT_S", "630"))
+FIRMS_QUOTA_MAX_WAITS = int(os.environ.get("FIRMS_QUOTA_MAX_WAITS", "3"))
+_QUOTA_TEXT = re.compile(r"transaction|limit|exceed|too many", re.IGNORECASE)
+
+# Secrets that must never reach a log line, an exception text or the
+# provenance manifest (which is shipped inside the Kaggle package).
+_SECRET_ENV_VARS = ("FIRMS_MAP_KEY", "MAP_KEY", "EARTHDATA_TOKEN")
+_FIRMS_KEY_IN_PATH = re.compile(r"(/api/[A-Za-z_]+/csv/)([^/?#\s]+)")
+_KEY_IN_QUERY = re.compile(r"((?:MAP_KEY|map_key|token|access_token)=)([^&\s'\"]+)")
+
+
+def redact_secrets(text) -> str:
+    """Replace MAP_KEYs / tokens in ``text`` by placeholders."""
+    if text is None:
+        return ""
+    out = str(text)
+    for var in _SECRET_ENV_VARS:
+        val = os.environ.get(var)
+        if val and len(val) >= 6:
+            out = out.replace(val, "<" + var + ">")
+    out = _FIRMS_KEY_IN_PATH.sub(r"\1<MAP_KEY>", out)
+    return _KEY_IN_QUERY.sub(r"\1<redacted>", out)
+
+
+class FirmsApiError(RuntimeError):
+    """FIRMS API refused a request (message carries no MAP_KEY)."""
+
+    def __init__(self, status: int, body: str, url: str):
+        self.status = status
+        self.body = redact_secrets(" ".join((body or "").split()))[:300]
+        super().__init__(f"FIRMS HTTP {status} for {redact_secrets(url)}: "
+                         f"{self.body or '<empty body>'}")
+
+
+class FirmsQuotaExhausted(FirmsApiError):
+    """The MAP_KEY transaction quota stayed exhausted after waiting."""
 
 _UMD_PATTERNS = {
     "MCD14ML": re.compile(r"MCD14ML", re.IGNORECASE),
@@ -89,9 +130,9 @@ class ProvenanceManifest:
             detail: str = "", status: str = "OK") -> None:
         entry = {
             "product": product,
-            "resolved_source": source,
+            "resolved_source": redact_secrets(source),
             "method": method,
-            "detail": detail,
+            "detail": redact_secrets(detail),
             "status": status,
             "ts": datetime.now(timezone.utc).isoformat(),
         }
@@ -108,7 +149,7 @@ class ProvenanceManifest:
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self.entries, indent=2))
+        self.path.write_text(redact_secrets(json.dumps(self.entries, indent=2)))
 
 
 # ---------------------------------------------------------------------------
@@ -982,33 +1023,89 @@ def fetch_firms_nrt(map_key: str, source: str, bbox: tuple,
     bb = f"{west},{south},{east},{north}"
     url = (f"{S.FIRMS_API_BASE}/area/csv/{map_key}/{source}/{bb}/"
            f"{day_range}/{date_str}")
-    csv_text = _firms_get(url)
+    csv_text = _firms_get(url, map_key=map_key)
     if not csv_text.strip():
         return pd.DataFrame()
     return pd.read_csv(io.StringIO(csv_text))
 
 
-def _firms_get(url: str, max_retries: int = 6) -> str:
-    """GET with 0.15 s pacing and exponential backoff on 429/5xx."""
+def firms_quota_status(map_key: str) -> dict | None:
+    """Best-effort MAP_KEY usage ``{transaction_limit, current_transactions}``."""
+    base = S.FIRMS_API_BASE.rsplit("/api", 1)[0]
+    try:
+        resp = requests.get(f"{base}/mapserver/mapkey_status/",
+                            params={"MAP_KEY": map_key}, timeout=30)
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, dict):
+                return data
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _quota_exhausted(resp, map_key: str | None) -> bool:
+    if resp.status_code == 429:
+        return True
+    if resp.status_code not in (400, 403):
+        return False
+    if _QUOTA_TEXT.search(resp.text or ""):
+        return True
+    if map_key:
+        st = firms_quota_status(map_key) or {}
+        try:
+            return (float(st.get("current_transactions", 0)) >=
+                    0.9 * float(st.get("transaction_limit", float("inf"))))
+        except (TypeError, ValueError):
+            return False
+    return False
+
+
+def _firms_get(url: str, max_retries: int = 6, map_key: str | None = None,
+               sleep=time.sleep) -> str:
+    """GET with pacing, backoff on 5xx and quota waits on transaction limits.
+
+    Errors never contain the MAP_KEY (it is part of the FIRMS URL path).
+    """
     delay = 1.0
-    for attempt in range(max_retries):
-        time.sleep(FIRMS_SLEEP_S)
+    quota_waits = 0
+    attempt = 0
+    safe_url = redact_secrets(url)
+    while attempt < max_retries:
+        sleep(FIRMS_SLEEP_S)
         try:
             resp = requests.get(url, timeout=HTTP_TIMEOUT_S)
         except requests.RequestException as exc:  # noqa: BLE001
-            if attempt == max_retries - 1:
-                raise
-            logger.warning("FIRMS request error (%s); retry in %.1fs", exc, delay)
-            time.sleep(delay)
+            attempt += 1
+            if attempt >= max_retries:
+                raise RuntimeError(
+                    f"FIRMS request failed for {safe_url}: "
+                    f"{redact_secrets(exc)}") from None
+            logger.warning("FIRMS request error (%s); retry in %.1fs",
+                           redact_secrets(exc), delay)
+            sleep(delay)
             delay = min(delay * 2, FIRMS_MAX_BACKOFF_S)
             continue
-        if resp.status_code == 429 or resp.status_code >= 500:
-            time.sleep(delay)
+        if resp.status_code == 200:
+            return resp.text
+        if _quota_exhausted(resp, map_key):
+            if quota_waits >= FIRMS_QUOTA_MAX_WAITS:
+                raise FirmsQuotaExhausted(resp.status_code, resp.text, url)
+            quota_waits += 1
+            logger.warning(
+                "FIRMS transaction quota exhausted (HTTP %s: %s); waiting "
+                "%.0f s for the 10-minute window (%d/%d)", resp.status_code,
+                redact_secrets(" ".join((resp.text or "").split()))[:120],
+                FIRMS_QUOTA_WAIT_S, quota_waits, FIRMS_QUOTA_MAX_WAITS)
+            sleep(FIRMS_QUOTA_WAIT_S)
+            continue                        # quota waits do not use retries
+        if resp.status_code >= 500:
+            attempt += 1
+            sleep(delay)
             delay = min(delay * 2, FIRMS_MAX_BACKOFF_S)
             continue
-        resp.raise_for_status()
-        return resp.text
-    raise RuntimeError(f"FIRMS API exhausted retries: {url}")
+        raise FirmsApiError(resp.status_code, resp.text, url)
+    raise RuntimeError(f"FIRMS API exhausted retries: {safe_url}")
 
 
 # ---------------------------------------------------------------------------
@@ -1578,6 +1675,7 @@ def download_all(paths: DataPaths, years: list[int] | None = None,
             avail = None
             manifest.log("firms_data_availability", S.FIRMS_API_BASE, "http",
                          detail=str(exc), status="FAIL")
+        quota_dead = False
         for source, plats in FIRMS_NRT_SOURCES.items():
             known = [last_sci[p] for p in plats if p in last_sci]
             start = min(known) if known else "2026-01-01"
@@ -1586,20 +1684,40 @@ def download_all(paths: DataPaths, years: list[int] | None = None,
                 row = avail[avail["data_id"] == source]
                 if len(row) and "max_date" in row.columns:
                     end = min(end, str(row["max_date"].iloc[0])[:10])
+            n_ok = n_reused = n_fail = 0
             for bi, box in enumerate(bboxes):
                 for day0, rng in nrt_windows(start, end):
+                    if quota_dead:
+                        n_fail += 1
+                        continue
+                    dest = (Path(paths.raw_stage_dir) /
+                            f"firms_nrt_{source}_{bi}_{day0}.parquet")
+                    if dest.exists():               # resume
+                        n_reused += 1
+                        continue
                     try:
                         df = fetch_firms_nrt(firms_map_key, source, box, rng,
                                              day0)
                         if len(df):
-                            dest = (Path(paths.raw_stage_dir) /
-                                    f"firms_nrt_{source}_{bi}_{day0}.parquet")
-                            df.to_parquet(dest, index=False)
-                    except Exception as exc:  # noqa: BLE001
+                            _atomic_parquet(df, dest)
+                        n_ok += 1
+                    except FirmsQuotaExhausted as exc:
+                        quota_dead = True
+                        n_fail += 1
                         manifest.log(f"nrt_{source}", "firms_api", "http",
-                                     detail=f"{day0}: {exc}", status="FAIL")
+                                     detail=(f"box {bi} {day0}: {exc}; quota "
+                                             "still exhausted -- remaining NRT "
+                                             "windows skipped (re-run resumes)"),
+                                     status="FAIL")
+                    except Exception as exc:  # noqa: BLE001
+                        n_fail += 1
+                        manifest.log(f"nrt_{source}", "firms_api", "http",
+                                     detail=f"box {bi} {day0}: {exc}",
+                                     status="FAIL")
             manifest.log(f"nrt_{source}", "firms_api", "area_csv",
-                         detail=f"from {start} to {end}")
+                         detail=(f"from {start} to {end}: {n_ok} fetched, "
+                                 f"{n_reused} reused, {n_fail} failed"),
+                         status="OK" if n_fail == 0 else "WARN")
 
     # 4) Ancillary cloud + burned-area CMG grids (UMD -> CMR discovery).
     cloud_parts, burn_parts = list(umd["cloud"]), list(umd["burned"])
