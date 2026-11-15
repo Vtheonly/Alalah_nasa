@@ -309,5 +309,8 @@ details summary { cursor: pointer; color: var(--sky); font-size: 13px; }
 .sat-top { display: flex; align-items: center; gap: 8px; justify-content: space-between; }
 .sat-facts { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 12px; color: #cbd5e1; }
 .link-btn { background: none; border: 0; color: var(--sky); cursor: pointer; font: inherit; font-size: 12px; }
-.sat-label { font: 600 11px/1 Inter, system-ui, sans-serif; text-shadow: 0 0 6px #000, 0 0 2px #000; transform: translate(10px, -14px); pointer-events: none; white-space: nowrap; }
+.sat-label { display: inline-flex; align-items: center; gap: 5px; font: 600 10.5px/1 Inter, system-ui, sans-serif; letter-spacing: .04em; color: #e2e8f0;
+  padding: 3px 7px; border-radius: 4px; background: rgba(2, 6, 16, 0.55); border: 1px solid rgba(148,163,184,.25); backdrop-filter: blur(2px);
+  transform: translate(14px, -22px); pointer-events: none; white-space: nowrap; }
+.sat-label i { width: 6px; height: 6px; border-radius: 50%; display: inline-block; }
 @media (max-width: 1100px) { .globe-layout { grid-template-columns: 1fr; } }

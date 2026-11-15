@@ -649,3 +649,15 @@ real and synthetic data, synthetic never presented as evidence.
   month slider (satellites shown only while flying), speeds, follow.
   Positions along the orbit are illustrative (labelled), NOT TLE tracking.
   Server mounts `/textures` from `Frontend/dist`. Test in test_11.
+* Globe realism pass (user: "orbits/earth look cartoonish"): custom Earth
+  `ShaderMaterial` (`Frontend/src/earthMaterial.ts`): Blue Marble day +
+  Black Marble city lights blended by the REAL sub-solar point of the
+  simulated instant (`orbits.subsolarPoint`), Lambert shading, ocean sun
+  glint (ocean mask, suppressed at the limb), soft twilight; cloud sphere
+  (density = alpha channel of three-globe clouds.png, 2048 px JPG) dimmed
+  on the night side. Orbits = closed Sun-fixed rings (`orbitRing`) with an
+  alpha fade behind each satellite (rgba strings; points need plain hex);
+  scan fan + 12-min imaged ground strip per satellite and an oriented
+  spacecraft model via `customLayerData` with in-place geometry updates.
+  Clouds are attached by a short retry loop (onGlobeReady can fire before
+  the ref). Textures added: earth-night.jpg, earth-water.jpg, earth-clouds.jpg.

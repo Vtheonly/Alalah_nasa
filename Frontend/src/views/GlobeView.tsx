@@ -5,7 +5,8 @@ import { Pause, Play, Satellite } from "lucide-react";
 import { api } from "../api";
 import type { GlobeData, SatelliteMeta } from "../types";
 import { PLATFORM_COLORS } from "../colors";
-import { activeAt, greatCircleKm, orbitPath, subpoint } from "../orbits";
+import { activeAt, bearingDeg, destination, greatCircleKm, orbitRing, subpoint, subsolarPoint } from "../orbits";
+import { makeClouds, makeEarthMaterial, makeSpacecraft } from "../earthMaterial";
 import { compact, MONTHS } from "../format";
 
 const SPEEDS = [1, 60, 300, 1200];
@@ -15,20 +16,41 @@ for (let y = 2000; y <= 2026; y++) for (let m = 1; m <= 12; m++) {
   MONTH_LIST.push({ y, m });
 }
 
-function satelliteObject(color: string): THREE.Object3D {
+type Layer = { id: string; kind: "sat" | "fan" | "strip"; s: SatelliteMeta };
+
+function rgba(hex: string, a: number): string {
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${Math.max(0, Math.min(1, a)).toFixed(3)})`;
+}
+
+function fanObject(color: string): THREE.Object3D {
   const g = new THREE.Group();
-  const mat = new THREE.MeshLambertMaterial({ color: "#e2e8f0", emissive: new THREE.Color(color), emissiveIntensity: 0.6 });
-  g.add(new THREE.Mesh(new THREE.BoxGeometry(1.1, 1.1, 1.8), mat));
-  const panel = new THREE.MeshLambertMaterial({ color: "#1e3a8a", emissive: new THREE.Color("#1d4ed8"), emissiveIntensity: 0.5, side: THREE.DoubleSide });
-  for (const x of [-2.4, 2.4]) {
-    const p = new THREE.Mesh(new THREE.PlaneGeometry(3.2, 1.2), panel);
-    p.position.set(x, 0, 0);
-    g.add(p);
-  }
-  const glow = new THREE.Mesh(new THREE.SphereGeometry(1.6, 16, 16), new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.25 }));
-  g.add(glow);
-  g.scale.setScalar(2.4);          // globe radius = 100 units: make spacecraft visible
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.Float32BufferAttribute(new Float32Array(9), 3));
+  g.add(new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.09, side: THREE.DoubleSide, depthWrite: false, blending: THREE.AdditiveBlending })));
+  const edge = new THREE.BufferGeometry();
+  edge.setAttribute("position", new THREE.Float32BufferAttribute(new Float32Array(12), 3));
+  g.add(new THREE.LineSegments(edge, new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.28 })));
   return g;
+}
+
+const STRIP_N = 48;
+function stripObject(color: string): THREE.Object3D {
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.Float32BufferAttribute(new Float32Array(STRIP_N * 2 * 3), 3));
+  const alpha = new Float32Array(STRIP_N * 2);
+  for (let i = 0; i < STRIP_N; i++) { alpha[2 * i] = alpha[2 * i + 1] = 1 - i / (STRIP_N - 1); }
+  geo.setAttribute("alpha", new THREE.Float32BufferAttribute(alpha, 1));
+  const idx: number[] = [];
+  for (let i = 0; i < STRIP_N - 1; i++) { const a = 2 * i; idx.push(a, a + 1, a + 2, a + 1, a + 3, a + 2); }
+  geo.setIndex(idx);
+  const mat = new THREE.ShaderMaterial({
+    transparent: true, depthWrite: false, side: THREE.DoubleSide, blending: THREE.AdditiveBlending,
+    uniforms: { color: { value: new THREE.Color(color) } },
+    vertexShader: "attribute float alpha; varying float vA; void main(){ vA = alpha; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }",
+    fragmentShader: "uniform vec3 color; varying float vA; void main(){ gl_FragColor = vec4(color, 0.22 * vA * vA); }",
+  });
+  return new THREE.Mesh(geo, mat);
 }
 
 export default function GlobeView() {
@@ -43,7 +65,8 @@ export default function GlobeView() {
   const [hidden, setHidden] = useState<Set<string>>(new Set());
   const ym = MONTH_LIST[mi];
   const isoDate = `${ym.y}-${String(ym.m).padStart(2, "0")}-15`;
-  const [simT, setSimT] = useState(() => Date.UTC(ym.y, ym.m - 1, 15, 6));
+  // 15:00 UTC: the Americas (and their fires) in daylight on first view
+  const [simT, setSimT] = useState(() => Date.UTC(ym.y, ym.m - 1, 15, 15));
   const [lit, setLit] = useState<Uint8Array>(new Uint8Array(0));
 
   useEffect(() => {
@@ -64,10 +87,10 @@ export default function GlobeView() {
   useEffect(() => {
     const g = globeRef.current;
     if (!g) return;
-    g.pointOfView({ lat: -5, lng: -40, altitude: 2.5 }, 0);
+    g.pointOfView({ lat: -8, lng: -55, altitude: 2.3 }, 0);
     const c = g.controls() as unknown as { autoRotate: boolean; autoRotateSpeed: number };
     c.autoRotate = true;
-    c.autoRotateSpeed = 0.35;
+    c.autoRotateSpeed = 0.12;
   }, [data !== null]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // simulation clock (~30 fps)
@@ -89,11 +112,18 @@ export default function GlobeView() {
 
   const sats = useMemo<SatelliteMeta[]>(() => (data?.satellites ?? []).filter((s) => activeAt(s, isoDate) && !hidden.has(s.platform)), [data, isoDate, hidden]);
   const positions = useMemo(() => sats.map((s) => ({ s, ...subpoint(s, simT), alt: s.altitude_km / 6371 })), [sats, simT]);
-  const pathsKey = Math.floor(simT / 120_000);   // refresh orbit paths every 2 simulated minutes
-  const paths = useMemo(() => sats.map((s) => ({ name: s.platform, color: PLATFORM_COLORS[s.platform], pts: orbitPath(s, simT) })), [sats, pathsKey]); // eslint-disable-line react-hooks/exhaustive-deps
-  const ringsKey = Math.floor(simT / 20_000);
-  const rings = useMemo(() => positions.map((p) => ({ lat: p.lat, lng: p.lng, color: PLATFORM_COLORS[p.s.platform], maxR: p.s.swath_km / 2 / 111 })), [ringsKey, sats]); // eslint-disable-line react-hooks/exhaustive-deps
+  // closed orbit rings, fixed relative to the Sun, fading behind each satellite
+  const ringTick = Math.floor(simT / 20_000);
+  const paths = useMemo(() => sats.map((s) => {
+    const pts = orbitRing(s, simT);
+    const c = PLATFORM_COLORS[s.platform];
+    return { name: s.platform, pts, colors: pts.map((_, k) => rgba(c, 0.95 * (1 - k / pts.length) ** 1.6)) };
+  }), [sats, ringTick]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // spacecraft, scan fans and scanned strips: stable objects updated in place
+  const layers = useMemo<Layer[]>(() => sats.flatMap((s) => (["strip", "fan", "sat"] as const).map((kind) => ({ id: `${s.platform}-${kind}`, kind, s }))), [sats]);
+  const simRef = useRef(simT);
+  simRef.current = simT;
   // hotspots inside a satellite's swath light up (refreshed ~3x / s)
   useEffect(() => {
     if (!data) return;
@@ -116,11 +146,88 @@ export default function GlobeView() {
   const maxLog = useMemo(() => Math.max(1, ...(data?.hotspots ?? []).map((h) => Math.log1p(h[4] ?? 0))), [data]);
   const points = useMemo(() => (data?.hotspots ?? []).map((h, i) => ({
     lat: h[1], lng: h[2], h3: h[0], phi: h[4] ?? 0, iso: h[3],
-    alt: 0.004 + 0.07 * (Math.log1p(h[4] ?? 0) / maxLog),
-    color: lit[i] ? "#fffbe6" : (Math.log1p(h[4] ?? 0) / maxLog > 0.6 ? "#ff4d1a" : "#f97316"),
+    alt: 0.002 + 0.035 * (Math.log1p(h[4] ?? 0) / maxLog),
+    color: lit[i] ? "#fff7d6" : (Math.log1p(h[4] ?? 0) / maxLog > 0.6 ? "#ff5a1f" : "#ff9a3c"),
   })), [data, lit, maxLog]);
   const nLit = lit.reduce((a, b) => a + b, 0);
-  const objFor = useMemo(() => new Map<string, THREE.Object3D>(), []);
+  const earth = useMemo(() => makeEarthMaterial(), []);
+  const cloudsRef = useRef<ReturnType<typeof makeClouds> | null>(null);
+  const onReady = () => {
+    const g = globeRef.current;
+    if (!g || cloudsRef.current) return;
+    const clouds = makeClouds(g.getGlobeRadius());
+    cloudsRef.current = clouds;
+    g.scene().add(clouds.mesh);
+  };
+  // the ready callback can fire before the ref is attached: retry briefly
+  useEffect(() => {
+    let n = 0;
+    const id = window.setInterval(() => {
+      onReady();
+      if (cloudsRef.current || ++n > 50) window.clearInterval(id);
+    }, 200);
+    return () => {
+      window.clearInterval(id);
+      if (cloudsRef.current) { globeRef.current?.scene().remove(cloudsRef.current.mesh); cloudsRef.current = null; }
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  // Sun direction for the simulated instant (date + time of day)
+  useEffect(() => {
+    const g = globeRef.current;
+    if (!g) return;
+    const sp = subsolarPoint(simT);
+    const c = g.getCoords(sp.lat, sp.lng, 0);
+    const dir = new THREE.Vector3(c.x, c.y, c.z).normalize();
+    earth.setSun(dir);
+    cloudsRef.current?.setSun(dir);
+    if (cloudsRef.current) cloudsRef.current.mesh.rotation.y = -Math.PI / 2 + (simT / 3_600_000) * 0.002;
+  }, [simT, earth]);
+
+  const updateLayer = (obj: THREE.Object3D, d: object) => {
+    const g = globeRef.current;
+    if (!g) return;
+    const L = d as Layer;
+    const t = simRef.current;
+    const alt = L.s.altitude_km / 6371;
+    const p = subpoint(L.s, t);
+    const ahead = subpoint(L.s, t + 20_000);
+    const head = bearingDeg(p.lat, p.lng, ahead.lat, ahead.lng);
+    const xyz = (lat: number, lng: number, a: number) => { const c = g.getCoords(lat, lng, a); return new THREE.Vector3(c.x, c.y, c.z); };
+    const P = xyz(p.lat, p.lng, alt);
+    if (L.kind === "sat") {
+      obj.position.copy(P);
+      obj.up.copy(P.clone().normalize());
+      obj.lookAt(xyz(ahead.lat, ahead.lng, alt));
+      return;
+    }
+    const half = L.s.swath_km / 2;
+    if (L.kind === "fan") {
+      const left = destination(p.lat, p.lng, head - 90, half);
+      const right = destination(p.lat, p.lng, head + 90, half);
+      const Lp = xyz(left[0], left[1], 0.002), Rp = xyz(right[0], right[1], 0.002);
+      const tri = (obj.children[0] as THREE.Mesh).geometry.getAttribute("position") as THREE.BufferAttribute;
+      tri.setXYZ(0, P.x, P.y, P.z); tri.setXYZ(1, Lp.x, Lp.y, Lp.z); tri.setXYZ(2, Rp.x, Rp.y, Rp.z);
+      tri.needsUpdate = true;
+      const ed = (obj.children[1] as THREE.LineSegments).geometry.getAttribute("position") as THREE.BufferAttribute;
+      ed.setXYZ(0, P.x, P.y, P.z); ed.setXYZ(1, Lp.x, Lp.y, Lp.z); ed.setXYZ(2, P.x, P.y, P.z); ed.setXYZ(3, Rp.x, Rp.y, Rp.z);
+      ed.needsUpdate = true;
+      (obj.children[0] as THREE.Mesh).geometry.computeBoundingSphere();
+      (obj.children[1] as THREE.LineSegments).geometry.computeBoundingSphere();
+      return;
+    }
+    // scanned strip: the ground swath of the last ~12 simulated minutes
+    const pos = (obj as THREE.Mesh).geometry.getAttribute("position") as THREE.BufferAttribute;
+    for (let i = 0; i < STRIP_N; i++) {
+      const ti = t - (i / (STRIP_N - 1)) * 720_000;
+      const a = subpoint(L.s, ti), b = subpoint(L.s, ti + 20_000);
+      const hb = bearingDeg(a.lat, a.lng, b.lat, b.lng);
+      const l = destination(a.lat, a.lng, hb - 90, half), r = destination(a.lat, a.lng, hb + 90, half);
+      const lp = xyz(l[0], l[1], 0.003), rp = xyz(r[0], r[1], 0.003);
+      pos.setXYZ(2 * i, lp.x, lp.y, lp.z); pos.setXYZ(2 * i + 1, rp.x, rp.y, rp.z);
+    }
+    pos.needsUpdate = true;
+    (obj as THREE.Mesh).geometry.computeBoundingSphere();
+  };
 
   const utc = new Date(simT);
   return (
@@ -148,62 +255,52 @@ export default function GlobeView() {
             width={size.w}
             height={size.h}
             backgroundColor="#00000000"
-            globeImageUrl="/textures/earth-blue-marble.jpg"
-            bumpImageUrl="/textures/earth-topology.png"
             backgroundImageUrl="/textures/night-sky.png"
+            globeMaterial={earth.material}
+            onGlobeReady={onReady}
             showAtmosphere
-            atmosphereColor="#7dd3fc"
-            atmosphereAltitude={0.18}
-            objectsData={positions}
-            objectLat="lat"
-            objectLng="lng"
-            objectAltitude="alt"
-            objectFacesSurfaces
-            objectThreeObject={(d: object) => {
-              const p = d as { s: SatelliteMeta };
-              let o = objFor.get(p.s.platform);
-              if (!o) { o = satelliteObject(PLATFORM_COLORS[p.s.platform]); objFor.set(p.s.platform, o); }
-              return o;
-            }}
+            atmosphereColor="#5fa8ff"
+            atmosphereAltitude={0.14}
+            showGraticules={false}
             pathsData={paths}
             pathPoints="pts"
             pathPointLat={(p: number[]) => p[0]}
             pathPointLng={(p: number[]) => p[1]}
             pathPointAlt={(p: number[]) => p[2]}
-            pathColor={(d: object) => [`${(d as { color: string }).color}00`, (d as { color: string }).color, `${(d as { color: string }).color}00`]}
-            pathStroke={1.2}
-            pathDashLength={0.06}
-            pathDashGap={0.012}
-            pathDashAnimateTime={9000}
+            pathColor={(d: object) => (d as { colors: string[] }).colors}
+            pathResolution={2}
             pathTransitionDuration={0}
-            ringsData={rings}
-            ringColor={(d: object) => (t: number) => `${(d as { color: string }).color}${Math.round((1 - t) * 160).toString(16).padStart(2, "0")}`}
-            ringMaxRadius="maxR"
-            ringPropagationSpeed={6}
-            ringRepeatPeriod={900}
+            customLayerData={layers.slice()}
+            customThreeObject={(d: object) => {
+              const L = d as Layer;
+              const c = PLATFORM_COLORS[L.s.platform];
+              return L.kind === "sat" ? makeSpacecraft(c) : L.kind === "fan" ? fanObject(c) : stripObject(c);
+            }}
+            customThreeObjectUpdate={updateLayer}
             pointsData={points}
             pointLat="lat"
             pointLng="lng"
             pointAltitude="alt"
             pointColor="color"
-            pointRadius={0.3}
+            pointRadius={0.13}
+            pointResolution={6}
             pointsMerge
             pointsTransitionDuration={0}
             htmlElementsData={positions}
             htmlLat="lat"
             htmlLng="lng"
-            htmlAltitude={(d: object) => (d as { alt: number }).alt + 0.02}
+            htmlAltitude={(d: object) => (d as { alt: number }).alt + 0.015}
             htmlElement={(d: object) => {
               const p = d as { s: SatelliteMeta };
               const el = document.createElement("div");
               el.className = "sat-label";
-              el.style.color = PLATFORM_COLORS[p.s.platform];
-              el.textContent = p.s.platform;
+              el.innerHTML = `<i style="background:${PLATFORM_COLORS[p.s.platform]}"></i>${p.s.platform}`;
               return el;
             }}
           />
           <div className="globe-foot">
-            <span><i className="dotp" style={{ background: "#f97316" }} /> fire hexagon (height = harmonized fire power)</span>
+            <span><i className="dotp" style={{ background: "#ff9a3c" }} /> fire hexagon (height = harmonized fire power)</span>
+            <span className="muted">fan = instrument scan · glowing band = ground strip imaged in the last 12 min</span>
             <span><i className="dotp" style={{ background: "#fffbe6" }} /> inside a satellite swath now: <b>{nLit}</b></span>
             <span className="muted">{data ? `${compact(data.hotspots.length)} most active hexagons of ${MONTHS[ym.m - 1]} ${ym.y}` : "loading…"}</span>
           </div>
