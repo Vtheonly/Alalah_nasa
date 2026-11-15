@@ -12,6 +12,7 @@
   "dependencies": {
     "echarts": "^5.6.0",
     "echarts-for-react": "^3.0.2",
+    "h3-js": "^4.2.1",
     "lucide-react": "^0.468.0",
     "maplibre-gl": "^5.6.1",
     "react": "^19.3.1",

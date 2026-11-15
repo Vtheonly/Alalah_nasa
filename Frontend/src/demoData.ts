@@ -7,6 +7,7 @@ import {
   type MonthlyMetric,
   type Region,
 } from "./data";
+import { cellToBoundary, cellToLatLng, gridDisk, latLngToCell } from "h3-js";
 
 function stableNoise(seed: number): number {
   const value = Math.sin(seed * 127.1 + 311.7) * 43758.5453;
@@ -65,23 +66,7 @@ function makeCalendar(series: MonthlyMetric[]): CalendarCell[] {
   }));
 }
 
-function hexagon(longitude: number, latitude: number, width: number, height: number): number[][] {
-  const points = Array.from({ length: 6 }, (_, index) => {
-    const angle = (Math.PI / 3) * index;
-    return [
-      longitude + Math.cos(angle) * width,
-      latitude + Math.sin(angle) * height,
-    ];
-  });
-  return [...points, points[0]];
-}
-
 function makeFireCells(region: Region, month: string): FireCollection {
-  const [west, south, east, north] = region.bbox;
-  const columns = 25;
-  const rows = 20;
-  const dx = (east - west) / columns;
-  const dy = (north - south) / rows;
   const selectedYear = Number(month.slice(0, 4));
   const selectedMonth = Number(month.slice(5, 7));
   const eventScale =
@@ -91,46 +76,50 @@ function makeFireCells(region: Region, month: string): FireCollection {
       ? 1.5
       : 1;
   const features: FireFeature[] = [];
+  const [west, south, east, north] = region.bbox;
+  const h3Cells = new Set<string>();
+  for (const [longitude, latitude] of region.hotspots) {
+    const center = latLngToCell(latitude, longitude, 6);
+    for (const h3Index of gridDisk(center, 10)) h3Cells.add(h3Index);
+  }
 
-  for (let row = 0; row < rows; row += 1) {
-    for (let column = 0; column < columns; column += 1) {
-      const longitude = west + (column + 0.5) * dx;
-      const latitude = south + (row + 0.5) * dy;
-      const heat = region.hotspots.reduce((sum, [hotLon, hotLat, strength]) => {
-        const distance =
-          ((longitude - hotLon) / Math.max(dx * 5, 0.08)) ** 2 +
-          ((latitude - hotLat) / Math.max(dy * 5, 0.08)) ** 2;
-        return sum + strength * Math.exp(-distance * 1.5);
-      }, 0);
-      const noise = stableNoise(row * columns + column + selectedMonth * 3);
-      const frp = Math.max(0, (heat * 0.78 + noise * 0.16 - 0.13) * eventScale);
-      if (frp < 0.045) continue;
+  for (const h3Index of h3Cells) {
+    const [latitude, longitude] = cellToLatLng(h3Index);
+    if (longitude < west || longitude > east || latitude < south || latitude > north) continue;
+    const heat = region.hotspots.reduce((sum, [hotLon, hotLat, strength]) => {
+      const distance =
+        ((longitude - hotLon) / 0.8) ** 2 +
+        ((latitude - hotLat) / 0.8) ** 2;
+      return sum + strength * Math.exp(-distance * 1.5);
+    }, 0);
+    const noise = stableNoise(Number.parseInt(h3Index.slice(-6), 16) + selectedMonth * 3);
+    const frp = Math.max(0, (heat * 0.78 + noise * 0.16 - 0.13) * eventScale);
+    if (frp < 0.045) continue;
 
-      const anomaly = clamp(0.82 + heat * 1.2 + noise * 0.6, 0.65, 3.8);
-      const detections = Math.round(1 + frp * 34 + noise * 4);
-      const feature: FireFeature = {
-        type: "Feature",
-        geometry: {
-          type: "Polygon",
-          coordinates: [hexagon(longitude, latitude, dx * 0.52, dy * 0.54)],
-        },
-        properties: {
-          frp_score: frp,
-          anomaly_score: anomaly,
-          uncertainty_score: Number((frp * 0.28 + noise * 0.06).toFixed(3)),
-          value: frp,
-          phi_q50_mw: Number((frp * 40).toFixed(2)),
-          anomaly_ratio: Number(anomaly.toFixed(2)),
-          width: Number((frp * 20).toFixed(2)),
-          raw_count: detections,
-          quality_flag: selectedYear >= 2026 && selectedMonth >= 9
-            ? "CLIMATOLOGY_CLOUD_FALLBACK"
-            : "NOMINAL",
-          attribution_flag: anomaly > 1.6 ? "REAL_FIRE_CHANGE" : "WITHIN_NORMAL_VARIABILITY",
-        },
-      };
-      features.push(feature);
-    }
+    const anomaly = clamp(0.82 + heat * 1.2 + noise * 0.6, 0.65, 3.8);
+    const detections = Math.round(1 + frp * 34 + noise * 4);
+    const ring = cellToBoundary(h3Index).map(([lat, lon]) => [lon, lat]);
+    ring.push(ring[0]);
+    const feature: FireFeature = {
+      type: "Feature",
+      geometry: { type: "Polygon", coordinates: [ring] },
+      properties: {
+        h3_index: h3Index,
+        frp_score: frp,
+        anomaly_score: anomaly,
+        uncertainty_score: Number((frp * 0.28 + noise * 0.06).toFixed(3)),
+        value: frp,
+        phi_q50_mw: Number((frp * 40).toFixed(2)),
+        anomaly_ratio: Number(anomaly.toFixed(2)),
+        width: Number((frp * 20).toFixed(2)),
+        raw_count: detections,
+        quality_flag: selectedYear >= 2026 && selectedMonth >= 9
+          ? "CLIMATOLOGY_CLOUD_FALLBACK"
+          : "NOMINAL",
+        attribution_flag: anomaly > 1.6 ? "REAL_FIRE_CHANGE" : "WITHIN_NORMAL_VARIABILITY",
+      },
+    };
+    features.push(feature);
   }
 
   const maxFrp = Math.max(0.01, ...features.map((feature) => feature.properties.frp_score));

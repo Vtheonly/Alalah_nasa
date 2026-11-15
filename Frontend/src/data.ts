@@ -47,6 +47,7 @@ export interface FireCellProperties {
   value: number;
   raw_count?: number;
   quality_flag?: string;
+  measured_fraction?: number;
   attribution_flag?: string;
 }
 
