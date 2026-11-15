@@ -710,3 +710,16 @@ the FIRMS MAP_KEY anyway (old Kaggle versions keep the old manifest).
   it), checks with `datasets list --mine --csv` only, and redacts the key
   from any error text. Option parsing of list/create/version verified
   against kaggle 2.2.5 (api.kaggle.com not reachable from this sandbox).
+* Follow-up (Kaggle real run, 31.8 M-detection spatial subset): cpu_prep
+  preprocess took 608 s and logged `49 pass keys split across year
+  partitions`. My earlier claim "passes never straddle solar midnight" was
+  wrong for the KEY: the pass key is the SOLAR day, whose night half spans
+  two UTC dates, so 31 Dec/1 Jan nights get rows from two UTC-year
+  partitions. Downstream nothing crashes (pivot_table / groupby average),
+  but the solver's dense `y[i,t,p,s] = ...` keeps only the last half.
+  `preprocess_geometry.merge_split_passes` now re-aggregates those rows
+  (sums, pixel-weighted means, max flags) == the monolithic aggregation
+  (test_02 `..._solar_night_split_across_utc_years`). The user's running
+  job uses the previous code: effect is 49 of 10.4 M pass rows, negligible.
+* Kaggle hardware tests on the user's 4x L4: `25 passed` in test_06
+  (CUDA tests ran; no skips reported).

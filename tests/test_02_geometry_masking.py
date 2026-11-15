@@ -457,3 +457,42 @@ def test_02_partitioned_preprocess_equals_monolithic(tmp_path):
             == pd.factorize(g["event_cluster_id"])[0]).all()
     bio = g["pass_id"] >= 0
     assert g.loc[bio, "event_cluster_id"].is_unique is False   # real clusters
+
+
+def test_02_partitioned_merges_solar_night_split_across_utc_years(tmp_path):
+    """A solar day's night spans two UTC dates: at 60 W the evening of
+    31 Dec (local) is 1 Jan UTC, so one pass key gets detections from two
+    UTC-year partitions.  They must be merged back into ONE pass row equal
+    to the monolithic aggregation (the solver would otherwise keep only one
+    half)."""
+    import numpy as np
+    import pandas as pd
+    from src.geometry import preprocess_geometry as pg
+    from src.ingest.normalize_dedup import CANONICAL_COLUMNS
+    rows = []
+    # same Terra cell, solar night of 2013-12-31: 02:10 local (06:10 UTC
+    # 31 Dec) and 22:30 local (02:30 UTC 1 Jan 2014); 3 pixels each
+    for acq_date, hhmm in (("2013-12-31", 610), ("2014-01-01", 230)):
+        for k in range(3):
+            rows.append({"latitude": -29.0 + 0.003 * k, "longitude": -60.0,
+                         "acq_date": acq_date, "acq_hhmm": hhmm + k,
+                         "frp_mw": 10.0 + k, "sample_idx": 600.0 + k})
+    df = pd.DataFrame(rows)
+    df = df.assign(country_iso="ARG", sensor_family="MODIS", platform="Terra",
+                   data_tier="ML_SCIENCE", t_mir_k=330.0, t_tir_k=295.0,
+                   scan_km=np.nan, track_km=np.nan, pixarea_km2=1.5,
+                   conf_raw="n", conf_num=80.0, type_raw=0, version_raw="C6.1",
+                   ingest_ts="2026-11-15T00:00:00Z")[CANONICAL_COLUMNS]
+    root = tmp_path / "active_fires"
+    for y, g in df.groupby(df["acq_date"].str[:4]):
+        d = root / "country_iso=ARG" / f"year={y}"
+        d.mkdir(parents=True)
+        g.to_parquet(d / "part.parquet", index=False)
+    _ref_prov, ref_pass = pg.preprocess_observations(df)
+    pas, info = pg.preprocess_partitioned(root, tmp_path / "prov")
+    assert len(ref_pass) == 1                       # one solar-day night pass
+    assert info["duplicate_pass_keys_across_years"] == 1   # detected ...
+    assert len(pas) == 1                            # ... and merged
+    a = ref_pass.reset_index(drop=True)
+    b = pas[ref_pass.columns].reset_index(drop=True)
+    pd.testing.assert_frame_equal(a, b, check_dtype=False)

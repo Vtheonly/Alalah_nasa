@@ -460,9 +460,49 @@ def preprocess_partitioned(active_fires_dir, prov_dir) -> tuple[pd.DataFrame, di
                 else pd.DataFrame(columns=PASS_COLUMNS))
     key = ["h3_index", "solar_date", "platform", "dn_flag"]
     n_dup = int(pass_obs.duplicated(key).sum()) if len(pass_obs) else 0
+    if n_dup:
+        pass_obs = merge_split_passes(pass_obs)
     return pass_obs, {"provenance_rows": n_rows, "years": sorted(groups),
                       "static_flare_cells": int(len(static_ids)),
                       "duplicate_pass_keys_across_years": n_dup}
+
+
+_PASS_SUMS = ("y_frp_mw", "raw_event_count", "det_footprint_km2", "n_pixels")
+_PASS_MEANS = ("mean_area_km2", "mean_vza_deg", "mean_solar_hour",
+               "mean_conf_num", "w_mean")
+_PASS_MAXS = ("has_i4_m13_fallback", "sat_flag")
+
+
+def merge_split_passes(pass_obs: pd.DataFrame) -> pd.DataFrame:
+    """Re-aggregate pass rows whose key was split across UTC-year partitions.
+
+    The pass key is the SOLAR day: its night half spans two UTC dates, so on
+    31 Dec / 1 Jan one (cell, solar day, platform, dn) can receive detections
+    from two UTC-year partitions.  Sums add, means are pixel-weighted, flags
+    take the max -- the same row the monolithic aggregation produces.
+    """
+    key = ["h3_index", "solar_date", "platform", "dn_flag"]
+    dup = pass_obs.duplicated(key, keep=False)
+    if not dup.any():
+        return pass_obs
+    d = pass_obs.loc[dup].copy()
+    w = d["n_pixels"].astype(float)
+    for c in _PASS_MEANS:
+        d[c] = d[c].astype(float) * w
+    d["_w"] = w
+    agg = {c: "sum" for c in _PASS_SUMS + _PASS_MEANS + ("_w",)}
+    agg.update({c: "max" for c in _PASS_MAXS})
+    agg.update({"sensor_family": "first", "country_iso": "first"})
+    m = d.groupby(key, as_index=False, sort=False).agg(agg)
+    for c in _PASS_MEANS:
+        m[c] = m[c] / m["_w"].where(m["_w"] > 0)
+    m = m.drop(columns="_w")
+    out = pd.concat([pass_obs.loc[~dup], m[pass_obs.columns]],
+                    ignore_index=True)
+    for c in pass_obs.columns:
+        if out[c].dtype != pass_obs[c].dtype:
+            out[c] = out[c].astype(pass_obs[c].dtype)
+    return out.sort_values(key, kind="mergesort").reset_index(drop=True)
 
 
 def _aggregate_passes(bio: pd.DataFrame) -> pd.DataFrame:
