@@ -61,32 +61,41 @@ export default function Overview({ status }: { status: Status | null }) {
   const avail = val?.checks.filter((c) => c.status !== "unavailable").length ?? 0;
   return (
     <div className="stack-lg">
-      <section className="hero">
+      <section className="hero hero-home">
         <div className="hero-copy">
-          <div className="eyebrow">One continuous fire record from five satellites</div>
-          <h1>Turning two generations of fire satellites into <span className="grad">one consistent 26-year record</span></h1>
-          <p>MODIS (1 km, since 2000) and VIIRS (375 m, since 2012) see fire differently. Fire Harmonizer fuses every detection into a single, uncertainty-aware estimate of fire energy on a global hexagon grid, and shows its evidence.</p>
+          <div className="eyebrow">Satellite-derived fire energy · 2000–2026</div>
+          <h1>A consistent record of <span className="hero-highlight">global fire activity.</span></h1>
+          <p>MODIS and VIIRS have different resolutions and detection limits. Fire Harmonizer accounts for those differences to estimate fire energy on a common hexagon grid, with uncertainty and source observations available for review.</p>
           <div className="hero-actions">
-            <a className="btn primary" href="#/explorer">Explore the map <ArrowRight size={15} /></a>
-            <a className="btn" href="#/globe">Watch the satellites in 3D</a>
-            <a className="btn" href="#/challenges">See how each problem is solved</a>
+            <a className="btn primary" href="#/explorer">Explore the record <ArrowRight size={15} /></a>
+            <a className="btn" href="#/challenges">How it works</a>
           </div>
         </div>
-        <div className="hero-stats">
-          <Stat value={ov ? compact(ov.n_detections ?? 0) : "…"} label="satellite detections" />
-          <Stat value={ov ? compact(ov.n_cells, 0) : "…"} label="H3 hexagons (36 km²)" />
-          <Stat value={ov ? `${ov.first_year}–${ov.last_year}` : "…"} label="monthly record" />
-          <Stat value={val ? `${passed}/${avail}` : "…"} label="validation checks passed" accent={val?.gate.passed ? "#34d399" : "#f87171"} />
+        <div className="hero-summary">
+          <div className="hero-summary-head">
+            <span>Record at a glance</span>
+            <span className="hero-summary-note">Current dataset</span>
+          </div>
+          <div className="hero-stats">
+            <Stat value={ov ? compact(ov.n_detections ?? 0) : "…"} label="Satellite detections" />
+            <Stat value={ov ? compact(ov.n_cells, 0) : "…"} label="Hexagons · 36 km²" />
+            <Stat value={ov ? `${ov.first_year}–${ov.last_year}` : "…"} label="Monthly record" />
+            <Stat value={val ? `${passed}/${avail}` : "…"} label="Checks passed" accent={val?.gate.passed ? "#34d399" : "#f87171"} />
+          </div>
+          <div className="hero-summary-foot">MODIS · VIIRS · five satellite missions</div>
         </div>
       </section>
 
-      <section className="card">
-        <div className="card-head"><h2>Satellites behind the record</h2><span className="muted">dashed marks: launches, orbit drift, S-NPP end</span></div>
+      <section className="card record-card">
+        <div className="card-head">
+          <div><span className="section-kicker">Coverage</span><h2>Satellites behind the record</h2></div>
+          <span className="muted">Operational history · 2000–2026</span>
+        </div>
         {ov && status ? <Timeline ov={ov} events={status.constellation_events} /> : <div className="skeleton" style={{ height: 180 }} />}
       </section>
 
       <section>
-        <div className="section-head"><h2>From raw pixels to a harmonized record</h2><a href="#/challenges" className="link">All challenges <ArrowRight size={14} /></a></div>
+        <div className="section-head"><div><span className="section-kicker">Method</span><h2>From detections to a harmonized record</h2></div><a href="#/challenges" className="link">View methods <ArrowRight size={14} /></a></div>
         <div className="pipeline">
           {PIPELINE.map((s, i) => (
             <a key={s.t} className="pipe-step" href={`#/challenges/${s.c}`}>

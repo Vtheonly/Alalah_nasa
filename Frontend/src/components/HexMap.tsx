@@ -1,27 +1,10 @@
 import { useEffect, useRef } from "react";
-import maplibregl, { type Map as MLMap, type StyleSpecification } from "maplibre-gl";
+import maplibregl, { type Map as MLMap } from "maplibre-gl";
 import type { HexCollection } from "../types";
 
 export type MapMetric = "frp" | "anomaly" | "uncertainty" | "evidence";
 
-// Inline style: if the basemap tiles cannot load (offline judging laptop),
-// the hexagons still render on a dark background.
-export const STYLE: StyleSpecification = {
-  version: 8,
-  sources: {
-    carto: {
-      type: "raster",
-      tiles: ["https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
-              "https://b.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png"],
-      tileSize: 256,
-      attribution: "© OpenStreetMap contributors © CARTO",
-    },
-  },
-  layers: [
-    { id: "bg", type: "background", paint: { "background-color": "#0b1220" } },
-    { id: "carto", type: "raster", source: "carto", paint: { "raster-opacity": 0.9 } },
-  ],
-};
+export const STYLE = "https://tiles.openfreemap.org/styles/dark";
 
 const COLOR_EXPR: Record<MapMetric, unknown> = {
   frp: ["interpolate", ["linear"], ["ln", ["+", 1, ["get", "phi_q50_mw"]]],

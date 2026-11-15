@@ -9,8 +9,8 @@ export function provenanceTone(p?: Provenance): "synthetic" | "validated" | "unv
 export function ProvenancePill({ p }: { p?: Provenance }) {
   const tone = provenanceTone(p);
   const Icon = tone === "validated" ? ShieldCheck : tone === "synthetic" ? FlaskConical : ShieldAlert;
-  const text = tone === "validated" ? "Real engine · validated" : tone === "synthetic" ? "Synthetic demo data" : "Real engine · not validated";
-  return <span className={`pill pill-${tone}`}><Icon size={13} /> {text}</span>;
+  const text = tone === "validated" ? "Real engine · validated" : tone === "synthetic" ? "Synthetic demo" : "Real engine · not validated";
+  return <span className={`pill pill-${tone}`} aria-label={text}><Icon size={13} /><span className="pill-label">{text}</span></span>;
 }
 
 export function ProvenanceBanner({ status }: { status: Status | null }) {
@@ -30,7 +30,7 @@ export function ProvenanceBanner({ status }: { status: Status | null }) {
       {tone === "synthetic" ? <FlaskConical size={16} /> : <ShieldAlert size={16} />}
       <span>
         {tone === "synthetic"
-          ? <><b>Synthetic demonstration data.</b> Simulated values that follow the engine's exact output format, so every feature can be explored. They are not satellite observations and not scientific evidence.</>
+          ? <><b>Demonstration data.</b> Values are simulated—not satellite observations or scientific evidence.</>
           : <><b>Real engine output, not validated.</b> Shown for inspection only; it did not pass the critical validation checks.</>}
         <span className="banner-reason"> Why: {p.reason}</span>
       </span>
